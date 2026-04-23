@@ -6,12 +6,7 @@ router.get('/', function(req, res, next) {
   res.render('index', { title: 'Express' });
 });
 
-router.post("/login", function(req,res,next){
 
-  res.status(200).send(JSON.stringify({
-    token: "testToken"
-  }))
-})
 
 
 module.exports = router;
