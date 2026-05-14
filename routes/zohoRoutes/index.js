@@ -1,14 +1,14 @@
 var express = require("express");
 var router = express.Router();
-var productRouter = require("./zohoRoutes/product/index");
+var productRouter = require("./product/index");
 const { ObjectId } = require("mongodb");
-const { connectToDatabase } = require("../utils/mongodb");
+const { connectToDatabase } = require("../../utils/mongodb");
 
-const { categoriesQueryMap } = require("../constants");
+const { categoriesQueryMap } = require("../../constants");
 const {
   getViewData,
   handleZohoInventoryRequest,
-} = require("../utils/zohoRequest");
+} = require("../../utils/zohoRequest");
 
 /* GET home page. */
 router.get("/", function (req, res, next) {
