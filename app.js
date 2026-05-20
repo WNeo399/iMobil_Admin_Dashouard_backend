@@ -10,6 +10,7 @@ const cors = require("cors");
 var indexRouter = require('./routes/index');
 var usersRouter = require('./routes/users');
 var zohoRouter = require('./routes/zohoRoutes/index');
+var sqtRouter = require('./routes/sqtRoutes/index');
 
 var app = express();
 
@@ -27,6 +28,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/', indexRouter);
 app.use('/zoho', zohoRouter);
+app.use('/sqt', sqtRouter);
 
 app.use('/users', function(req,rex,next){
     const authHeader = req.headers['authorization'];

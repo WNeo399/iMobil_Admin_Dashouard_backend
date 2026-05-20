@@ -1,11 +1,23 @@
 const axios = require("axios");
-let requestToken =
-  "1000.7200b06e58233d5bb13b3a42e15ac14a.50963666d0eebaa230e2e1b4072e0dd5";
+let requestToken ="";
 const refresh_token = process.env.REFRESH_TOKEN;
 const client_id = process.env.CLIENT_ID;
 const client_secret = process.env.CLIENT_SECRET;
 
 const workspaceId = "1404913000003936002";
+
+function isTokenExpired(data) {
+  if (!data) return false;
+  return (
+    data.summary === "INVALID_OAUTHTOKEN" ||
+    data.summary === "SECURITY_NEEDS_LOGIN" ||
+    data.code === 14 ||
+    data.code === 57 ||
+    data.error?.code == 57 ||
+    data.errorCode == 8535 ||
+    data.errorCode == 7309
+  );
+}
 
 async function refreshToken() {
   try {
@@ -59,7 +71,7 @@ async function createExportJob(viewId) {
   try {
     let data = await fetchData(viewId);
 
-    if (data?.summary === "INVALID_OAUTHTOKEN") {
+    if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
       const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
       if (!newAccessToken) {
@@ -132,7 +144,7 @@ async function getViewData(url) {
   try {
     let data = await fetchData();
 
-    if (data?.summary === "INVALID_OAUTHTOKEN") {
+    if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
       const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
       if (!newAccessToken) {
@@ -167,12 +179,7 @@ async function handleZohoInventoryRequest(url) {
   try {
     let data = await fetchData(url);
 
-    if (
-      data?.summary === "INVALID_OAUTHTOKEN" ||
-      data?.code === 57 ||
-      data?.error?.code == 57 ||
-      data?.errorCode == 8535
-    ) {
+    if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
       const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
       if (!newAccessToken) {
@@ -210,12 +217,7 @@ async function handleZohoInventoryPostRequest(url, params) {
   try {
     let data = await fetchData(url, params);
 
-    if (
-      data?.summary === "INVALID_OAUTHTOKEN" ||
-      data?.code === 57 ||
-      data?.error?.code == 57 ||
-      data?.errorCode == 8535
-    ) {
+    if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
       const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
       if (!newAccessToken) {
@@ -260,11 +262,7 @@ async function handleZohoInventoryPutRequest(url, params) {
   try {
     let data = await fetchData(url, params);
     console.log(data);
-    if (
-      data?.summary === "INVALID_OAUTHTOKEN" ||
-      data?.code === 57 ||
-      data?.error?.code == 57
-    ) {
+    if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
       const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
       if (!newAccessToken) {
