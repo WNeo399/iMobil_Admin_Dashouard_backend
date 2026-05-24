@@ -16,6 +16,7 @@ const STATUS_PERMISSION = {
   "repairing": "sqt:case:startRepair",
   "repaired": "sqt:case:markRepaired",
   "repaired-and-collected": "sqt:case:markCollected",
+  "waiting-solvup": "sqt:case:selectParts",
   "unrepairable": "sqt:case:markUnrepairable",
   "ber": "sqt:case:markBer",
   "completed": "sqt:case:markBer",
@@ -44,6 +45,7 @@ const VALID_STATUSES = [
   "repairing",
   "repaired",
   "repaired-and-collected",
+  "waiting-solvup",
   "unrepairable",
   "ber",
   "completed",
@@ -969,9 +971,25 @@ router.post("/:id/parts", requirePermission("sqt:case:selectParts"), authorizeCa
       });
     }
 
+    const now = new Date();
+    const update = { $set: { partsForInvoice, updatedAt: now } };
+
+    // Selecting at least one part hands the case off to Solvup for invoicing.
+    if (partsForInvoice.length > 0) {
+      update.$set.status = "waiting-solvup";
+      update.$push = {
+        statusHistory: {
+          status: "waiting-solvup",
+          at: now,
+          updatedBy: actor(req),
+          note: `${partsForInvoice.length} part(s) selected — awaiting Solvup`,
+        },
+      };
+    }
+
     const result = await collection.findOneAndUpdate(
       { _id: new ObjectId(id) },
-      { $set: { partsForInvoice, updatedAt: new Date() } },
+      update,
       { returnDocument: "after" },
     );
 

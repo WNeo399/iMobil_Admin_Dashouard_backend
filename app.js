@@ -12,6 +12,9 @@ var usersRouter = require('./routes/users');
 var zohoRouter = require('./routes/zohoRoutes/index');
 var sqtRouter = require('./routes/sqtRoutes/index');
 var authRouter = require('./routes/authRoutes/index');
+// TEMPORARY: external-integration endpoint (no auth). Remove together with
+// routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
+var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
 var { authenticate } = require('./middleware/auth');
 
 var app = express();
@@ -30,6 +33,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/', indexRouter);
 app.use('/auth', authRouter);
+// TEMPORARY: mounted before the auth-protected routers so /integration/* stays
+// open to the external caller. Remove when the integration is gone.
+app.use(tempIntegrationRouter);
 // All zoho/sqt/users routes require a valid login; per-permission checks are
 // applied inside the routers.
 app.use('/zoho', authenticate, zohoRouter);
