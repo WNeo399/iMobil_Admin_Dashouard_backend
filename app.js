@@ -11,6 +11,8 @@ var indexRouter = require('./routes/index');
 var usersRouter = require('./routes/users');
 var zohoRouter = require('./routes/zohoRoutes/index');
 var sqtRouter = require('./routes/sqtRoutes/index');
+var authRouter = require('./routes/authRoutes/index');
+var { authenticate } = require('./middleware/auth');
 
 var app = express();
 
@@ -27,22 +29,12 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/', indexRouter);
-app.use('/zoho', zohoRouter);
-app.use('/sqt', sqtRouter);
-
-app.use('/users', function(req,rex,next){
-    const authHeader = req.headers['authorization'];
-
-  if (!authHeader) {
-    return res.status(401).json({
-      success: false,
-      message: 'Unauthorized',
-    });
-  }
-
-  next();
-})
-app.use('/users', usersRouter);
+app.use('/auth', authRouter);
+// All zoho/sqt/users routes require a valid login; per-permission checks are
+// applied inside the routers.
+app.use('/zoho', authenticate, zohoRouter);
+app.use('/sqt', authenticate, sqtRouter);
+app.use('/users', authenticate, usersRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

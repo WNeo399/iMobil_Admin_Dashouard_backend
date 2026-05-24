@@ -3,6 +3,30 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
+const { requirePermission } = require("../../middleware/auth");
+
+// The generic /status endpoint serves several transitions; the permission it
+// requires depends on the target status. (BER is internal; the rest are
+// shop-side actions that shop roles are allowed to perform.)
+const STATUS_PERMISSION = {
+  "pending": "sqt:case:list",
+  "waiting-for-parts": "sqt:case:sendParts",
+  "parts-arrived": "sqt:case:partsReceived",
+  "waiting-for-drop-off": "sqt:case:customerNotified",
+  "repairing": "sqt:case:startRepair",
+  "repaired": "sqt:case:markRepaired",
+  "repaired-and-collected": "sqt:case:markCollected",
+  "unrepairable": "sqt:case:markUnrepairable",
+  "ber": "sqt:case:markBer",
+  "completed": "sqt:case:markBer",
+  "cancelled": "sqt:case:markBer",
+};
+
+function requireStatusPermission(req, res, next) {
+  const target = req.body && req.body.status;
+  const perm = STATUS_PERMISSION[target] || "sqt:case:edit";
+  return requirePermission(perm)(req, res, next);
+}
 
 const ZOHO_ORG_ID = "746138234";
 const ZOHO_PRICEBOOK_ID_WHOLESALE = "2591985000000103011";
@@ -35,6 +59,12 @@ function toDateOrNull(v) {
 function toObjectIdOrNull(v) {
   if (!v) return null;
   return ObjectId.isValid(v) ? new ObjectId(v) : null;
+}
+
+// The name recorded against status-history / note entries — always the
+// authenticated user, never a client-supplied value.
+function actor(req) {
+  return (req.user && req.user.username) || "system";
 }
 
 function buildCaseDoc(body, { isUpdate = false, shop = null, model = null } = {}) {
@@ -134,7 +164,59 @@ async function resolveModel(db, modelId) {
   return db.collection("sqt_models").findOne({ _id: new ObjectId(modelId) });
 }
 
-router.get("/list", async function (req, res, next) {
+// ── Shop data scoping ────────────────────────────────────────────────────────
+// req.user.accessibleShopIds is null for unscoped roles (Admin / iMobile /
+// TechElite) and an array of ObjectIds for shop roles. When scoped, list/count
+// queries are constrained to those shops, and single-case routes are guarded by
+// `authorizeCaseAccess`.
+
+// Merge the shop scope into a Mongo query. Returns the (mutated) query.
+function applyShopScope(req, query) {
+  const ids = req.user && req.user.accessibleShopIds;
+  if (!Array.isArray(ids)) return query; // unscoped role — no constraint
+  if (query.shopId instanceof ObjectId) {
+    // a specific shop was requested — only honour it if it's accessible
+    query.shopId = ids.some((id) => id.equals(query.shopId))
+      ? query.shopId
+      : { $in: [] };
+  } else {
+    query.shopId = { $in: ids };
+  }
+  return query;
+}
+
+// Route guard for single-case endpoints: ensures a scoped user can only touch
+// cases belonging to one of their shops. No-ops for unscoped roles.
+async function authorizeCaseAccess(req, res, next) {
+  try {
+    const ids = req.user && req.user.accessibleShopIds;
+    if (!Array.isArray(ids)) return next(); // unscoped role
+
+    const id = req.params.id || (req.body && req.body.id);
+    if (!id || !ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid case id" });
+    }
+
+    const db = await connectToDatabase();
+    const c = await db
+      .collection(COLLECTION)
+      .findOne({ _id: new ObjectId(id) }, { projection: { shopId: 1 } });
+
+    if (!c) {
+      return res.status(404).json({ success: false, message: "Case not found" });
+    }
+    const allowed = c.shopId && ids.some((sid) => sid.equals(c.shopId));
+    if (!allowed) {
+      return res.status(403).json({ success: false, message: "Forbidden" });
+    }
+    next();
+  } catch (error) {
+    console.error("authorizeCaseAccess error:", error);
+    return res.status(500).json({ success: false, message: "Authorization failed" });
+  }
+}
+
+router.get("/list", requirePermission("sqt:case:list"), async function (req, res, next) {
   try {
     const { status, shopId, search } = req.query;
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -171,6 +253,9 @@ router.get("/list", async function (req, res, next) {
       ];
     }
 
+    // Restrict to the user's shops when they are a shop-scoped role
+    applyShopScope(req, query);
+
     const totalDocs = await collection.countDocuments(query);
     const data = await collection
       .find(query)
@@ -194,13 +279,25 @@ router.get("/list", async function (req, res, next) {
 });
 
 // Counts per status — for the sidebar tree
-router.get("/counts", async function (req, res, next) {
+router.get("/counts", requirePermission("sqt:case:list"), async function (req, res, next) {
   try {
     const db = await connectToDatabase();
-    const result = await db
-      .collection(COLLECTION)
-      .aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
-      .toArray();
+
+    // Optional shopId narrows the counts to a single shop (e.g. a shop owner
+    // "switching" to one of their shops). applyShopScope then constrains it to
+    // the user's accessible shops, so the counts match exactly what that shop
+    // would see.
+    const match = {};
+    if (req.query.shopId && ObjectId.isValid(req.query.shopId)) {
+      match.shopId = new ObjectId(req.query.shopId);
+    }
+    applyShopScope(req, match);
+
+    const pipeline = [];
+    if (Object.keys(match).length > 0) pipeline.push({ $match: match });
+    pipeline.push({ $group: { _id: "$status", count: { $sum: 1 } } });
+
+    const result = await db.collection(COLLECTION).aggregate(pipeline).toArray();
 
     const counts = {};
     let total = 0;
@@ -219,7 +316,7 @@ router.get("/counts", async function (req, res, next) {
   }
 });
 
-router.get("/detail/:id", async function (req, res, next) {
+router.get("/detail/:id", requirePermission("sqt:case:list"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -237,7 +334,7 @@ router.get("/detail/:id", async function (req, res, next) {
   }
 });
 
-router.post("/create", async function (req, res, next) {
+router.post("/create", requirePermission("sqt:case:create"), async function (req, res, next) {
   try {
     const { serviceRequestId } = req.body;
     if (!serviceRequestId) {
@@ -279,7 +376,7 @@ router.post("/create", async function (req, res, next) {
       {
         status,
         at: now,
-        updatedBy: req.body.updatedBy || "system",
+        updatedBy: actor(req),
         note: req.body.statusNote || "Case created",
       },
     ];
@@ -310,7 +407,7 @@ router.post("/create", async function (req, res, next) {
   }
 });
 
-router.put("/update/:id", async function (req, res, next) {
+router.put("/update/:id", requirePermission("sqt:case:edit"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -368,7 +465,7 @@ router.put("/update/:id", async function (req, res, next) {
       { returnDocument: "after" },
     );
 
-    const updated = result.value || result;
+    const updated = result ? (result.value || result) : null;
     if (!updated) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -379,7 +476,7 @@ router.put("/update/:id", async function (req, res, next) {
   }
 });
 
-router.post("/status/:id", async function (req, res, next) {
+router.post("/status/:id", requireStatusPermission, authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -400,7 +497,7 @@ router.post("/status/:id", async function (req, res, next) {
     const historyEntry = {
       status,
       at: now,
-      updatedBy: updatedBy || "Admin",
+      updatedBy: actor(req),
       note: note || null,
     };
 
@@ -413,7 +510,7 @@ router.post("/status/:id", async function (req, res, next) {
       { returnDocument: "after" },
     );
 
-    const updated = result.value || result;
+    const updated = result ? (result.value || result) : null;
     if (!updated) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -424,7 +521,7 @@ router.post("/status/:id", async function (req, res, next) {
   }
 });
 
-router.post("/:id/sendParts", async function (req, res, next) {
+router.post("/:id/sendParts", requirePermission("sqt:case:sendParts"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -547,7 +644,7 @@ router.post("/:id/sendParts", async function (req, res, next) {
     const statusEntry = {
       status: "waiting-for-parts",
       at: now,
-      updatedBy: (req.body && req.body.updatedBy) || "Admin",
+      updatedBy: actor(req),
       note: `Parts dispatched — Zoho SO ${so.salesorder_number}`,
     };
 
@@ -563,7 +660,7 @@ router.post("/:id/sendParts", async function (req, res, next) {
       { returnDocument: "after" },
     );
 
-    const updatedCase = updateResult.value || updateResult;
+    const updatedCase = updateResult ? (updateResult.value || updateResult) : null;
     return res.json({
       success: true,
       message: `Sales order ${so.salesorder_number} created`,
@@ -581,7 +678,7 @@ router.post("/:id/sendParts", async function (req, res, next) {
   }
 });
 
-router.post("/:id/markRepaired", async function (req, res, next) {
+router.post("/:id/markRepaired", requirePermission("sqt:case:markRepaired"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -622,7 +719,7 @@ router.post("/:id/markRepaired", async function (req, res, next) {
     const statusEntry = {
       status: newStatus,
       at: now,
-      updatedBy: (req.body && req.body.updatedBy) || "Admin",
+      updatedBy: actor(req),
       note: collected
         ? `Repair complete — device collected; ${usedCount} part(s) used`
         : `Repair complete — awaiting pickup; ${usedCount} part(s) used`,
@@ -637,7 +734,7 @@ router.post("/:id/markRepaired", async function (req, res, next) {
       { returnDocument: "after" },
     );
 
-    const updated = result.value || result;
+    const updated = result ? (result.value || result) : null;
     if (!updated) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -650,7 +747,7 @@ router.post("/:id/markRepaired", async function (req, res, next) {
   }
 });
 
-router.post("/:id/partsReceived", async function (req, res, next) {
+router.post("/:id/partsReceived", requirePermission("sqt:case:partsReceived"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -684,7 +781,7 @@ router.post("/:id/partsReceived", async function (req, res, next) {
     const statusEntry = {
       status: newStatus,
       at: now,
-      updatedBy: (req.body && req.body.updatedBy) || "Admin",
+      updatedBy: actor(req),
       note: noteParts.join(" — "),
     };
 
@@ -714,7 +811,7 @@ router.post("/:id/partsReceived", async function (req, res, next) {
       },
     );
 
-    const updated = result.value || result;
+    const updated = result ? (result.value || result) : null;
     if (!updated) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -731,7 +828,7 @@ router.post("/:id/partsReceived", async function (req, res, next) {
   }
 });
 
-router.put("/:id/device", async function (req, res, next) {
+router.put("/:id/device", requirePermission("sqt:case:editDevice"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -785,7 +882,7 @@ router.put("/:id/device", async function (req, res, next) {
       { returnDocument: "after" },
     );
 
-    const updated = result.value || result;
+    const updated = result ? (result.value || result) : null;
     if (!updated) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -796,7 +893,7 @@ router.put("/:id/device", async function (req, res, next) {
   }
 });
 
-router.post("/:id/notes", async function (req, res, next) {
+router.post("/:id/notes", requirePermission("sqt:case:note"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -814,7 +911,7 @@ router.post("/:id/notes", async function (req, res, next) {
     const note = {
       text,
       at: new Date(),
-      addedBy: req.body.addedBy ? String(req.body.addedBy).trim() : "Admin",
+      addedBy: actor(req),
     };
 
     const result = await collection.findOneAndUpdate(
@@ -823,7 +920,7 @@ router.post("/:id/notes", async function (req, res, next) {
       { returnDocument: "after" },
     );
 
-    const updated = result.value || result;
+    const updated = result ? (result.value || result) : null;
     if (!updated) {
       return res.status(404).json({ success: false, message: "Case not found" });
     }
@@ -834,7 +931,62 @@ router.post("/:id/notes", async function (req, res, next) {
   }
 });
 
-router.post("/delete", async function (req, res, next) {
+// Select the parts used for a case (snapshotted into partsForInvoice) — picked
+// from the parts catalogue of the case's device model. Admin / TechElite only.
+router.post("/:id/parts", requirePermission("sqt:case:selectParts"), authorizeCaseAccess, async function (req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid case id" });
+    }
+    const selections = Array.isArray(req.body && req.body.parts) ? req.body.parts : [];
+
+    const db = await connectToDatabase();
+    const collection = db.collection(COLLECTION);
+
+    const theCase = await collection.findOne({ _id: new ObjectId(id) });
+    if (!theCase) {
+      return res.status(404).json({ success: false, message: "Case not found" });
+    }
+
+    // Snapshot each selected part from sqt_parts_prices
+    const partsForInvoice = [];
+    for (const sel of selections) {
+      if (!sel || !ObjectId.isValid(sel.partPriceId)) continue;
+      const part = await db
+        .collection("sqt_parts_prices")
+        .findOne({ _id: new ObjectId(sel.partPriceId) });
+      if (!part) continue;
+      partsForInvoice.push({
+        partPriceId: part._id,
+        partName: part.partName || null,
+        modelName: part.modelName || null,
+        genuine: !!part.genuine,
+        sku: (part.identifiers && part.identifiers.sku) || null,
+        partNumber: (part.identifiers && part.identifiers.partNumber) || null,
+        unitPrice: Number(part.price) || 0,
+        quantity: Math.max(1, Number(sel.quantity) || 1),
+      });
+    }
+
+    const result = await collection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { partsForInvoice, updatedAt: new Date() } },
+      { returnDocument: "after" },
+    );
+
+    const updated = result ? (result.value || result) : null;
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Case not found" });
+    }
+    return res.json({ success: true, message: "Parts selected", data: updated });
+  } catch (error) {
+    console.error("Select parts error:", error);
+    return res.status(500).json({ success: false, message: "Failed to select parts" });
+  }
+});
+
+router.post("/delete", requirePermission("sqt:case:delete"), authorizeCaseAccess, async function (req, res, next) {
   try {
     const { id } = req.body;
     if (!id || !ObjectId.isValid(id)) {

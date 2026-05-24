@@ -6,31 +6,24 @@ const { connectToDatabase } = require("../../utils/mongodb");
 
 const COLLECTION = "sqt_parts_prices";
 const MODELS_COLLECTION = "sqt_models";
-const QUALITIES_COLLECTION = "sqt_qualities";
 
 async function resolveModel(db, modelId) {
   if (!ObjectId.isValid(modelId)) return null;
   return db.collection(MODELS_COLLECTION).findOne({ _id: new ObjectId(modelId) });
 }
 
-async function resolveQuality(db, qualityId) {
-  if (!ObjectId.isValid(qualityId)) return null;
-  return db.collection(QUALITIES_COLLECTION).findOne({ _id: new ObjectId(qualityId) });
-}
-
-function buildPartDoc(body, { model, quality, isUpdate = false } = {}) {
+function buildPartDoc(body, { model, isUpdate = false } = {}) {
   const doc = {};
 
   if (model) {
     doc.modelId = model._id;
     doc.modelName = model.name;
   }
-  if (quality) {
-    doc.qualityId = quality._id;
-    doc.qualityName = quality.name;
-  }
 
   if (body.partName !== undefined) doc.partName = String(body.partName).trim();
+
+  // genuine: true = original/OEM part, false = aftermarket/compatible
+  if (body.genuine !== undefined) doc.genuine = !!body.genuine;
 
   if (body.identifiers !== undefined) {
     doc.identifiers = {
@@ -79,7 +72,7 @@ router.get("/", async function (req, res, next) {
 router.post("/", async function (req, res, next) {
   try {
     const { modelId } = req.params;
-    const { qualityId, partName, price } = req.body;
+    const { partName, price } = req.body;
 
     if (!partName) {
       return res.status(400).json({ success: false, message: "partName is required" });
@@ -87,33 +80,28 @@ router.post("/", async function (req, res, next) {
     if (price === undefined || price === null || price === "") {
       return res.status(400).json({ success: false, message: "price is required" });
     }
-    if (!qualityId) {
-      return res.status(400).json({ success: false, message: "qualityId is required" });
-    }
 
     const db = await connectToDatabase();
     const model = await resolveModel(db, modelId);
     if (!model) {
       return res.status(404).json({ success: false, message: "Model not found" });
     }
-    const quality = await resolveQuality(db, qualityId);
-    if (!quality) {
-      return res.status(404).json({ success: false, message: "Quality not found" });
-    }
 
-    const doc = buildPartDoc(req.body, { model, quality, isUpdate: false });
+    const doc = buildPartDoc(req.body, { model, isUpdate: false });
     if (doc.active === undefined) doc.active = true;
+    if (doc.genuine === undefined) doc.genuine = false;
 
-    // Enforce uniqueness on (modelId, partName, qualityId)
+    // Enforce uniqueness on (modelId, partName, genuine) — a part can exist as
+    // both a genuine and an aftermarket entry, but not duplicated within each.
     const dup = await db.collection(COLLECTION).findOne({
       modelId: model._id,
       partName: doc.partName,
-      qualityId: quality._id,
+      genuine: doc.genuine,
     });
     if (dup) {
       return res.status(409).json({
         success: false,
-        message: "A part with the same name and quality already exists for this model",
+        message: `A ${doc.genuine ? "genuine" : "non-genuine"} "${doc.partName}" already exists for this model`,
       });
     }
 
@@ -147,31 +135,23 @@ router.put("/:partId", async function (req, res, next) {
       return res.status(404).json({ success: false, message: "Part not found" });
     }
 
-    // Allow changing quality on update
-    let quality = null;
-    if (req.body.qualityId && String(req.body.qualityId) !== String(existing.qualityId)) {
-      quality = await resolveQuality(db, req.body.qualityId);
-      if (!quality) {
-        return res.status(404).json({ success: false, message: "Quality not found" });
-      }
-    }
+    const update = buildPartDoc(req.body, { isUpdate: true });
 
-    const update = buildPartDoc(req.body, { quality, isUpdate: true });
-
-    // Uniqueness re-check if partName or qualityId changed
+    // Uniqueness re-check if partName or genuine changed
     const effectiveName = update.partName !== undefined ? update.partName : existing.partName;
-    const effectiveQualityId = quality ? quality._id : existing.qualityId;
+    const effectiveGenuine =
+      update.genuine !== undefined ? update.genuine : !!existing.genuine;
 
     const dup = await collection.findOne({
       _id: { $ne: new ObjectId(partId) },
       modelId: new ObjectId(modelId),
       partName: effectiveName,
-      qualityId: effectiveQualityId,
+      genuine: effectiveGenuine,
     });
     if (dup) {
       return res.status(409).json({
         success: false,
-        message: "Another part with the same name and quality already exists",
+        message: `Another ${effectiveGenuine ? "genuine" : "non-genuine"} "${effectiveName}" already exists`,
       });
     }
 

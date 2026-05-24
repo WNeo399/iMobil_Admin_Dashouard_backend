@@ -8,12 +8,15 @@ const {
   getViewData,
   handleZohoInventoryRequest,
 } = require("../../../utils/zohoRequest");
+const { requirePermission } = require("../../../middleware/auth");
 
 var productCollectionRoute = require("./routes/collections");
 
-router.use("/collections", productCollectionRoute);
+// Collections management belongs to the zoho Inventory area
+router.use("/collections", requirePermission("zoho:collection:view"), productCollectionRoute);
 
-router.get("/searchProduct", async function (req, res, next) {
+// Product search powers the SQT "Send Parts" picker (TechElite/Admin)
+router.get("/searchProduct", requirePermission("sqt:case:sendParts"), async function (req, res, next) {
   const keyword = req.query.keyword;
   const domainName = process.env.DOMAIN_NAME;
   if (!keyword || !domainName) {
@@ -60,7 +63,7 @@ const priceListIdMap = {
   WholeSale: "2591985000000103011",
 };
 
-router.get("/getProductDetail/:id", async function (req, res, next) {
+router.get("/getProductDetail/:id", requirePermission("zoho:stock:view"), async function (req, res, next) {
   const { id } = req.params;
   const url = `https://www.zohoapis.com/inventory/v1/items/${id}?organization_id=746138234`;
 

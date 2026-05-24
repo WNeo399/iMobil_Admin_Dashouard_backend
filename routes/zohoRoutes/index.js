@@ -9,6 +9,7 @@ const {
   getViewData,
   handleZohoInventoryRequest,
 } = require("../../utils/zohoRequest");
+const { requirePermission } = require("../../middleware/auth");
 
 /* GET home page. */
 router.get("/", function (req, res, next) {
@@ -17,7 +18,7 @@ router.get("/", function (req, res, next) {
 
 router.use("/product", productRouter);
 
-router.get("/collectionStocks", async function (req, res, next) {
+router.get("/collectionStocks", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { collection } = req.query;
 
@@ -143,7 +144,7 @@ router.get("/collectionStocks", async function (req, res, next) {
   }
 });
 
-router.post("/salesTotal", async function (req, res, next) {
+router.post("/salesTotal", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { itemIds, duration = 30 } = req.body;
 
