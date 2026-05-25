@@ -3,24 +3,25 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
+const { updateTicketStatus } = require("../../utils/repairDesk");
 const { requirePermission } = require("../../middleware/auth");
 
 // The generic /status endpoint serves several transitions; the permission it
 // requires depends on the target status. (BER is internal; the rest are
 // shop-side actions that shop roles are allowed to perform.)
 const STATUS_PERMISSION = {
-  "pending": "sqt:case:list",
+  pending: "sqt:case:list",
   "waiting-for-parts": "sqt:case:sendParts",
   "parts-arrived": "sqt:case:partsReceived",
   "waiting-for-drop-off": "sqt:case:customerNotified",
-  "repairing": "sqt:case:startRepair",
-  "repaired": "sqt:case:markRepaired",
+  repairing: "sqt:case:startRepair",
+  repaired: "sqt:case:markRepaired",
   "repaired-and-collected": "sqt:case:markCollected",
   "waiting-solvup": "sqt:case:selectParts",
-  "unrepairable": "sqt:case:markUnrepairable",
-  "ber": "sqt:case:markBer",
-  "completed": "sqt:case:markBer",
-  "cancelled": "sqt:case:markBer",
+  unrepairable: "sqt:case:markUnrepairable",
+  ber: "sqt:case:markBer",
+  completed: "sqt:case:markBer",
+  cancelled: "sqt:case:markBer",
 };
 
 function requireStatusPermission(req, res, next) {
@@ -69,7 +70,10 @@ function actor(req) {
   return (req.user && req.user.username) || "system";
 }
 
-function buildCaseDoc(body, { isUpdate = false, shop = null, model = null } = {}) {
+function buildCaseDoc(
+  body,
+  { isUpdate = false, shop = null, model = null } = {},
+) {
   const doc = {};
 
   if (body.serviceRequestId !== undefined) {
@@ -124,7 +128,9 @@ function buildCaseDoc(body, { isUpdate = false, shop = null, model = null } = {}
       imei: d.imei ? String(d.imei).trim() : null,
       brand: d.brand || null,
       purchasePrice:
-        d.purchasePrice === null || d.purchasePrice === "" || d.purchasePrice === undefined
+        d.purchasePrice === null ||
+        d.purchasePrice === "" ||
+        d.purchasePrice === undefined
           ? null
           : Number(d.purchasePrice),
       purchaseDate: toDateOrNull(d.purchaseDate),
@@ -196,7 +202,9 @@ async function authorizeCaseAccess(req, res, next) {
 
     const id = req.params.id || (req.body && req.body.id);
     if (!id || !ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid case id" });
     }
 
     const db = await connectToDatabase();
@@ -205,7 +213,9 @@ async function authorizeCaseAccess(req, res, next) {
       .findOne({ _id: new ObjectId(id) }, { projection: { shopId: 1 } });
 
     if (!c) {
-      return res.status(404).json({ success: false, message: "Case not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Case not found" });
     }
     const allowed = c.shopId && ids.some((sid) => sid.equals(c.shopId));
     if (!allowed) {
@@ -214,812 +224,1067 @@ async function authorizeCaseAccess(req, res, next) {
     next();
   } catch (error) {
     console.error("authorizeCaseAccess error:", error);
-    return res.status(500).json({ success: false, message: "Authorization failed" });
+    return res
+      .status(500)
+      .json({ success: false, message: "Authorization failed" });
   }
 }
 
-router.get("/list", requirePermission("sqt:case:list"), async function (req, res, next) {
-  try {
-    const { status, shopId, search } = req.query;
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
+router.get(
+  "/list",
+  requirePermission("sqt:case:list"),
+  async function (req, res, next) {
+    try {
+      const { status, shopId, search } = req.query;
+      const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+      const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
 
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
 
-    const query = {};
+      const query = {};
 
-    if (status) {
-      const arr =
-        typeof status === "string" ? status.split(",") : Array.isArray(status) ? status : [status];
-      query.status = { $in: arr };
+      if (status) {
+        const arr =
+          typeof status === "string"
+            ? status.split(",")
+            : Array.isArray(status)
+              ? status
+              : [status];
+        query.status = { $in: arr };
+      }
+
+      if (shopId && ObjectId.isValid(shopId)) {
+        query.shopId = new ObjectId(shopId);
+      }
+
+      if (search) {
+        const re = { $regex: String(search), $options: "i" };
+        query.$or = [
+          { serviceRequestId: re },
+          { caseId: re },
+          { repairDeskTicketNumber: re },
+          { "customer.firstName": re },
+          { "customer.lastName": re },
+          { "customer.email": re },
+          { "customer.phone": re },
+          { "device.imei": re },
+          { "device.description": re },
+          { retailer: re },
+        ];
+      }
+
+      // Restrict to the user's shops when they are a shop-scoped role
+      applyShopScope(req, query);
+
+      const totalDocs = await collection.countDocuments(query);
+      const data = await collection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray();
+
+      return res.json({
+        success: true,
+        totalDocs,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalDocs / pageSize),
+        data,
+      });
+    } catch (error) {
+      console.error("List cases error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to list cases" });
     }
-
-    if (shopId && ObjectId.isValid(shopId)) {
-      query.shopId = new ObjectId(shopId);
-    }
-
-    if (search) {
-      const re = { $regex: String(search), $options: "i" };
-      query.$or = [
-        { serviceRequestId: re },
-        { caseId: re },
-        { repairDeskTicketNumber: re },
-        { "customer.firstName": re },
-        { "customer.lastName": re },
-        { "customer.email": re },
-        { "customer.phone": re },
-        { "device.imei": re },
-        { "device.description": re },
-        { retailer: re },
-      ];
-    }
-
-    // Restrict to the user's shops when they are a shop-scoped role
-    applyShopScope(req, query);
-
-    const totalDocs = await collection.countDocuments(query);
-    const data = await collection
-      .find(query)
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .toArray();
-
-    return res.json({
-      success: true,
-      totalDocs,
-      page,
-      pageSize,
-      totalPages: Math.ceil(totalDocs / pageSize),
-      data,
-    });
-  } catch (error) {
-    console.error("List cases error:", error);
-    return res.status(500).json({ success: false, message: "Failed to list cases" });
-  }
-});
+  },
+);
 
 // Counts per status — for the sidebar tree
-router.get("/counts", requirePermission("sqt:case:list"), async function (req, res, next) {
-  try {
-    const db = await connectToDatabase();
+router.get(
+  "/counts",
+  requirePermission("sqt:case:list"),
+  async function (req, res, next) {
+    try {
+      const db = await connectToDatabase();
 
-    // Optional shopId narrows the counts to a single shop (e.g. a shop owner
-    // "switching" to one of their shops). applyShopScope then constrains it to
-    // the user's accessible shops, so the counts match exactly what that shop
-    // would see.
-    const match = {};
-    if (req.query.shopId && ObjectId.isValid(req.query.shopId)) {
-      match.shopId = new ObjectId(req.query.shopId);
-    }
-    applyShopScope(req, match);
-
-    const pipeline = [];
-    if (Object.keys(match).length > 0) pipeline.push({ $match: match });
-    pipeline.push({ $group: { _id: "$status", count: { $sum: 1 } } });
-
-    const result = await db.collection(COLLECTION).aggregate(pipeline).toArray();
-
-    const counts = {};
-    let total = 0;
-    for (const s of VALID_STATUSES) counts[s] = 0;
-    for (const row of result) {
-      if (row._id) {
-        counts[row._id] = row.count;
-        total += row.count;
+      // Optional shopId narrows the counts to a single shop (e.g. a shop owner
+      // "switching" to one of their shops). applyShopScope then constrains it to
+      // the user's accessible shops, so the counts match exactly what that shop
+      // would see.
+      const match = {};
+      if (req.query.shopId && ObjectId.isValid(req.query.shopId)) {
+        match.shopId = new ObjectId(req.query.shopId);
       }
-    }
+      applyShopScope(req, match);
 
-    return res.json({ success: true, data: { total, byStatus: counts } });
-  } catch (error) {
-    console.error("Case counts error:", error);
-    return res.status(500).json({ success: false, message: "Failed to fetch counts" });
-  }
-});
+      const pipeline = [];
+      if (Object.keys(match).length > 0) pipeline.push({ $match: match });
+      pipeline.push({ $group: { _id: "$status", count: { $sum: 1 } } });
 
-router.get("/detail/:id", requirePermission("sqt:case:list"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-    const db = await connectToDatabase();
-    const data = await db.collection(COLLECTION).findOne({ _id: new ObjectId(id) });
-    if (!data) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, data });
-  } catch (error) {
-    console.error("Get case detail error:", error);
-    return res.status(500).json({ success: false, message: "Failed to fetch case" });
-  }
-});
+      const result = await db
+        .collection(COLLECTION)
+        .aggregate(pipeline)
+        .toArray();
 
-router.post("/create", requirePermission("sqt:case:create"), async function (req, res, next) {
-  try {
-    const { serviceRequestId } = req.body;
-    if (!serviceRequestId) {
+      const counts = {};
+      let total = 0;
+      for (const s of VALID_STATUSES) counts[s] = 0;
+      for (const row of result) {
+        if (row._id) {
+          counts[row._id] = row.count;
+          total += row.count;
+        }
+      }
+
+      return res.json({ success: true, data: { total, byStatus: counts } });
+    } catch (error) {
+      console.error("Case counts error:", error);
       return res
-        .status(400)
-        .json({ success: false, message: "serviceRequestId is required" });
+        .status(500)
+        .json({ success: false, message: "Failed to fetch counts" });
     }
+  },
+);
 
-    const status = req.body.status && VALID_STATUSES.includes(req.body.status)
-      ? req.body.status
-      : "pending";
-
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
-
-    // Uniqueness — serviceRequestId always; caseId / repairDesk IDs when provided
-    const orClauses = [{ serviceRequestId: String(serviceRequestId).trim() }];
-    if (req.body.caseId) orClauses.push({ caseId: String(req.body.caseId).trim() });
-    if (req.body.repairDeskTicketId)
-      orClauses.push({ repairDeskTicketId: String(req.body.repairDeskTicketId).trim() });
-    if (req.body.repairDeskTicketNumber)
-      orClauses.push({ repairDeskTicketNumber: String(req.body.repairDeskTicketNumber).trim() });
-
-    const dup = await collection.findOne({ $or: orClauses });
-    if (dup) {
+router.get(
+  "/detail/:id",
+  requirePermission("sqt:case:list"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      const db = await connectToDatabase();
+      const data = await db
+        .collection(COLLECTION)
+        .findOne({ _id: new ObjectId(id) });
+      if (!data) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({ success: true, data });
+    } catch (error) {
+      console.error("Get case detail error:", error);
       return res
-        .status(409)
-        .json({ success: false, message: "A case with one of these identifiers already exists" });
+        .status(500)
+        .json({ success: false, message: "Failed to fetch case" });
     }
+  },
+);
 
-    const shop = await resolveShop(db, req.body.shopId);
-    const model = await resolveModel(db, req.body.device && req.body.device.modelId);
+router.post(
+  "/create",
+  requirePermission("sqt:case:create"),
+  async function (req, res, next) {
+    try {
+      const { serviceRequestId } = req.body;
+      if (!serviceRequestId) {
+        return res
+          .status(400)
+          .json({ success: false, message: "serviceRequestId is required" });
+      }
 
-    const doc = buildCaseDoc(req.body, { isUpdate: false, shop, model });
-    const now = new Date();
+      const status =
+        req.body.status && VALID_STATUSES.includes(req.body.status)
+          ? req.body.status
+          : "pending";
 
-    doc.status = status;
-    doc.statusHistory = [
-      {
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      // Uniqueness — serviceRequestId always; caseId / repairDesk IDs when provided
+      const orClauses = [{ serviceRequestId: String(serviceRequestId).trim() }];
+      if (req.body.caseId)
+        orClauses.push({ caseId: String(req.body.caseId).trim() });
+      if (req.body.repairDeskTicketId)
+        orClauses.push({
+          repairDeskTicketId: String(req.body.repairDeskTicketId).trim(),
+        });
+      if (req.body.repairDeskTicketNumber)
+        orClauses.push({
+          repairDeskTicketNumber: String(
+            req.body.repairDeskTicketNumber,
+          ).trim(),
+        });
+
+      const dup = await collection.findOne({ $or: orClauses });
+      if (dup) {
+        return res.status(409).json({
+          success: false,
+          message: "A case with one of these identifiers already exists",
+        });
+      }
+
+      const shop = await resolveShop(db, req.body.shopId);
+      const model = await resolveModel(
+        db,
+        req.body.device && req.body.device.modelId,
+      );
+
+      const doc = buildCaseDoc(req.body, { isUpdate: false, shop, model });
+      const now = new Date();
+
+      doc.status = status;
+      doc.statusHistory = [
+        {
+          status,
+          at: now,
+          updatedBy: actor(req),
+          note: req.body.statusNote || "Case created",
+        },
+      ];
+      // Initialize collection arrays / objects (empty for now)
+      doc.zohoOrders = Array.isArray(req.body.zohoOrders)
+        ? req.body.zohoOrders
+        : [];
+      doc.partsForInvoice = Array.isArray(req.body.partsForInvoice)
+        ? req.body.partsForInvoice
+        : [];
+      doc.sqtInvoice = {
+        id: null,
+        number: null,
+        invoicedAt: null,
+        paidAt: null,
+        amount: null,
+      };
+      doc.shopPayment = {
+        id: null,
+        ref: null,
+        paidAt: null,
+        amount: null,
+      };
+
+      const result = await collection.insertOne(doc);
+      return res.status(201).json({
+        success: true,
+        message: "Case created",
+        data: { _id: result.insertedId, ...doc },
+      });
+    } catch (error) {
+      console.error("Create case error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to create case" });
+    }
+  },
+);
+
+router.put(
+  "/update/:id",
+  requirePermission("sqt:case:edit"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      // Reject status changes here — use /status/:id
+      if (req.body.status !== undefined) {
+        delete req.body.status;
+      }
+      delete req.body.statusHistory;
+
+      // Uniqueness for editable identifiers
+      const checkDup = async (field) => {
+        const val = req.body[field];
+        if (!val) return null;
+        return collection.findOne({
+          [field]: String(val).trim(),
+          _id: { $ne: new ObjectId(id) },
+        });
+      };
+      for (const f of [
+        "serviceRequestId",
+        "caseId",
+        "repairDeskTicketId",
+        "repairDeskTicketNumber",
+      ]) {
+        const dup = await checkDup(f);
+        if (dup) {
+          return res.status(409).json({
+            success: false,
+            message: `${f} is already used by another case`,
+          });
+        }
+      }
+
+      let shop = null;
+      if (req.body.shopId !== undefined) {
+        shop = req.body.shopId ? await resolveShop(db, req.body.shopId) : false;
+        // false → caller passed empty/null, we'll clear the field
+      }
+
+      let model = null;
+      if (req.body.device && req.body.device.modelId !== undefined) {
+        model = req.body.device.modelId
+          ? await resolveModel(db, req.body.device.modelId)
+          : null;
+      }
+
+      const update = buildCaseDoc(req.body, {
+        isUpdate: true,
+        shop: shop === false ? null : shop,
+        model,
+      });
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $set: update },
+        { returnDocument: "after" },
+      );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: "Case updated",
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Update case error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to update case" });
+    }
+  },
+);
+
+router.post(
+  "/status/:id",
+  requireStatusPermission,
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      const { status, note, updatedBy } = req.body;
+      if (!status || !VALID_STATUSES.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: `status must be one of: ${VALID_STATUSES.join(", ")}`,
+        });
+      }
+
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      const now = new Date();
+      const historyEntry = {
         status,
         at: now,
         updatedBy: actor(req),
-        note: req.body.statusNote || "Case created",
-      },
-    ];
-    // Initialize collection arrays / objects (empty for now)
-    doc.zohoOrders = Array.isArray(req.body.zohoOrders) ? req.body.zohoOrders : [];
-    doc.partsForInvoice = Array.isArray(req.body.partsForInvoice) ? req.body.partsForInvoice : [];
-    doc.sqtInvoice = {
-      id: null,
-      number: null,
-      invoicedAt: null,
-      paidAt: null,
-      amount: null,
-    };
-    doc.shopPayment = {
-      id: null,
-      ref: null,
-      paidAt: null,
-      amount: null,
-    };
-
-    const result = await collection.insertOne(doc);
-    return res
-      .status(201)
-      .json({ success: true, message: "Case created", data: { _id: result.insertedId, ...doc } });
-  } catch (error) {
-    console.error("Create case error:", error);
-    return res.status(500).json({ success: false, message: "Failed to create case" });
-  }
-});
-
-router.put("/update/:id", requirePermission("sqt:case:edit"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
-
-    // Reject status changes here — use /status/:id
-    if (req.body.status !== undefined) {
-      delete req.body.status;
-    }
-    delete req.body.statusHistory;
-
-    // Uniqueness for editable identifiers
-    const checkDup = async (field) => {
-      const val = req.body[field];
-      if (!val) return null;
-      return collection.findOne({
-        [field]: String(val).trim(),
-        _id: { $ne: new ObjectId(id) },
-      });
-    };
-    for (const f of ["serviceRequestId", "caseId", "repairDeskTicketId", "repairDeskTicketNumber"]) {
-      const dup = await checkDup(f);
-      if (dup) {
-        return res
-          .status(409)
-          .json({ success: false, message: `${f} is already used by another case` });
-      }
-    }
-
-    let shop = null;
-    if (req.body.shopId !== undefined) {
-      shop = req.body.shopId ? await resolveShop(db, req.body.shopId) : false;
-      // false → caller passed empty/null, we'll clear the field
-    }
-
-    let model = null;
-    if (req.body.device && req.body.device.modelId !== undefined) {
-      model = req.body.device.modelId
-        ? await resolveModel(db, req.body.device.modelId)
-        : null;
-    }
-
-    const update = buildCaseDoc(req.body, {
-      isUpdate: true,
-      shop: shop === false ? null : shop,
-      model,
-    });
-
-    const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      { $set: update },
-      { returnDocument: "after" },
-    );
-
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, message: "Case updated", data: updated });
-  } catch (error) {
-    console.error("Update case error:", error);
-    return res.status(500).json({ success: false, message: "Failed to update case" });
-  }
-});
-
-router.post("/status/:id", requireStatusPermission, authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-    const { status, note, updatedBy } = req.body;
-    if (!status || !VALID_STATUSES.includes(status)) {
-      return res.status(400).json({
-        success: false,
-        message: `status must be one of: ${VALID_STATUSES.join(", ")}`,
-      });
-    }
-
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
-
-    const now = new Date();
-    const historyEntry = {
-      status,
-      at: now,
-      updatedBy: actor(req),
-      note: note || null,
-    };
-
-    const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      {
-        $set: { status, updatedAt: now },
-        $push: { statusHistory: historyEntry },
-      },
-      { returnDocument: "after" },
-    );
-
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, message: "Status updated", data: updated });
-  } catch (error) {
-    console.error("Change status error:", error);
-    return res.status(500).json({ success: false, message: "Failed to change status" });
-  }
-});
-
-router.post("/:id/sendParts", requirePermission("sqt:case:sendParts"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-
-    const products = Array.isArray(req.body && req.body.products) ? req.body.products : [];
-    const lineItems = products
-      .filter((p) => p && p.product_id)
-      .map((p) => ({ item_id: String(p.product_id), quantity: 1 }));
-
-    if (lineItems.length === 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "At least one product with a product_id is required" });
-    }
-
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
-
-    const theCase = await collection.findOne({ _id: new ObjectId(id) });
-    if (!theCase) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    if (!theCase.shopId) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Case has no shop assigned" });
-    }
-
-    const shop = await db.collection("sqt_shops").findOne({ _id: theCase.shopId });
-    if (!shop) {
-      return res.status(404).json({ success: false, message: "Shop not found" });
-    }
-    const customerId = shop.externalIds && shop.externalIds.zohoId;
-    if (!customerId) {
-      return res.status(400).json({
-        success: false,
-        message: `Shop "${shop.storeName}" has no Zoho ID configured`,
-      });
-    }
-
-    // Build notes from whatever identifiers exist (skip empty parts)
-    const noteSegments = [];
-    if (theCase.caseId) noteSegments.push(`Case ID: ${theCase.caseId}`);
-    if (theCase.serviceRequestId)
-      noteSegments.push(`Service ID: ${theCase.serviceRequestId}`);
-    const notes = noteSegments.join(" | ") || null;
-
-    const customFields = [
-      {
-        customfield_id: ZOHO_CUSTOMFIELD_CASE_ID,
-        index: 3,
-        label: "TE Case ID",
-        value: theCase.caseId || "",
-      },
-      {
-        customfield_id: ZOHO_CUSTOMFIELD_TICKET_ID,
-        index: 4,
-        label: "TE Ticket ID",
-        value: theCase.repairDeskTicketId || "",
-      },
-    ];
-
-    const requestBody = {
-      customer_id: customerId,
-      date: new Date().toISOString().split("T")[0],
-      line_items: lineItems,
-      pricebook_id: ZOHO_PRICEBOOK_ID_WHOLESALE,
-      notes,
-      template_id: ZOHO_TEMPLATE_ID,
-      custom_fields: customFields,
-    };
-
-    const zohoUrl = `https://www.zohoapis.com/inventory/v1/salesorders?organization_id=${ZOHO_ORG_ID}`;
-    const zohoResp = await handleZohoInventoryPostRequest(zohoUrl, requestBody);
-
-    if (!zohoResp || zohoResp.code !== 0 || !zohoResp.salesorder) {
-      const msg =
-        (zohoResp && zohoResp.message) ||
-        "Zoho Inventory did not accept the order";
-      console.error("Zoho SO create failed:", zohoResp);
-      return res
-        .status(502)
-        .json({ success: false, message: `Zoho: ${msg}`, data: zohoResp || null });
-    }
-
-    const so = zohoResp.salesorder;
-
-    // Build the zohoOrders entry per the schema design — match Zoho's returned
-    // line_items back to the products we sent so we keep the original names/SKUs
-    // even if Zoho's lookup returns different values.
-    const productsByItemId = {};
-    for (const p of products) {
-      if (p && p.product_id) productsByItemId[String(p.product_id)] = p;
-    }
-    const orderLineItems = (so.line_items || []).map((li) => {
-      const sent = productsByItemId[String(li.item_id)];
-      return {
-        partName: li.name || (sent && sent.name) || "",
-        sku: li.sku || (sent && sent.sku) || "",
-        unitPrice: Number(li.rate) || 0,
-        quantitySent: Number(li.quantity) || 1,
-        quantityUsed: 0,
-        quantityReturned: 0,
+        note: note || null,
       };
-    });
 
-    const now = new Date();
-    const orderEntry = {
-      zohoSalesOrderId: so.salesorder_id,
-      zohoSalesOrderNumber: so.salesorder_number,
-      orderedAt: now,
-      receivedAt: null,
-      trackingNumber: null,
-      notes: null,
-      lineItems: orderLineItems,
-    };
-
-    const statusEntry = {
-      status: "waiting-for-parts",
-      at: now,
-      updatedBy: actor(req),
-      note: `Parts dispatched — Zoho SO ${so.salesorder_number}`,
-    };
-
-    const updateResult = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      {
-        $set: { status: "waiting-for-parts", updatedAt: now },
-        $push: {
-          zohoOrders: orderEntry,
-          statusHistory: statusEntry,
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        {
+          $set: { status, updatedAt: now },
+          $push: { statusHistory: historyEntry },
         },
-      },
-      { returnDocument: "after" },
-    );
+        { returnDocument: "after" },
+      );
 
-    const updatedCase = updateResult ? (updateResult.value || updateResult) : null;
-    return res.json({
-      success: true,
-      message: `Sales order ${so.salesorder_number} created`,
-      data: {
-        case: updatedCase,
-        salesOrderId: so.salesorder_id,
-        salesOrderNumber: so.salesorder_number,
-      },
-    });
-  } catch (error) {
-    console.error("Send parts error:", error);
-    return res
-      .status(500)
-      .json({ success: false, message: `Failed to send parts: ${error.message || error}` });
-  }
-});
-
-router.post("/:id/markRepaired", requirePermission("sqt:case:markRepaired"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: "Status updated",
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Change status error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to change status" });
     }
+  },
+);
 
-    const collected = !!(req.body && req.body.collected);
-    const usage = Array.isArray(req.body && req.body.usage) ? req.body.usage : [];
-    const newStatus = collected ? "repaired-and-collected" : "repaired";
+router.post(
+  "/:id/sendParts",
+  requirePermission("sqt:case:sendParts"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
 
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
+      const products = Array.isArray(req.body && req.body.products)
+        ? req.body.products
+        : [];
+      const lineItems = products
+        .filter((p) => p && p.product_id)
+        .map((p) => ({ item_id: String(p.product_id), quantity: 1 }));
 
-    const theCase = await collection.findOne({ _id: new ObjectId(id) });
-    if (!theCase) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
+      if (lineItems.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "At least one product with a product_id is required",
+        });
+      }
 
-    // Apply usage updates onto a clone of zohoOrders, then save the whole array back.
-    // Addressing each line item by (zohoSalesOrderId, lineItemIdx) keeps the update
-    // robust even if the array order changes between client load and submit.
-    const orders = Array.isArray(theCase.zohoOrders)
-      ? JSON.parse(JSON.stringify(theCase.zohoOrders))
-      : [];
-    let usedCount = 0;
-    for (const u of usage) {
-      if (!u || !u.zohoSalesOrderId) continue;
-      const order = orders.find((o) => o.zohoSalesOrderId === u.zohoSalesOrderId);
-      if (!order || !Array.isArray(order.lineItems)) continue;
-      const li = order.lineItems[u.lineItemIdx];
-      if (!li) continue;
-      const qty = Math.max(0, Number(u.quantityUsed) || 0);
-      li.quantityUsed = qty;
-      if (qty > 0) usedCount += 1;
-    }
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
 
-    const now = new Date();
-    const statusEntry = {
-      status: newStatus,
-      at: now,
-      updatedBy: actor(req),
-      note: collected
-        ? `Repair complete — device collected; ${usedCount} part(s) used`
-        : `Repair complete — awaiting pickup; ${usedCount} part(s) used`,
-    };
+      const theCase = await collection.findOne({ _id: new ObjectId(id) });
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      if (!theCase.shopId) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Case has no shop assigned" });
+      }
 
-    const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      {
-        $set: { status: newStatus, updatedAt: now, zohoOrders: orders },
-        $push: { statusHistory: statusEntry },
-      },
-      { returnDocument: "after" },
-    );
+      const shop = await db
+        .collection("sqt_shops")
+        .findOne({ _id: theCase.shopId });
+      if (!shop) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Shop not found" });
+      }
+      const customerId = shop.externalIds && shop.externalIds.zohoId;
+      if (!customerId) {
+        return res.status(400).json({
+          success: false,
+          message: `Shop "${shop.storeName}" has no Zoho ID configured`,
+        });
+      }
 
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, message: `Status updated to ${newStatus}`, data: updated });
-  } catch (error) {
-    console.error("Mark repaired error:", error);
-    return res
-      .status(500)
-      .json({ success: false, message: `Failed to mark repaired: ${error.message || error}` });
-  }
-});
+      // Build notes from whatever identifiers exist (skip empty parts)
+      const noteSegments = [];
+      if (theCase.caseId) noteSegments.push(`Case ID: ${theCase.caseId}`);
+      if (theCase.serviceRequestId)
+        noteSegments.push(`Service ID: ${theCase.serviceRequestId}`);
+      const notes = noteSegments.join(" | ") || null;
 
-router.post("/:id/partsReceived", requirePermission("sqt:case:partsReceived"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-
-    const customerNotified = !!(req.body && req.body.customerNotified);
-    const newStatus = customerNotified ? "waiting-for-drop-off" : "parts-arrived";
-
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
-
-    const theCase = await collection.findOne({ _id: new ObjectId(id) });
-    if (!theCase) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-
-    // Count how many orders we'll mark received (for the status note)
-    const ordersToMark = (Array.isArray(theCase.zohoOrders) ? theCase.zohoOrders : [])
-      .filter((o) => !o || !o.receivedAt).length;
-
-    const now = new Date();
-    const noteParts = [
-      ordersToMark > 0
-        ? `${ordersToMark} order${ordersToMark === 1 ? "" : "s"} marked received`
-        : "No outstanding orders",
-      customerNotified ? "customer notified for drop-off" : "customer not yet notified",
-    ];
-    if (req.body && req.body.note) noteParts.push(req.body.note);
-
-    const statusEntry = {
-      status: newStatus,
-      at: now,
-      updatedBy: actor(req),
-      note: noteParts.join(" — "),
-    };
-
-    const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          status: newStatus,
-          updatedAt: now,
-          // Mark all orders that don't yet have a receivedAt — `$[order]` with
-          // an arrayFilter so we don't overwrite any already-received timestamp.
-          "zohoOrders.$[order].receivedAt": now,
+      const customFields = [
+        {
+          customfield_id: ZOHO_CUSTOMFIELD_CASE_ID,
+          index: 3,
+          label: "TE Case ID",
+          value: theCase.caseId || "",
         },
-        $push: { statusHistory: statusEntry },
-      },
-      {
-        returnDocument: "after",
-        // Match orders where receivedAt is null OR the field is missing entirely
-        arrayFilters: [
-          {
-            $or: [
-              { "order.receivedAt": null },
-              { "order.receivedAt": { $exists: false } },
-            ],
+        {
+          customfield_id: ZOHO_CUSTOMFIELD_TICKET_ID,
+          index: 4,
+          label: "TE Ticket ID",
+          value: theCase.repairDeskTicketId || "",
+        },
+      ];
+
+      const requestBody = {
+        customer_id: customerId,
+        date: new Date().toISOString().split("T")[0],
+        line_items: lineItems,
+        pricebook_id: ZOHO_PRICEBOOK_ID_WHOLESALE,
+        notes,
+        template_id: ZOHO_TEMPLATE_ID,
+        custom_fields: customFields,
+      };
+
+      const zohoUrl = `https://www.zohoapis.com/inventory/v1/salesorders?organization_id=${ZOHO_ORG_ID}`;
+      const zohoResp = await handleZohoInventoryPostRequest(
+        zohoUrl,
+        requestBody,
+      );
+
+      if (!zohoResp || zohoResp.code !== 0 || !zohoResp.salesorder) {
+        const msg =
+          (zohoResp && zohoResp.message) ||
+          "Zoho Inventory did not accept the order";
+        console.error("Zoho SO create failed:", zohoResp);
+        return res.status(502).json({
+          success: false,
+          message: `Zoho: ${msg}`,
+          data: zohoResp || null,
+        });
+      }
+
+      const so = zohoResp.salesorder;
+
+      // Build the zohoOrders entry per the schema design — match Zoho's returned
+      // line_items back to the products we sent so we keep the original names/SKUs
+      // even if Zoho's lookup returns different values.
+      const productsByItemId = {};
+      for (const p of products) {
+        if (p && p.product_id) productsByItemId[String(p.product_id)] = p;
+      }
+      const orderLineItems = (so.line_items || []).map((li) => {
+        const sent = productsByItemId[String(li.item_id)];
+        return {
+          partName: li.name || (sent && sent.name) || "",
+          sku: li.sku || (sent && sent.sku) || "",
+          unitPrice: Number(li.rate) || 0,
+          quantitySent: Number(li.quantity) || 1,
+          quantityUsed: 0,
+          quantityReturned: 0,
+        };
+      });
+
+      const now = new Date();
+      const orderEntry = {
+        zohoSalesOrderId: so.salesorder_id,
+        zohoSalesOrderNumber: so.salesorder_number,
+        orderedAt: now,
+        receivedAt: null,
+        trackingNumber: null,
+        notes: null,
+        lineItems: orderLineItems,
+      };
+
+      const statusEntry = {
+        status: "waiting-for-parts",
+        at: now,
+        updatedBy: actor(req),
+        note: `Parts dispatched — Zoho SO ${so.salesorder_number}`,
+      };
+
+      const updateResult = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        {
+          $set: { status: "waiting-for-parts", updatedAt: now },
+          $push: {
+            zohoOrders: orderEntry,
+            statusHistory: statusEntry,
           },
-        ],
-      },
-    );
+        },
+        { returnDocument: "after" },
+      );
 
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({
-      success: true,
-      message: `Status updated to ${newStatus}`,
-      data: updated,
-    });
-  } catch (error) {
-    console.error("Parts received error:", error);
-    return res
-      .status(500)
-      .json({ success: false, message: `Failed to mark parts received: ${error.message || error}` });
-  }
-});
+      const updatedCase = updateResult
+        ? updateResult.value || updateResult
+        : null;
 
-router.put("/:id/device", requirePermission("sqt:case:editDevice"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-
-    // Only allow a defined whitelist of device fields, partial update style
-    const allowed = ["description", "imei", "brand", "category", "purchasePrice", "purchaseDate"];
-    const setOps = {};
-    for (const f of allowed) {
-      if (req.body[f] !== undefined) {
-        if (f === "purchasePrice") {
-          setOps[`device.${f}`] =
-            req.body[f] === null || req.body[f] === "" ? null : Number(req.body[f]);
-        } else if (f === "purchaseDate") {
-          setOps[`device.${f}`] = toDateOrNull(req.body[f]);
-        } else if (f === "imei") {
-          setOps[`device.${f}`] = req.body[f] ? String(req.body[f]).trim() : null;
-        } else {
-          setOps[`device.${f}`] = req.body[f] || null;
+      // Best-effort: mirror the status change in RepairDesk. A failure here must
+      // NOT roll back the Zoho order / case update — surface it in the response
+      // so the frontend can warn, but the case stays in waiting-for-parts.
+      let repairDesk = null;
+      if (theCase.repairDeskTicketId) {
+        try {
+          const rdResp = await updateTicketStatus(
+            theCase.repairDeskTicketId,
+            "Waiting For Parts",
+          );
+          repairDesk = { success: true, response: rdResp };
+        } catch (e) {
+          const detail = (e.response && e.response.data) || e.message;
+          console.error("RepairDesk updateTicketStatus failed:", detail);
+          repairDesk = { success: false, error: detail };
         }
-      }
-    }
-
-    // modelId update needs to resolve modelName as well
-    if (req.body.modelId !== undefined) {
-      if (req.body.modelId) {
-        const db = await connectToDatabase();
-        const model = await resolveModel(db, req.body.modelId);
-        if (!model) {
-          return res.status(404).json({ success: false, message: "Model not found" });
-        }
-        setOps["device.modelId"] = model._id;
-        setOps["device.modelName"] = model.name;
       } else {
-        setOps["device.modelId"] = null;
-        setOps["device.modelName"] = null;
+        repairDesk = { success: false, error: "no repairDeskTicketId on case" };
       }
+
+      return res.json({
+        success: true,
+        message: `Sales order ${so.salesorder_number} created`,
+        data: {
+          case: updatedCase,
+          salesOrderId: so.salesorder_id,
+          salesOrderNumber: so.salesorder_number,
+          repairDesk,
+        },
+      });
+    } catch (error) {
+      console.error("Send parts error:", error);
+      return res.status(500).json({
+        success: false,
+        message: `Failed to send parts: ${error.message || error}`,
+      });
     }
+  },
+);
 
-    if (Object.keys(setOps).length === 0) {
-      return res.status(400).json({ success: false, message: "No device fields to update" });
+router.post(
+  "/:id/markRepaired",
+  requirePermission("sqt:case:markRepaired"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+
+      const collected = !!(req.body && req.body.collected);
+      const usage = Array.isArray(req.body && req.body.usage)
+        ? req.body.usage
+        : [];
+      const newStatus = collected ? "repaired-and-collected" : "repaired";
+
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      const theCase = await collection.findOne({ _id: new ObjectId(id) });
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+
+      // Apply usage updates onto a clone of zohoOrders, then save the whole array back.
+      // Addressing each line item by (zohoSalesOrderId, lineItemIdx) keeps the update
+      // robust even if the array order changes between client load and submit.
+      const orders = Array.isArray(theCase.zohoOrders)
+        ? JSON.parse(JSON.stringify(theCase.zohoOrders))
+        : [];
+      let usedCount = 0;
+      for (const u of usage) {
+        if (!u || !u.zohoSalesOrderId) continue;
+        const order = orders.find(
+          (o) => o.zohoSalesOrderId === u.zohoSalesOrderId,
+        );
+        if (!order || !Array.isArray(order.lineItems)) continue;
+        const li = order.lineItems[u.lineItemIdx];
+        if (!li) continue;
+        const qty = Math.max(0, Number(u.quantityUsed) || 0);
+        li.quantityUsed = qty;
+        if (qty > 0) usedCount += 1;
+      }
+
+      const now = new Date();
+      const statusEntry = {
+        status: newStatus,
+        at: now,
+        updatedBy: actor(req),
+        note: collected
+          ? `Repair complete — device collected; ${usedCount} part(s) used`
+          : `Repair complete — awaiting pickup; ${usedCount} part(s) used`,
+      };
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        {
+          $set: { status: newStatus, updatedAt: now, zohoOrders: orders },
+          $push: { statusHistory: statusEntry },
+        },
+        { returnDocument: "after" },
+      );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: `Status updated to ${newStatus}`,
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Mark repaired error:", error);
+      return res.status(500).json({
+        success: false,
+        message: `Failed to mark repaired: ${error.message || error}`,
+      });
     }
+  },
+);
 
-    setOps.updatedAt = new Date();
+router.post(
+  "/:id/partsReceived",
+  requirePermission("sqt:case:partsReceived"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
 
-    const db = await connectToDatabase();
-    const result = await db.collection(COLLECTION).findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      { $set: setOps },
-      { returnDocument: "after" },
-    );
+      const customerNotified = !!(req.body && req.body.customerNotified);
+      const newStatus = customerNotified
+        ? "waiting-for-drop-off"
+        : "parts-arrived";
 
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      const theCase = await collection.findOne({ _id: new ObjectId(id) });
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+
+      // Count how many orders we'll mark received (for the status note)
+      const ordersToMark = (
+        Array.isArray(theCase.zohoOrders) ? theCase.zohoOrders : []
+      ).filter((o) => !o || !o.receivedAt).length;
+
+      const now = new Date();
+      const noteParts = [
+        ordersToMark > 0
+          ? `${ordersToMark} order${ordersToMark === 1 ? "" : "s"} marked received`
+          : "No outstanding orders",
+        customerNotified
+          ? "customer notified for drop-off"
+          : "customer not yet notified",
+      ];
+      if (req.body && req.body.note) noteParts.push(req.body.note);
+
+      const statusEntry = {
+        status: newStatus,
+        at: now,
+        updatedBy: actor(req),
+        note: noteParts.join(" — "),
+      };
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: newStatus,
+            updatedAt: now,
+            // Mark all orders that don't yet have a receivedAt — `$[order]` with
+            // an arrayFilter so we don't overwrite any already-received timestamp.
+            "zohoOrders.$[order].receivedAt": now,
+          },
+          $push: { statusHistory: statusEntry },
+        },
+        {
+          returnDocument: "after",
+          // Match orders where receivedAt is null OR the field is missing entirely
+          arrayFilters: [
+            {
+              $or: [
+                { "order.receivedAt": null },
+                { "order.receivedAt": { $exists: false } },
+              ],
+            },
+          ],
+        },
+      );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: `Status updated to ${newStatus}`,
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Parts received error:", error);
+      return res.status(500).json({
+        success: false,
+        message: `Failed to mark parts received: ${error.message || error}`,
+      });
     }
-    return res.json({ success: true, message: "Device info updated", data: updated });
-  } catch (error) {
-    console.error("Update device error:", error);
-    return res.status(500).json({ success: false, message: "Failed to update device info" });
-  }
-});
+  },
+);
 
-router.post("/:id/notes", requirePermission("sqt:case:note"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
+router.put(
+  "/:id/device",
+  requirePermission("sqt:case:editDevice"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+
+      // Only allow a defined whitelist of device fields, partial update style
+      const allowed = [
+        "description",
+        "imei",
+        "brand",
+        "category",
+        "purchasePrice",
+        "purchaseDate",
+      ];
+      const setOps = {};
+      for (const f of allowed) {
+        if (req.body[f] !== undefined) {
+          if (f === "purchasePrice") {
+            setOps[`device.${f}`] =
+              req.body[f] === null || req.body[f] === ""
+                ? null
+                : Number(req.body[f]);
+          } else if (f === "purchaseDate") {
+            setOps[`device.${f}`] = toDateOrNull(req.body[f]);
+          } else if (f === "imei") {
+            setOps[`device.${f}`] = req.body[f]
+              ? String(req.body[f]).trim()
+              : null;
+          } else {
+            setOps[`device.${f}`] = req.body[f] || null;
+          }
+        }
+      }
+
+      // modelId update needs to resolve modelName as well
+      if (req.body.modelId !== undefined) {
+        if (req.body.modelId) {
+          const db = await connectToDatabase();
+          const model = await resolveModel(db, req.body.modelId);
+          if (!model) {
+            return res
+              .status(404)
+              .json({ success: false, message: "Model not found" });
+          }
+          setOps["device.modelId"] = model._id;
+          setOps["device.modelName"] = model.name;
+        } else {
+          setOps["device.modelId"] = null;
+          setOps["device.modelName"] = null;
+        }
+      }
+
+      if (Object.keys(setOps).length === 0) {
+        return res
+          .status(400)
+          .json({ success: false, message: "No device fields to update" });
+      }
+
+      setOps.updatedAt = new Date();
+
+      const db = await connectToDatabase();
+      const result = await db
+        .collection(COLLECTION)
+        .findOneAndUpdate(
+          { _id: new ObjectId(id) },
+          { $set: setOps },
+          { returnDocument: "after" },
+        );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: "Device info updated",
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Update device error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to update device info" });
     }
+  },
+);
 
-    const text = req.body && req.body.text ? String(req.body.text).trim() : "";
-    if (!text) {
-      return res.status(400).json({ success: false, message: "Note text is required" });
+router.post(
+  "/:id/notes",
+  requirePermission("sqt:case:note"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+
+      const text =
+        req.body && req.body.text ? String(req.body.text).trim() : "";
+      if (!text) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Note text is required" });
+      }
+
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      const note = {
+        text,
+        at: new Date(),
+        addedBy: actor(req),
+      };
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $push: { notes: note }, $set: { updatedAt: note.at } },
+        { returnDocument: "after" },
+      );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({ success: true, message: "Note added", data: updated });
+    } catch (error) {
+      console.error("Add note error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to add note" });
     }
-
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
-
-    const note = {
-      text,
-      at: new Date(),
-      addedBy: actor(req),
-    };
-
-    const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      { $push: { notes: note }, $set: { updatedAt: note.at } },
-      { returnDocument: "after" },
-    );
-
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, message: "Note added", data: updated });
-  } catch (error) {
-    console.error("Add note error:", error);
-    return res.status(500).json({ success: false, message: "Failed to add note" });
-  }
-});
+  },
+);
 
 // Select the parts used for a case (snapshotted into partsForInvoice) — picked
 // from the parts catalogue of the case's device model. Admin / TechElite only.
-router.post("/:id/parts", requirePermission("sqt:case:selectParts"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-    const selections = Array.isArray(req.body && req.body.parts) ? req.body.parts : [];
+router.post(
+  "/:id/parts",
+  requirePermission("sqt:case:selectParts"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      const selections = Array.isArray(req.body && req.body.parts)
+        ? req.body.parts
+        : [];
 
-    const db = await connectToDatabase();
-    const collection = db.collection(COLLECTION);
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
 
-    const theCase = await collection.findOne({ _id: new ObjectId(id) });
-    if (!theCase) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
+      const theCase = await collection.findOne({ _id: new ObjectId(id) });
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
 
-    // Snapshot each selected part from sqt_parts_prices
-    const partsForInvoice = [];
-    for (const sel of selections) {
-      if (!sel || !ObjectId.isValid(sel.partPriceId)) continue;
-      const part = await db
-        .collection("sqt_parts_prices")
-        .findOne({ _id: new ObjectId(sel.partPriceId) });
-      if (!part) continue;
-      partsForInvoice.push({
-        partPriceId: part._id,
-        partName: part.partName || null,
-        modelName: part.modelName || null,
-        genuine: !!part.genuine,
-        sku: (part.identifiers && part.identifiers.sku) || null,
-        partNumber: (part.identifiers && part.identifiers.partNumber) || null,
-        unitPrice: Number(part.price) || 0,
-        quantity: Math.max(1, Number(sel.quantity) || 1),
+      // Snapshot each selected part from sqt_parts_prices
+      const partsForInvoice = [];
+      for (const sel of selections) {
+        if (!sel || !ObjectId.isValid(sel.partPriceId)) continue;
+        const part = await db
+          .collection("sqt_parts_prices")
+          .findOne({ _id: new ObjectId(sel.partPriceId) });
+        if (!part) continue;
+        partsForInvoice.push({
+          partPriceId: part._id,
+          partName: part.partName || null,
+          modelName: part.modelName || null,
+          genuine: !!part.genuine,
+          sku: (part.identifiers && part.identifiers.sku) || null,
+          partNumber: (part.identifiers && part.identifiers.partNumber) || null,
+          unitPrice: Number(part.price) || 0,
+          quantity: Math.max(1, Number(sel.quantity) || 1),
+        });
+      }
+
+      const now = new Date();
+      const update = { $set: { partsForInvoice, updatedAt: now } };
+
+      // Selecting at least one part hands the case off to Solvup for invoicing.
+      if (partsForInvoice.length > 0) {
+        update.$set.status = "waiting-solvup";
+        update.$push = {
+          statusHistory: {
+            status: "waiting-solvup",
+            at: now,
+            updatedBy: actor(req),
+            note: `${partsForInvoice.length} part(s) selected — awaiting Solvup`,
+          },
+        };
+      }
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        update,
+        { returnDocument: "after" },
+      );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: "Parts selected",
+        data: updated,
       });
+    } catch (error) {
+      console.error("Select parts error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to select parts" });
     }
+  },
+);
 
-    const now = new Date();
-    const update = { $set: { partsForInvoice, updatedAt: now } };
-
-    // Selecting at least one part hands the case off to Solvup for invoicing.
-    if (partsForInvoice.length > 0) {
-      update.$set.status = "waiting-solvup";
-      update.$push = {
-        statusHistory: {
-          status: "waiting-solvup",
-          at: now,
-          updatedBy: actor(req),
-          note: `${partsForInvoice.length} part(s) selected — awaiting Solvup`,
-        },
-      };
+router.post(
+  "/delete",
+  requirePermission("sqt:case:delete"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.body;
+      if (!id || !ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      const db = await connectToDatabase();
+      const result = await db
+        .collection(COLLECTION)
+        .deleteOne({ _id: new ObjectId(id) });
+      if (result.deletedCount === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({ success: true, message: "Case deleted" });
+    } catch (error) {
+      console.error("Delete case error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to delete case" });
     }
-
-    const result = await collection.findOneAndUpdate(
-      { _id: new ObjectId(id) },
-      update,
-      { returnDocument: "after" },
-    );
-
-    const updated = result ? (result.value || result) : null;
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, message: "Parts selected", data: updated });
-  } catch (error) {
-    console.error("Select parts error:", error);
-    return res.status(500).json({ success: false, message: "Failed to select parts" });
-  }
-});
-
-router.post("/delete", requirePermission("sqt:case:delete"), authorizeCaseAccess, async function (req, res, next) {
-  try {
-    const { id } = req.body;
-    if (!id || !ObjectId.isValid(id)) {
-      return res.status(400).json({ success: false, message: "Invalid case id" });
-    }
-    const db = await connectToDatabase();
-    const result = await db.collection(COLLECTION).deleteOne({ _id: new ObjectId(id) });
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ success: false, message: "Case not found" });
-    }
-    return res.json({ success: true, message: "Case deleted" });
-  } catch (error) {
-    console.error("Delete case error:", error);
-    return res.status(500).json({ success: false, message: "Failed to delete case" });
-  }
-});
+  },
+);
 
 module.exports = router;
