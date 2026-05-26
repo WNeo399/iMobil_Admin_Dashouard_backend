@@ -11,6 +11,7 @@ var indexRouter = require('./routes/index');
 var usersRouter = require('./routes/users');
 var zohoRouter = require('./routes/zohoRoutes/index');
 var sqtRouter = require('./routes/sqtRoutes/index');
+var dashboardRouter = require('./routes/dashboardRoutes/index');
 var authRouter = require('./routes/authRoutes/index');
 // TEMPORARY: external-integration endpoint (no auth). Remove together with
 // routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
@@ -40,6 +41,7 @@ app.use(tempIntegrationRouter);
 // applied inside the routers.
 app.use('/zoho', authenticate, zohoRouter);
 app.use('/sqt', authenticate, sqtRouter);
+app.use('/dashboard', authenticate, dashboardRouter);
 app.use('/users', authenticate, usersRouter);
 
 // catch 404 and forward to error handler
