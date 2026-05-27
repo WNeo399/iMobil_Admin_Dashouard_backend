@@ -13,7 +13,7 @@ const {
 
 const COLLECTION = "users";
 
-// Only Admin (the *:*:* wildcard) holds this permission.
+// Admin (*:*:*) and TechElite Admin both hold this permission.
 const requireUserAdmin = requirePermission("system:user:manage");
 
 // Never leak the password hash to the client.
@@ -24,6 +24,16 @@ function normalizeShopIds(shopIds) {
   return shopIds
     .filter((id) => ObjectId.isValid(id))
     .map((id) => new ObjectId(id));
+}
+
+// Role-aware variant: Repair Shop is a single-shop role (one physical
+// location, one account), Repair Shop Owner can hold many. Trimming on the
+// server side guarantees the invariant even if a client sends extras.
+function normalizeShopIdsForRole(shopIds, role) {
+  if (!isShopScopedRole(role)) return [];
+  const ids = normalizeShopIds(shopIds);
+  if (role === ROLES.REPAIR_SHOP) return ids.slice(0, 1);
+  return ids;
 }
 
 // Roles available for assignment (for the role dropdown)
@@ -38,7 +48,7 @@ router.get("/roles", requireUserAdmin, function (req, res) {
 
 router.get("/list", requireUserAdmin, async function (req, res, next) {
   try {
-    const { role, search, active } = req.query;
+    const { role, search, active, shopId } = req.query;
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
 
@@ -53,6 +63,17 @@ router.get("/list", requireUserAdmin, async function (req, res, next) {
     if (search) {
       const re = { $regex: String(search), $options: "i" };
       query.$or = [{ username: re }, { email: re }];
+    }
+
+    // Used by the Shop edit dialog's Users tab — match any user whose shopIds
+    // array contains this shop. When the caller didn't already constrain the
+    // role, restrict to the shop-scoped roles so we don't surface, say, an
+    // admin user that happens to have a shop linked to them.
+    if (shopId && ObjectId.isValid(shopId)) {
+      query.shopIds = new ObjectId(shopId);
+      if (!query.role) {
+        query.role = { $in: [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP] };
+      }
     }
 
     const totalDocs = await collection.countDocuments(query);
@@ -100,14 +121,16 @@ router.get("/detail/:id", requireUserAdmin, async function (req, res, next) {
 router.post("/create", requireUserAdmin, async function (req, res, next) {
   try {
     const username = (req.body.username || "").trim();
+    // Email is optional — users can log in with just their username. When
+    // provided we still lowercase + uniqueness-check it.
     const email = (req.body.email || "").trim().toLowerCase();
     const password = req.body.password;
     const role = req.body.role;
 
-    if (!username || !email || !password) {
+    if (!username || !password) {
       return res
         .status(400)
-        .json({ success: false, message: "username, email and password are required" });
+        .json({ success: false, message: "username and password are required" });
     }
     if (!isValidRole(role)) {
       return res.status(400).json({ success: false, message: "Invalid role" });
@@ -116,7 +139,12 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
     const db = await connectToDatabase();
     const collection = db.collection(COLLECTION);
 
-    const dup = await collection.findOne({ $or: [{ username }, { email }] });
+    // Uniqueness — always check the username, and also the email when one
+    // was supplied. We never compare on an empty email (that would collide
+    // every other email-less user against each other).
+    const dupOr = [{ username }];
+    if (email) dupOr.push({ email });
+    const dup = await collection.findOne({ $or: dupOr });
     if (dup) {
       return res
         .status(409)
@@ -126,11 +154,12 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
     const now = new Date();
     const doc = {
       username,
-      email,
+      email: email || null,
       passwordHash: await hashPassword(password),
       role,
-      // Shop list only matters for shop-scoped roles
-      shopIds: isShopScopedRole(role) ? normalizeShopIds(req.body.shopIds) : [],
+      // Shop list only matters for shop-scoped roles. normalizeShopIdsForRole
+      // also enforces the max-1 rule for the repair-shop role.
+      shopIds: normalizeShopIdsForRole(req.body.shopIds, role),
       active: req.body.active === undefined ? true : !!req.body.active,
       createdAt: now,
       updatedAt: now,
@@ -165,7 +194,13 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     const update = { updatedAt: new Date() };
 
     if (req.body.username !== undefined) update.username = String(req.body.username).trim();
-    if (req.body.email !== undefined) update.email = String(req.body.email).trim().toLowerCase();
+    // Email is optional — treat empty string as "clear it" and store null so
+    // the unique-email check below doesn't see one user's "" colliding with
+    // another's.
+    if (req.body.email !== undefined) {
+      const trimmed = String(req.body.email).trim().toLowerCase();
+      update.email = trimmed === "" ? null : trimmed;
+    }
     if (req.body.active !== undefined) update.active = !!req.body.active;
 
     let effectiveRole = existing.role;
@@ -177,14 +212,17 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
       effectiveRole = req.body.role;
     }
 
-    // Keep shopIds consistent with the (effective) role
+    // Keep shopIds consistent with the (effective) role — incl. enforcing
+    // the max-1 rule for repair-shop. We use the existing shopIds when the
+    // request didn't include them so a pure role-change still gets trimmed
+    // (e.g. shop-owner → repair-shop with prior multi-shop list).
     if (req.body.shopIds !== undefined || req.body.role !== undefined) {
-      update.shopIds = isShopScopedRole(effectiveRole)
-        ? normalizeShopIds(req.body.shopIds !== undefined ? req.body.shopIds : existing.shopIds)
-        : [];
+      const sourceIds = req.body.shopIds !== undefined ? req.body.shopIds : existing.shopIds;
+      update.shopIds = normalizeShopIdsForRole(sourceIds, effectiveRole);
     }
 
-    // Uniqueness checks when username/email changed
+    // Uniqueness checks when username/email changed — skip email when it
+    // was cleared (null) so an empty value can be reused across users.
     const orClauses = [];
     if (update.username) orClauses.push({ username: update.username });
     if (update.email) orClauses.push({ email: update.email });

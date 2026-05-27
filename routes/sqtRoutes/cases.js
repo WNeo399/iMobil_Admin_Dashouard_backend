@@ -58,6 +58,16 @@ const VALID_STATUSES = [
   "cancelled",
 ];
 
+// Admin-side limbo states that shop roles should never see — they represent
+// work being handled internally by Admin / TechElite Admin (paused by an
+// admin, or handed off to Solvup). Filtered out of list/counts for
+// shop-scoped users so the shop's view stays focused on what's actionable.
+const ADMIN_ONLY_STATUSES = ["on-hold", "waiting-solvup"];
+
+function isShopScopedUser(req) {
+  return Array.isArray(req.user && req.user.accessibleShopIds);
+}
+
 function toDateOrNull(v) {
   if (!v) return null;
   const d = new Date(v);
@@ -248,15 +258,24 @@ router.get(
       const collection = db.collection(COLLECTION);
 
       const query = {};
+      const shopScoped = isShopScopedUser(req);
 
       if (status) {
-        const arr =
+        let arr =
           typeof status === "string"
             ? status.split(",")
             : Array.isArray(status)
               ? status
               : [status];
+        // Strip admin-only statuses from a shop user's request so they can't
+        // request them via URL hack.
+        if (shopScoped) {
+          arr = arr.filter((s) => !ADMIN_ONLY_STATUSES.includes(s));
+        }
         query.status = { $in: arr };
+      } else if (shopScoped) {
+        // No explicit filter — silently hide admin-only statuses.
+        query.status = { $nin: ADMIN_ONLY_STATUSES };
       }
 
       if (shopId && ObjectId.isValid(shopId)) {
@@ -324,6 +343,12 @@ router.get(
         match.shopId = new ObjectId(req.query.shopId);
       }
       applyShopScope(req, match);
+      // Hide admin-only statuses from shop-scoped users so the totals match
+      // what the same user sees in /list.
+      const shopScoped = isShopScopedUser(req);
+      if (shopScoped) {
+        match.status = { $nin: ADMIN_ONLY_STATUSES };
+      }
 
       const pipeline = [];
       if (Object.keys(match).length > 0) pipeline.push({ $match: match });
@@ -336,7 +361,13 @@ router.get(
 
       const counts = {};
       let total = 0;
-      for (const s of VALID_STATUSES) counts[s] = 0;
+      // Only initialize statuses the user is allowed to see — keeps the
+      // counts object compact and prevents the frontend from rendering
+      // empty admin-only nodes in the tree.
+      const visibleStatuses = shopScoped
+        ? VALID_STATUSES.filter((s) => !ADMIN_ONLY_STATUSES.includes(s))
+        : VALID_STATUSES;
+      for (const s of visibleStatuses) counts[s] = 0;
       for (const row of result) {
         if (row._id) {
           counts[row._id] = row.count;

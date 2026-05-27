@@ -37,7 +37,9 @@ const SHOP_CASE_PERMISSIONS = [
 const ROLE_PERMISSIONS = {
   [ROLES.ADMIN]: ["*:*:*"],
   [ROLES.IMOBILE_ADMIN]: ["zoho:*:*"],
-  [ROLES.TECHELITE_ADMIN]: ["sqt:*:*"],
+  // TechElite Admin owns the SQT domain and also manages users (read/create/
+  // edit/delete + password reset) via the System → Users page.
+  [ROLES.TECHELITE_ADMIN]: ["sqt:*:*", "system:user:manage"],
   [ROLES.SHOP_OWNER]: [...SHOP_CASE_PERMISSIONS],
   [ROLES.REPAIR_SHOP]: [...SHOP_CASE_PERMISSIONS],
 };
