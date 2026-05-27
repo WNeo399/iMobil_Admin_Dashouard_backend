@@ -3,7 +3,7 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
-const { updateTicketStatus } = require("../../utils/repairDesk");
+const { syncCaseStatus } = require("../../utils/repairDesk");
 const { requirePermission } = require("../../middleware/auth");
 
 // The generic /status endpoint serves several transitions; the permission it
@@ -613,6 +613,12 @@ router.post(
           .status(404)
           .json({ success: false, message: "Case not found" });
       }
+
+      // TEMP: mirror the status into RepairDesk. Never blocks the response on
+      // RepairDesk being slow/down — syncCaseStatus catches its own errors.
+      // Remove together with utils/repairDesk.js when RepairDesk is dropped.
+      await syncCaseStatus(updated, status);
+
       return res.json({
         success: true,
         message: "Status updated",
@@ -790,25 +796,15 @@ router.post(
         ? updateResult.value || updateResult
         : null;
 
-      // Best-effort: mirror the status change in RepairDesk. A failure here must
-      // NOT roll back the Zoho order / case update — surface it in the response
-      // so the frontend can warn, but the case stays in waiting-for-parts.
-      let repairDesk = null;
-      if (theCase.repairDeskTicketId) {
-        try {
-          const rdResp = await updateTicketStatus(
-            theCase.repairDeskTicketId,
-            "Waiting For Parts",
-          );
-          repairDesk = { success: true, response: rdResp };
-        } catch (e) {
-          const detail = (e.response && e.response.data) || e.message;
-          console.error("RepairDesk updateTicketStatus failed:", detail);
-          repairDesk = { success: false, error: detail };
-        }
-      } else {
-        repairDesk = { success: false, error: "no repairDeskTicketId on case" };
-      }
+      // TEMP: mirror the status into RepairDesk via the shared helper. Uses
+      // the stored repairDeskTicketId if present, otherwise falls back to a
+      // search-by-caseId. Failures here must not roll back the Zoho/case
+      // update — surface the outcome in the response so the frontend can
+      // warn, but the case stays in waiting-for-parts.
+      const rdResult = await syncCaseStatus(updatedCase || theCase, "waiting-for-parts");
+      const repairDesk = rdResult.synced
+        ? { success: true }
+        : { success: false, error: rdResult.reason || "sync failed" };
 
       return res.json({
         success: true,
@@ -904,6 +900,10 @@ router.post(
           .status(404)
           .json({ success: false, message: "Case not found" });
       }
+
+      // TEMP: mirror to RepairDesk. See utils/repairDesk.js comment.
+      await syncCaseStatus(updated, newStatus);
+
       return res.json({
         success: true,
         message: `Status updated to ${newStatus}`,
@@ -1002,6 +1002,10 @@ router.post(
           .status(404)
           .json({ success: false, message: "Case not found" });
       }
+
+      // TEMP: mirror to RepairDesk. See utils/repairDesk.js comment.
+      await syncCaseStatus(updated, newStatus);
+
       return res.json({
         success: true,
         message: `Status updated to ${newStatus}`,

@@ -4,9 +4,38 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../../../utils/mongodb");
 
+// Normalize the `products` payload from a Selection-type collection. We accept
+// either an array of objects ({ itemId, sku, name, imageUrl }) or a plain
+// array of itemId strings (legacy / lightweight callers). Drops anything
+// without a usable itemId and de-duplicates so the same item can't appear
+// twice in one collection.
+function sanitizeProducts(input) {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of input) {
+    if (!raw) continue;
+    const itemId =
+      typeof raw === "string" || typeof raw === "number"
+        ? String(raw).trim()
+        : raw.itemId != null
+          ? String(raw.itemId).trim()
+          : "";
+    if (!itemId || seen.has(itemId)) continue;
+    seen.add(itemId);
+    out.push({
+      itemId,
+      sku: raw.sku ? String(raw.sku) : "",
+      name: raw.name ? String(raw.name) : "",
+      imageUrl: raw.imageUrl ? String(raw.imageUrl) : "",
+    });
+  }
+  return out;
+}
+
 router.post("/create", async function (req, res, next) {
   try {
-    const { title, type, rules, children, note, status } = req.body;
+    const { title, type, rules, children, note, status, products } = req.body;
 
     // basic validation
     if (!title) {
@@ -27,6 +56,11 @@ router.post("/create", async function (req, res, next) {
       status: status || "draft",
       rules: rules || [],
       children: children || [],
+      // Selection-type collections store the picked products inline. Each
+      // entry carries the Zoho Inventory item_id (the source of truth for
+      // downstream lookups) plus light display metadata so the edit dialog
+      // can render without re-hitting Commerce/Inventory.
+      products: sanitizeProducts(products),
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -55,7 +89,7 @@ router.post("/create", async function (req, res, next) {
 router.put("/update/:id", async function (req, res, next) {
   try {
     const { id } = req.params;
-    const { title, type, rules, children, status, note } = req.body;
+    const { title, type, rules, children, status, note, products } = req.body;
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
@@ -77,7 +111,10 @@ router.put("/update/:id", async function (req, res, next) {
     if (type !== undefined) updateData.type = type;
     if (rules !== undefined) updateData.rules = rules;
     if (children !== undefined) updateData.children = children;
-    if (status !== undefined) updateData.children = status;
+    // Bug fix: this previously wrote `status` into the `children` field,
+    // which silently dropped status edits and corrupted the children array.
+    if (status !== undefined) updateData.status = status;
+    if (products !== undefined) updateData.products = sanitizeProducts(products);
     const result = await collection.updateOne(
       { _id: new ObjectId(id) },
       {

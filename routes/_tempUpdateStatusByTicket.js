@@ -80,6 +80,27 @@ router.post("/integration/case-status", async function (req, res) {
     const db = await connectToDatabase();
     const collection = db.collection(COLLECTION);
 
+    // Look up first so we can no-op when the inbound status matches what's
+    // already saved. This closes the dashboard→RepairDesk→webhook loop:
+    // when the dashboard pushes a status into RepairDesk, RepairDesk fires
+    // this webhook back; without the guard we'd push the same status into
+    // Mongo again (creating a duplicate statusHistory entry) and the
+    // history would grow on every edit.
+    const existing = await collection.findOne({ repairDeskTicketNumber });
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: `No case found with repairDeskTicketNumber "${repairDeskTicketNumber}"`,
+      });
+    }
+    if (existing.status === resolvedStatus) {
+      return res.json({
+        success: true,
+        message: `Case ${repairDeskTicketNumber} already at ${resolvedStatus} — no change`,
+        data: existing,
+      });
+    }
+
     const now = new Date();
     const historyEntry = {
       status: resolvedStatus,
@@ -99,6 +120,8 @@ router.post("/integration/case-status", async function (req, res) {
 
     const updated = result ? (result.value || result) : null;
     if (!updated) {
+      // The doc disappeared between the read and the update — vanishingly
+      // unlikely but handle it cleanly anyway.
       return res.status(404).json({
         success: false,
         message: `No case found with repairDeskTicketNumber "${repairDeskTicketNumber}"`,

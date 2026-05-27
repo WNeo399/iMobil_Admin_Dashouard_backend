@@ -84,4 +84,21 @@ function requirePermission(required) {
   };
 }
 
-module.exports = { authenticate, requirePermission };
+// "Allowed if the user holds ANY of these permissions" — for endpoints shared
+// across roles whose permission sets don't overlap on a single string. E.g.
+// product search is wanted by both Send Parts (sqt:case:sendParts) and
+// Collection editing (zoho:collection:edit).
+function requireAnyPermission(...permissions) {
+  return function (req, res, next) {
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+    const ok = permissions.some((p) => hasPermission(req.user.permissions, p));
+    if (!ok) {
+      return res.status(403).json({ success: false, message: "Forbidden" });
+    }
+    next();
+  };
+}
+
+module.exports = { authenticate, requirePermission, requireAnyPermission };

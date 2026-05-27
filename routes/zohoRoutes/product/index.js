@@ -8,7 +8,7 @@ const {
   getViewData,
   handleZohoInventoryRequest,
 } = require("../../../utils/zohoRequest");
-const { requirePermission } = require("../../../middleware/auth");
+const { requirePermission, requireAnyPermission } = require("../../../middleware/auth");
 
 var productCollectionRoute = require("./routes/collections");
 
@@ -18,7 +18,9 @@ router.use("/collections", requirePermission("zoho:collection:view"), productCol
 // Resolve a SKU to its real Zoho Inventory item_id (Commerce product_id ≠
 // Inventory item_id) and pull the Wholesale-pricebook rate. Used by the SQT
 // Send Parts picker after the user selects a product from search.
-router.get("/skuLookup", requirePermission("sqt:case:sendParts"), async function (req, res, next) {
+// Shared by Send Parts (TechElite/Admin via sqt:case:sendParts) and Selection
+// collections editing (iMobile Admin/Admin via zoho:collection:edit).
+router.get("/skuLookup", requireAnyPermission("sqt:case:sendParts", "zoho:collection:edit"), async function (req, res, next) {
   try {
     const skuRaw = String(req.query.sku || "").trim();
     if (!skuRaw) {
@@ -87,8 +89,9 @@ router.get("/skuLookup", requirePermission("sqt:case:sendParts"), async function
   }
 });
 
-// Product search powers the SQT "Send Parts" picker (TechElite/Admin)
-router.get("/searchProduct", requirePermission("sqt:case:sendParts"), async function (req, res, next) {
+// Product search powers the SQT "Send Parts" picker (TechElite/Admin) and the
+// Selection collections picker (iMobile Admin/Admin).
+router.get("/searchProduct", requireAnyPermission("sqt:case:sendParts", "zoho:collection:edit"), async function (req, res, next) {
   const keyword = req.query.keyword;
   const domainName = process.env.DOMAIN_NAME;
   if (!keyword || !domainName) {

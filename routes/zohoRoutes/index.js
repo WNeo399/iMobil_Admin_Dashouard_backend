@@ -18,126 +18,112 @@ router.get("/", function (req, res, next) {
 
 router.use("/product", productRouter);
 
+// ── Shared helpers for /collectionStocks ────────────────────────────────────
+// Hoisted out of the request handler so both the Criteria path (via Analytics)
+// and the Selection path (via the stored productIds) converge on the same
+// inventory fetch + response shape.
+
+const STOCK_WORKSPACE_ID = "1404913000003936002";
+const STOCK_ITEMS_VIEW_ID = "1404913000003936100";
+const STOCK_ORGANIZATION_ID = "746138234";
+const STOCK_BATCH_SIZE = 100;
+
+function chunkArray(arr, size = STOCK_BATCH_SIZE) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+// Resolve a Criteria collection to its matching item IDs via Zoho Analytics.
+async function getItemIdsFromCriteria(criteria) {
+  const config = {
+    responseFormat: "json",
+    selectedColumns: ["Item ID"],
+    criteria,
+  };
+  const url = `https://analyticsapi.zoho.com/restapi/v2/workspaces/${STOCK_WORKSPACE_ID}/views/${STOCK_ITEMS_VIEW_ID}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+  const viewData = await getViewData(url);
+  if (!Array.isArray(viewData) || viewData.length === 0) return [];
+  return [...new Set(viewData.map((r) => r["Item ID"]).filter(Boolean))];
+}
+
+// Bulk-fetch inventory details for a set of item IDs and shape them into the
+// `{ id, sku, productName, location, stock }` payload Stock Monitoring expects.
+// This is the single point of truth for both Criteria and Selection collections.
+async function fetchStockShapedItems(itemIds) {
+  if (!Array.isArray(itemIds) || itemIds.length === 0) return [];
+
+  const batches = chunkArray(itemIds, STOCK_BATCH_SIZE);
+  const responses = await Promise.all(
+    batches.map((batchIds) => {
+      const url =
+        `https://www.zohoapis.com/inventory/v1/itemdetails` +
+        `?item_ids=${encodeURIComponent(batchIds.join(","))}` +
+        `&organization_id=${STOCK_ORGANIZATION_ID}`;
+      return handleZohoInventoryRequest(url);
+    }),
+  );
+  const allItems = responses.flatMap((resp) =>
+    Array.isArray(resp?.items) ? resp.items : [],
+  );
+
+  return allItems
+    .map((item) => {
+      const locationField = item.custom_fields?.find(
+        (c) => c.label === "Location",
+      );
+      return {
+        id: item.item_id,
+        sku: item.sku,
+        productName: item.name,
+        location: locationField?.value || "",
+        stock:
+          Number(item.actual_available_for_sale_stock || 0) -
+          Number(item.actual_committed_stock || 0),
+      };
+    })
+    .sort((a, b) => a.productName.localeCompare(b.productName));
+}
+
 router.get("/collectionStocks", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { collection } = req.query;
-
     const collectionId = Array.isArray(collection) ? collection[0] : collection;
 
     if (!collectionId || !ObjectId.isValid(collectionId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid collection id",
-      });
+      return res.status(400).json({ success: false, message: "Invalid collection id" });
     }
 
     const db = await connectToDatabase();
-    const productCollections = db.collection("productCollections");
-
-    const collectionData = await productCollections.findOne({
-      _id: new ObjectId(collectionId),
-    });
+    const collectionData = await db
+      .collection("productCollections")
+      .findOne({ _id: new ObjectId(collectionId) });
 
     if (!collectionData) {
-      return res.status(404).json({
-        success: false,
-        message: "Collection not found",
-      });
+      return res.status(404).json({ success: false, message: "Collection not found" });
     }
 
-    if (collectionData.type !== "Criteria") {
-      return res.json([]);
-    }
-
-    const criteria = collectionData?.rules?.[0]?.criteria?.equals;
-
-    if (!criteria) {
-      return res.status(400).json({
-        success: false,
-        message: "Collection criteria not found",
-      });
-    }
-
-    const WORKSPACE_ID = "1404913000003936002";
-    const VIEW_ID = "1404913000003936100";
-    const ORGANIZATION_ID = "746138234";
-    const BATCH_SIZE = 100;
-
-    const chunkArray = (arr, size = 100) => {
-      const chunks = [];
-
-      for (let i = 0; i < arr.length; i += size) {
-        chunks.push(arr.slice(i, i + size));
+    // Source the item IDs differently per collection type, then converge on the
+    // shared inventory fetch. Selection has the IDs ready on the document, so
+    // it skips the Analytics round-trip entirely.
+    let itemIds = [];
+    if (collectionData.type === "Criteria") {
+      const criteria = collectionData?.rules?.[0]?.criteria?.equals;
+      if (!criteria) {
+        return res.status(400).json({ success: false, message: "Collection criteria not found" });
       }
-
-      return chunks;
-    };
-
-    const buildZohoAnalyticsUrl = (viewId, config) => {
-      const encoded = encodeURIComponent(JSON.stringify(config));
-
-      return `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${viewId}/data?CONFIG=${encoded}`;
-    };
-
-    const config = {
-      responseFormat: "json",
-      selectedColumns: ["Item ID"],
-      criteria,
-    };
-
-    const url = buildZohoAnalyticsUrl(VIEW_ID, config);
-
-    const viewData = await getViewData(url);
-
-    if (!Array.isArray(viewData) || viewData.length === 0) {
+      itemIds = await getItemIdsFromCriteria(criteria);
+    } else if (collectionData.type === "Selection") {
+      itemIds = (collectionData.products || [])
+        .map((p) => p && p.itemId)
+        .filter(Boolean);
+    } else {
+      // Unknown / unset type — return empty rather than error so the UI degrades
+      // gracefully on legacy / malformed records.
       return res.json([]);
     }
 
-    const itemIds = [
-      ...new Set(viewData.map((item) => item["Item ID"]).filter(Boolean)),
-    ];
-
-    if (itemIds.length === 0) {
-      return res.json([]);
-    }
-
-    const itemIdBatches = chunkArray(itemIds, BATCH_SIZE);
-
-    const productDetailResponses = await Promise.all(
-      itemIdBatches.map((batchIds) => {
-        const itemIdsParam = batchIds.join(",");
-
-        const url =
-          `https://www.zohoapis.com/inventory/v1/itemdetails` +
-          `?item_ids=${encodeURIComponent(itemIdsParam)}` +
-          `&organization_id=${ORGANIZATION_ID}`;
-
-        return handleZohoInventoryRequest(url);
-      }),
-    );
-
-    const allItems = productDetailResponses.flatMap((resp) =>
-      Array.isArray(resp?.items) ? resp.items : [],
-    );
-
-    const result = allItems
-      .map((item) => {
-        const locationField = item.custom_fields?.find(
-          (c) => c.label === "Location",
-        );
-
-        return {
-          id: item.item_id,
-          sku: item.sku,
-          productName: item.name,
-          location: locationField?.value || "",
-          stock:
-            Number(item.actual_available_for_sale_stock || 0) -
-            Number(item.actual_committed_stock || 0),
-        };
-      })
-      .sort((a, b) => a.productName.localeCompare(b.productName));
-
+    const result = await fetchStockShapedItems(itemIds);
     return res.json(result);
   } catch (error) {
     next(error);
