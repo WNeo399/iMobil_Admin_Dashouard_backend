@@ -20,6 +20,7 @@ const SHOPS_COLLECTION = "sqt_shops";
 const USERS_COLLECTION = "users";
 
 const VALID_STATUSES = [
+  "on-hold",
   "pending",
   "waiting-for-parts",
   "parts-arrived",

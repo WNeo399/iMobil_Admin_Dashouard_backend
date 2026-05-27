@@ -18,6 +18,10 @@ const STATUS_PERMISSION = {
   repaired: "sqt:case:markRepaired",
   "repaired-and-collected": "sqt:case:markCollected",
   "waiting-solvup": "sqt:case:selectParts",
+  // On Hold is an admin-side action — same gate as other manual transitions.
+  // The Change Status dialog already requires a note, which satisfies the
+  // "must leave a note" requirement.
+  "on-hold": "sqt:case:changeStatus",
   unrepairable: "sqt:case:markUnrepairable",
   ber: "sqt:case:markBer",
   completed: "sqt:case:markBer",
@@ -39,6 +43,7 @@ const ZOHO_CUSTOMFIELD_TICKET_ID = "2591985000317627125";
 const COLLECTION = "sqt_cases";
 
 const VALID_STATUSES = [
+  "on-hold",
   "pending",
   "waiting-for-parts",
   "parts-arrived",

@@ -17,10 +17,11 @@ const router = express.Router();
 // the human-readable label; we map it back to the internal status value.
 // Matching is case-insensitive and whitespace-tolerant.
 const STATUS_LABEL_TO_VALUE = {
+  "on hold": "on-hold",
   "pending": "pending",
   "waiting for parts": "waiting-for-parts",
   "parts arrived": "parts-arrived",
-  "waiting for drop-off": "waiting-for-drop-off",
+  "waiting for drop off": "waiting-for-drop-off",
   "repairing": "repairing",
   "repaired": "repaired",
   "repaired & collected": "repaired-and-collected",
