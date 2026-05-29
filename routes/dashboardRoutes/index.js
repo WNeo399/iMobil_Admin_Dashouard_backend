@@ -35,7 +35,11 @@ const VALID_STATUSES = [
   "cancelled",
 ];
 
-// Statuses where a case is still "open" (not finalized).
+// Statuses where a case is still "open" (not finalized). Admin / TechElite
+// see the broader list — including Waiting Solvup which is their queue to
+// process. Shop roles see a narrower window: Pending → Repaired only. Cases
+// in admin-side states (waiting-solvup, on-hold) are hidden from the shop
+// list elsewhere; keeping their "open" KPI consistent with that.
 const OPEN_STATUSES = [
   "pending",
   "waiting-for-parts",
@@ -44,6 +48,14 @@ const OPEN_STATUSES = [
   "repairing",
   "repaired",
   "waiting-solvup",
+];
+const SHOP_OPEN_STATUSES = [
+  "pending",
+  "waiting-for-parts",
+  "parts-arrived",
+  "waiting-for-drop-off",
+  "repairing",
+  "repaired",
 ];
 
 // Statuses where the shop side is the next actor.
@@ -87,7 +99,11 @@ router.get("/sqt", requirePermission("sqt:case:list"), async function (req, res,
         total += row.count;
       }
     }
-    const open = OPEN_STATUSES.reduce((sum, s) => sum + (byStatus[s] || 0), 0);
+    // Shop-scoped users get the narrower Pending → Repaired definition.
+    const openStatusesForUser = Array.isArray(req.user && req.user.accessibleShopIds)
+      ? SHOP_OPEN_STATUSES
+      : OPEN_STATUSES;
+    const open = openStatusesForUser.reduce((sum, s) => sum + (byStatus[s] || 0), 0);
 
     // recent cases — last 10
     const recent = await col
@@ -203,9 +219,12 @@ router.get("/shop", requirePermission("sqt:case:list"), async function (req, res
         {
           $group: {
             _id: "$shopId",
+            // Shop view: Pending → Repaired only. Mirrors what /dashboard/sqt
+            // returns to shop users so the per-shop breakdown column sums to
+            // the same "open" KPI shown at the top of their home.
             open: {
               $sum: {
-                $cond: [{ $in: ["$status", OPEN_STATUSES] }, 1, 0],
+                $cond: [{ $in: ["$status", SHOP_OPEN_STATUSES] }, 1, 0],
               },
             },
             partsReceived: {
