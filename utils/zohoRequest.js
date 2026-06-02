@@ -231,6 +231,53 @@ async function handleZohoInventoryPostRequest(url, params) {
   }
 }
 
+// Same token-refresh dance as handleZohoInventoryPostRequest, but POSTs a
+// multipart/form-data body (built with the `form-data` package). Used for
+// endpoints like /salesorders/:id/attachment that accept file uploads.
+async function handleZohoInventoryMultipartPostRequest(url, formData) {
+  const formHeaders =
+    formData && typeof formData.getHeaders === "function"
+      ? formData.getHeaders()
+      : {};
+
+  const fetchData = async (requestUrl, body) => {
+    try {
+      const response = await axios.post(requestUrl, body, {
+        headers: {
+          Authorization: `Zoho-oauthtoken ${requestToken}`,
+          ...formHeaders,
+        },
+        // PDFs etc. can be larger than axios's default 10 MB body limit.
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      });
+      return response.data;
+    } catch (error) {
+      console.log(
+        "Error uploading multipart:",
+        error.response?.data || error.message
+      );
+      return error.response?.data;
+    }
+  };
+
+  try {
+    let data = await fetchData(url, formData);
+
+    if (isTokenExpired(data)) {
+      console.log("Token Expired! Refreshing...");
+      const newAccessToken = await refreshToken();
+      if (!newAccessToken) {
+        throw new Error("Failed to refresh token.");
+      }
+      data = await fetchData(url, formData);
+    }
+    return data;
+  } catch (error) {
+    console.error("Error in handleZohoInventoryMultipartPostRequest:", error);
+  }
+}
+
 async function handleZohoInventoryPutRequest(url, params) {
   const fetchData = async (requestUrl, requestBody) => {
     try {
@@ -281,6 +328,7 @@ module.exports = {
   getJobData,
   handleZohoInventoryRequest,
   handleZohoInventoryPostRequest,
+  handleZohoInventoryMultipartPostRequest,
   handleZohoInventoryPutRequest,
   getViewData,
 };

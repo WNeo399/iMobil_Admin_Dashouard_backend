@@ -12,12 +12,22 @@
 
 var express = require("express");
 var router = express.Router();
+const multer = require("multer");
+const FormData = require("form-data");
 const {
   handleZohoInventoryPostRequest,
+  handleZohoInventoryMultipartPostRequest,
 } = require("../../../utils/zohoRequest");
 const { requirePermission } = require("../../../middleware/auth");
 
 const ZOHO_ORG_ID = "746138234";
+
+// In-memory upload for SO attachments. 25 MB is generous for a typical PO
+// PDF (which sits around 150 KB) while still capping the worst case.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+});
 
 // Sane fallback customer used when the caller doesn't supply one — keeps
 // the endpoint usable for ad-hoc tooling that doesn't have a real customer
@@ -61,16 +71,12 @@ router.post(
         ? body.customerId.trim()
         : DEFAULT_CUSTOMER_ID;
 
-      // ── Pricebook (required) ────────────────────────────────────────
+      // ── Pricebook (optional) ────────────────────────────────────────
+      // When omitted, Zoho uses the customer's default pricebook. Tools that
+      // need a specific pricebook (e.g. Buzztech) pass one explicitly.
       const priceListId = isNonEmptyString(body.priceListId)
         ? body.priceListId.trim()
         : "";
-      if (!priceListId) {
-        return res.status(400).json({
-          success: false,
-          message: "priceListId is required",
-        });
-      }
 
       // ── Line items (required, non-empty) ────────────────────────────
       const rawLines = Array.isArray(body.lineItems) ? body.lineItems : [];
@@ -98,8 +104,8 @@ router.post(
         customer_id: customerId,
         date,
         line_items: lineItems,
-        pricebook_id: priceListId,
       };
+      if (priceListId) requestBody.pricebook_id = priceListId;
       if (notes !== undefined) requestBody.notes = notes;
       if (templateId !== undefined) requestBody.template_id = templateId;
       if (customFields !== undefined) requestBody.custom_fields = customFields;
@@ -134,6 +140,74 @@ router.post(
       return res.status(500).json({
         success: false,
         message: `Failed to create sales order: ${error.message || error}`,
+      });
+    }
+  },
+);
+
+// POST /zoho/salesOrder/attach
+// Attach a single file to an existing Zoho sales order.
+// Body (multipart/form-data):
+//   salesOrderId  — the Zoho sales order id (required)
+//   file          — the file to attach (required, max 25 MB)
+// Used by the Buzztech import tool to staple the original PO PDF onto the
+// generated SO; kept generic so any other tool can use it too.
+router.post(
+  "/attach",
+  requirePermission("zoho:salesOrder:create"),
+  upload.single("file"),
+  async function (req, res) {
+    try {
+      const salesOrderId =
+        req.body && req.body.salesOrderId
+          ? String(req.body.salesOrderId).trim()
+          : "";
+      if (!salesOrderId) {
+        return res.status(400).json({
+          success: false,
+          message: "salesOrderId is required",
+        });
+      }
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({
+          success: false,
+          message: "file is required (form field 'file')",
+        });
+      }
+
+      // Zoho's attachment endpoint expects multipart with the file under the
+      // field name `attachment`.
+      const form = new FormData();
+      form.append("attachment", req.file.buffer, {
+        filename: req.file.originalname || "attachment",
+        contentType: req.file.mimetype || "application/octet-stream",
+      });
+
+      const url = `https://www.zohoapis.com/inventory/v1/salesorders/${encodeURIComponent(salesOrderId)}/attachment?organization_id=${ZOHO_ORG_ID}`;
+      const zohoResp = await handleZohoInventoryMultipartPostRequest(url, form);
+
+      if (!zohoResp || zohoResp.code !== 0) {
+        const msg =
+          (zohoResp && zohoResp.message) ||
+          "Zoho Inventory did not accept the attachment";
+        console.error("Zoho SO attachment failed:", zohoResp);
+        return res.status(502).json({
+          success: false,
+          message: `Zoho: ${msg}`,
+          data: zohoResp || null,
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: `Attached ${req.file.originalname || "file"} to sales order`,
+        data: { salesOrderId, response: zohoResp },
+      });
+    } catch (error) {
+      console.error("Attach SO error:", error);
+      return res.status(500).json({
+        success: false,
+        message: `Failed to attach file: ${error.message || error}`,
       });
     }
   },

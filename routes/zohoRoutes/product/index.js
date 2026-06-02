@@ -89,6 +89,79 @@ router.get("/skuLookup", requireAnyPermission("sqt:case:sendParts", "zoho:collec
   }
 });
 
+// Resolve a scanned code (SKU or barcode) to its Zoho Inventory item.
+// Tries the SKU column first; if no match, falls back to the Barcode
+// column (vendor / manufacturer barcode). Returns the matched item plus
+// a `matchedBy` flag so the caller knows which column hit — useful when
+// the same string is being treated as either a SKU or a barcode and you
+// want to keep that distinction in audit data.
+router.get("/scanLookup", requireAnyPermission("sqt:case:sendParts", "zoho:collection:edit"), async function (req, res, next) {
+  try {
+    const codeRaw = String(req.query.code || "").trim();
+    if (!codeRaw) {
+      return res.status(400).json({ success: false, message: "code is required" });
+    }
+
+    const WORKSPACE_ID = "1404913000003936002";
+    const ITEMS_VIEW_ID = "1404913000003936100";
+
+    const buildUrl = (viewId, config) =>
+      `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${viewId}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+    const esc = (v) => String(v).replace(/'/g, "''");
+    const safe = esc(codeRaw);
+    const columns = ["Item ID", "SKU", "Item Name", "Status"];
+
+    // 1) Try SKU first — most scans of our own product labels match here.
+    let rows = await getViewData(buildUrl(ITEMS_VIEW_ID, {
+      responseFormat: "json",
+      selectedColumns: columns,
+      criteria: `"SKU" = '${safe}'`,
+    }));
+    let matchedBy = "sku";
+
+    // 2) Fall back to the Barcode column (vendor / manufacturer barcode).
+    //    If the view doesn't have a Barcode column, this query errors —
+    //    swallow it and treat as "no match" rather than 500.
+    if (!Array.isArray(rows) || rows.length === 0) {
+      try {
+        rows = await getViewData(buildUrl(ITEMS_VIEW_ID, {
+          responseFormat: "json",
+          selectedColumns: columns,
+          criteria: `"Barcode" = '${safe}'`,
+        }));
+        matchedBy = "barcode";
+      } catch (e) {
+        // No Barcode column — leave rows as-is.
+      }
+    }
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: `No product found for code "${codeRaw}"`,
+      });
+    }
+
+    const item = rows[0];
+    return res.json({
+      success: true,
+      data: {
+        itemId: item["Item ID"] ? String(item["Item ID"]) : "",
+        sku: item.SKU || "",
+        name: item["Item Name"] || "",
+        status: item.Status || "",
+        scanCode: codeRaw,
+        matchedBy,
+      },
+    });
+  } catch (error) {
+    console.error("Scan lookup error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: `Scan lookup failed: ${error.message || error}` });
+  }
+});
+
 // Product search powers the SQT "Send Parts" picker (TechElite/Admin) and the
 // Selection collections picker (iMobile Admin/Admin).
 router.get("/searchProduct", requireAnyPermission("sqt:case:sendParts", "zoho:collection:edit"), async function (req, res, next) {

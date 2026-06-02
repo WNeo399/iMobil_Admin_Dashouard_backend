@@ -2,6 +2,8 @@ var express = require("express");
 var router = express.Router();
 var productRouter = require("./product/index");
 var salesOrderRouter = require("./salesOrder/index");
+var buzztechRouter = require("./buzztech/index");
+var locationRouter = require("./location/index");
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 
@@ -19,6 +21,8 @@ router.get("/", function (req, res, next) {
 
 router.use("/product", productRouter);
 router.use("/salesOrder", salesOrderRouter);
+router.use("/buzztech", buzztechRouter);
+router.use("/location", locationRouter);
 
 // ── Shared helpers for /collectionStocks ────────────────────────────────────
 // Hoisted out of the request handler so both the Criteria path (via Analytics)
