@@ -39,7 +39,7 @@ const EXTRACTOR_ID = "Newvjr8bJiwk";
 // app.js outside the authenticated chain). Keep this in sync with the
 // app's deployed hostname — if the backend moves, OCR will silently
 // stop calling back.
-const OCR_WEBHOOK_URL = "https://imbadmin.up.railway.app/webhook/creditNoteOcr";
+const OCR_WEBHOOK_URL = "https://imbadmin-back.up.railway.app/webhook/creditNoteOcr";
 
 // Kill-switch for the OCR forward. Left in place even though it's `true`
 // today because flipping to `false` to test S3 in isolation is useful
