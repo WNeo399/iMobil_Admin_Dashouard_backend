@@ -16,6 +16,13 @@ var authRouter = require('./routes/authRoutes/index');
 // iMobile Repair — proxies the iMobile RepairDesk org (separate API key,
 // see routes/repairRoutes/index.js for the key-name distinction).
 var repairRouter = require('./routes/repairRoutes/index');
+// Credit Note OCR submission — forwards PDFs to HandwritingOCR using
+// the bearer token kept in .env, so credentials stay server-side.
+var creditNoteRouter = require('./routes/creditNoteRoutes/index');
+// Public webhook endpoint that HandwritingOCR posts to when extraction
+// finishes. Mounted outside the authenticated chain (OCR doesn't hold
+// our JWT) — security is via the body's ocrId matching our own row.
+var creditNoteWebhookRouter = require('./routes/creditNoteRoutes/webhook');
 // TEMPORARY: external-integration endpoint (no auth). Remove together with
 // routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
 var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
@@ -40,6 +47,9 @@ app.use('/auth', authRouter);
 // TEMPORARY: mounted before the auth-protected routers so /integration/* stays
 // open to the external caller. Remove when the integration is gone.
 app.use(tempIntegrationRouter);
+// HandwritingOCR webhook — public POST endpoint mounted before the
+// authenticated routers because OCR doesn't carry our JWT.
+app.use('/webhook', creditNoteWebhookRouter);
 // All zoho/sqt/users routes require a valid login; per-permission checks are
 // applied inside the routers.
 app.use('/zoho', authenticate, zohoRouter);
@@ -47,6 +57,7 @@ app.use('/sqt', authenticate, sqtRouter);
 app.use('/dashboard', authenticate, dashboardRouter);
 app.use('/users', authenticate, usersRouter);
 app.use('/repair', authenticate, repairRouter);
+app.use('/creditNote', authenticate, creditNoteRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
