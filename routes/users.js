@@ -7,6 +7,9 @@ const { requirePermission } = require("../middleware/auth");
 const {
   ROLES,
   ROLE_LABELS,
+  ROLE_GROUPS,
+  ROLE_GROUP_LABELS,
+  ROLE_GROUP_OF,
   isValidRole,
   isShopScopedRole,
 } = require("../constants/roles");
@@ -36,14 +39,21 @@ function normalizeShopIdsForRole(shopIds, role) {
   return ids;
 }
 
-// Roles available for assignment (for the role dropdown)
+// Roles available for assignment (for the role dropdown) plus UI grouping
+// metadata so the Users page can render its left-side role tree without
+// duplicating the group map.
 router.get("/roles", requireUserAdmin, function (req, res) {
   const data = Object.values(ROLES).map((value) => ({
     value,
     label: ROLE_LABELS[value] || value,
     shopScoped: isShopScopedRole(value),
+    group: ROLE_GROUP_OF[value] || null,
   }));
-  return res.json({ success: true, data });
+  const groups = Object.values(ROLE_GROUPS).map((value) => ({
+    value,
+    label: ROLE_GROUP_LABELS[value] || value,
+  }));
+  return res.json({ success: true, data, groups });
 });
 
 router.get("/list", requireUserAdmin, async function (req, res, next) {
@@ -56,7 +66,21 @@ router.get("/list", requireUserAdmin, async function (req, res, next) {
     const collection = db.collection(COLLECTION);
 
     const query = {};
-    if (role) query.role = role;
+    // `role` accepts either a single role string or a comma-separated list
+    // so the Users page tree can filter a group node (multiple roles) in
+    // one request. Single-role callers (the old dropdown / the shop-edit
+    // Users tab) keep working unchanged.
+    if (role) {
+      const roles = String(role)
+        .split(",")
+        .map((r) => r.trim())
+        .filter(Boolean);
+      if (roles.length === 1) {
+        query.role = roles[0];
+      } else if (roles.length > 1) {
+        query.role = { $in: roles };
+      }
+    }
     if (active !== undefined && active !== "") {
       query.active = active === "true" || active === true;
     }

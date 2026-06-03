@@ -13,6 +13,9 @@ var zohoRouter = require('./routes/zohoRoutes/index');
 var sqtRouter = require('./routes/sqtRoutes/index');
 var dashboardRouter = require('./routes/dashboardRoutes/index');
 var authRouter = require('./routes/authRoutes/index');
+// iMobile Repair — proxies the iMobile RepairDesk org (separate API key,
+// see routes/repairRoutes/index.js for the key-name distinction).
+var repairRouter = require('./routes/repairRoutes/index');
 // TEMPORARY: external-integration endpoint (no auth). Remove together with
 // routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
 var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
@@ -43,6 +46,7 @@ app.use('/zoho', authenticate, zohoRouter);
 app.use('/sqt', authenticate, sqtRouter);
 app.use('/dashboard', authenticate, dashboardRouter);
 app.use('/users', authenticate, usersRouter);
+app.use('/repair', authenticate, repairRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

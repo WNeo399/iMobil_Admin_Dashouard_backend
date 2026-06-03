@@ -7,6 +7,7 @@
 const ROLES = {
   ADMIN: "admin",
   IMOBILE_ADMIN: "imobile-admin",
+  IMOBILE_REPAIR_ADMIN: "imobile-repair-admin",
   TECHELITE_ADMIN: "techelite-admin",
   SHOP_OWNER: "shop-owner",
   REPAIR_SHOP: "repair-shop",
@@ -15,9 +16,32 @@ const ROLES = {
 const ROLE_LABELS = {
   [ROLES.ADMIN]: "Admin",
   [ROLES.IMOBILE_ADMIN]: "iMobile Admin",
+  [ROLES.IMOBILE_REPAIR_ADMIN]: "iMobile Repair Admin",
   [ROLES.TECHELITE_ADMIN]: "TechElite Admin",
   [ROLES.SHOP_OWNER]: "Repair Shop Owner",
   [ROLES.REPAIR_SHOP]: "Repair Shop",
+};
+
+// UI grouping for the System → Users role-tree panel. Roles inside the
+// same group share a parent node in the tree. Pure presentation — has no
+// effect on permission checks.
+const ROLE_GROUPS = {
+  IMOBILE: "imobile",
+  TECHELITE: "techelite",
+};
+
+const ROLE_GROUP_LABELS = {
+  [ROLE_GROUPS.IMOBILE]: "iMobile",
+  [ROLE_GROUPS.TECHELITE]: "TechElite",
+};
+
+const ROLE_GROUP_OF = {
+  [ROLES.ADMIN]: ROLE_GROUPS.IMOBILE,
+  [ROLES.IMOBILE_ADMIN]: ROLE_GROUPS.IMOBILE,
+  [ROLES.IMOBILE_REPAIR_ADMIN]: ROLE_GROUPS.IMOBILE,
+  [ROLES.TECHELITE_ADMIN]: ROLE_GROUPS.TECHELITE,
+  [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
+  [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -36,7 +60,13 @@ const SHOP_CASE_PERMISSIONS = [
 
 const ROLE_PERMISSIONS = {
   [ROLES.ADMIN]: ["*:*:*"],
-  [ROLES.IMOBILE_ADMIN]: ["zoho:*:*"],
+  // iMobile Admin owns the iMobile-side modules: Zoho Inventory / Tools and
+  // the Repair (RepairDesk) page. Adding `repair:*:*` here keeps the page
+  // accessible without expanding the wildcard surface.
+  [ROLES.IMOBILE_ADMIN]: ["zoho:*:*", "repair:*:*"],
+  // iMobile Repair Admin: starts with full Repair access so the role is
+  // usable from day one. Other permissions are pending the owner's input.
+  [ROLES.IMOBILE_REPAIR_ADMIN]: ["repair:*:*"],
   // TechElite Admin owns the SQT domain and also manages users (read/create/
   // edit/delete + password reset) via the System → Users page.
   [ROLES.TECHELITE_ADMIN]: ["sqt:*:*", "system:user:manage"],
@@ -79,6 +109,9 @@ function hasPermission(userPermissions, required) {
 module.exports = {
   ROLES,
   ROLE_LABELS,
+  ROLE_GROUPS,
+  ROLE_GROUP_LABELS,
+  ROLE_GROUP_OF,
   ROLE_PERMISSIONS,
   SHOP_SCOPED_ROLES,
   isValidRole,
