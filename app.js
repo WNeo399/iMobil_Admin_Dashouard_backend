@@ -23,6 +23,10 @@ var creditNoteRouter = require('./routes/creditNoteRoutes/index');
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
 var creditNoteWebhookRouter = require('./routes/creditNoteRoutes/webhook');
+// Public webhook endpoint for Meta's WhatsApp Cloud API. Same mount
+// pattern as the OCR webhook: outside the auth chain, security via
+// the X-Hub-Signature-256 HMAC plus the GET-handshake verify token.
+var whatsappWebhookRouter = require('./routes/whatsappRoutes/webhook');
 // TEMPORARY: external-integration endpoint (no auth). Remove together with
 // routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
 var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
@@ -37,7 +41,17 @@ app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'jade');
 
 app.use(logger('dev'));
-app.use(express.json());
+// `verify` stashes the raw request bytes on req.rawBody so webhook
+// endpoints can recompute HMAC signatures over the exact payload Meta
+// signed — once express.json() parses the body, the original byte
+// sequence is gone and any re-serialised JSON won't match the digest.
+// The callback runs on every request but only retains a Buffer
+// reference, so the overhead is negligible.
+app.use(express.json({
+  verify: function (req, _res, buf) {
+    if (buf && buf.length) req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -50,6 +64,13 @@ app.use(tempIntegrationRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
+// WhatsApp Cloud API webhook — exposes:
+//   GET  /webhook/whatsapp  → Meta's subscription verification handshake
+//   POST /webhook/whatsapp  → inbound message + status notifications
+// Public for the same reason as the OCR webhook (Meta can't carry our
+// JWT); request integrity is enforced inside the router via
+// X-Hub-Signature-256 against WHATSAPP_APP_SECRET.
+app.use('/webhook', whatsappWebhookRouter);
 // All zoho/sqt/users routes require a valid login; per-permission checks are
 // applied inside the routers.
 app.use('/zoho', authenticate, zohoRouter);
