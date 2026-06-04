@@ -20,9 +20,23 @@ var axios = require("axios");
 var multer = require("multer");
 var FormData = require("form-data");
 var router = express.Router();
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { ObjectId } = require("mongodb");
+const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { requirePermission } = require("../../middleware/auth");
 const { connectToDatabase } = require("../../utils/mongodb");
+const {
+  handleZohoInventoryRequest,
+  handleZohoInventoryPutRequest,
+  handleZohoInventoryMultipartPostRequest,
+  getViewData,
+} = require("../../utils/zohoRequest");
+
+// Zoho org + Analytics view ids used by the Zoho-side credit-note
+// flow. The Analytics view is the user-provided fallback in case the
+// Inventory list endpoint can't resolve a credit note number directly.
+const ZOHO_ORG_ID = "746138234";
+const ZOHO_WORKSPACE_ID = "1404913000003936002";
+const ZOHO_CREDIT_NOTE_VIEW_ID = "1404913000003936107";
 
 // Persistence layer — every successful submit gets a row here so we
 // can correlate the OCR document id back to its S3 archive copy
@@ -301,6 +315,10 @@ async function persistCreditNoteRecord({ ocrData, s3Key }) {
       ocrId: (ocrData && (ocrData.id || ocrData.document_id)) || null,
       status: (ocrData && ocrData.status) || null,
       s3Key: s3Key || null,
+      // Stamped server-side so the Credit Note list page has a
+      // reliable sort key. Existing rows from before this field
+      // existed sort to the bottom (null < every date) — fine.
+      createdAt: new Date(),
     };
     const result = await db.collection(CREDIT_NOTE_COLLECTION).insertOne(doc);
     return { ok: true, _id: String(result.insertedId) };
@@ -308,6 +326,387 @@ async function persistCreditNoteRecord({ ocrData, s3Key }) {
     console.error("imb_credit_note insert failed:", e.message || e);
     return { ok: false, message: e.message || "Mongo insert failed" };
   }
+}
+
+// ── GET /creditNote/list ─────────────────────────────────────────────
+// Paginated list for the Credit Note page. Accepts:
+//   ?status=<queued|processed|completed>  optional status filter
+//   ?search=<creditNo substring>          optional case-insensitive
+//                                          regex match on creditNo
+//   ?page=N&pageSize=M                    standard paging
+//
+// Returns { success, data, total, counts } where `counts` is per-status
+// (queued / processed / completed + an `all` rollup). Counts respect the
+// search filter so the tree badges update as the user types, but ignore
+// the status filter so picking one status doesn't hide the others.
+router.get("/list", GATE, async function (req, res) {
+  try {
+    const { status, search } = req.query;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
+
+    const db = await connectToDatabase();
+    const collection = db.collection(CREDIT_NOTE_COLLECTION);
+
+    // baseFilter = search only (used for the counts rollup).
+    // fullFilter = baseFilter + status (used for the visible page).
+    const baseFilter = {};
+    if (search) {
+      // Escape regex metacharacters so a "+" or "." in a creditNo can't
+      // turn the search into an unexpected pattern.
+      const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      baseFilter.creditNo = { $regex: safe, $options: "i" };
+    }
+    const fullFilter = { ...baseFilter };
+    if (status) fullFilter.status = String(status);
+
+    const [data, total, countsRaw] = await Promise.all([
+      collection
+        .find(fullFilter)
+        // createdAt desc with _id as tiebreaker — old rows without
+        // createdAt drop to the bottom of the list, new rows surface
+        // at the top in insert order.
+        .sort({ createdAt: -1, _id: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray(),
+      collection.countDocuments(fullFilter),
+      collection
+        .aggregate([
+          { $match: baseFilter },
+          { $group: { _id: "$status", count: { $sum: 1 } } },
+        ])
+        .toArray(),
+    ]);
+
+    const counts = { all: 0, queued: 0, processed: 0, completed: 0 };
+    for (const c of countsRaw) {
+      const key = c._id || "unknown";
+      counts[key] = c.count;
+      counts.all += c.count;
+    }
+
+    return res.json({
+      success: true,
+      data,
+      total,
+      page,
+      pageSize,
+      counts,
+    });
+  } catch (error) {
+    console.error("List credit notes error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to list credit notes" });
+  }
+});
+
+// ── POST /creditNote/:id/submitToZoho ────────────────────────────────
+// Pushes the user's matched line items + edited note into the existing
+// Zoho Inventory credit note (resolved by creditNo on the row), then
+// re-uploads the S3 PDF as a Zoho attachment. On success the row's
+// status flips to "completed" so the Credit Note page tree count
+// reflects it and the Review dialog's Submit button stays off on
+// re-open. Body:
+//   {
+//     items: [{ matchedItemId, matchedSku, matchedName, quantity }, ...],
+//     note: "..."   // optional, replaces the credit note's notes field
+//   }
+router.post("/:id/submitToZoho", GATE, async function (req, res) {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid id" });
+    }
+    const items = Array.isArray(req.body && req.body.items)
+      ? req.body.items
+      : [];
+    const note =
+      req.body && typeof req.body.note === "string" ? req.body.note : "";
+
+    if (items.length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "items[] is required and must be non-empty" });
+    }
+    // Each item must carry a matched Zoho item id; quantity defaults
+    // to 1 if missing / non-numeric.
+    const usableItems = items
+      .map((it) => ({
+        item_id: String(it.matchedItemId || ""),
+        name: (it.matchedName || "").toString() || undefined,
+        quantity: Number(it.quantity) > 0 ? Number(it.quantity) : 1,
+      }))
+      .filter((it) => it.item_id);
+    if (usableItems.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No items have a matchedItemId — pick a Zoho match before submitting.",
+      });
+    }
+
+    const db = await connectToDatabase();
+    const collection = db.collection(CREDIT_NOTE_COLLECTION);
+    const row = await collection.findOne({ _id: new ObjectId(id) });
+    if (!row) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Credit note record not found" });
+    }
+    if (!row.creditNo) {
+      return res.status(400).json({
+        success: false,
+        message: "This row has no creditNo extracted from OCR — can't locate the Zoho credit note.",
+      });
+    }
+
+    // 1. Resolve creditNo → Zoho creditnote_id.
+    const zohoCreditNoteId = await findZohoCreditNoteId(row.creditNo);
+    if (!zohoCreditNoteId) {
+      return res.status(404).json({
+        success: false,
+        message: `Could not find credit note "${row.creditNo}" in Zoho Inventory.`,
+      });
+    }
+
+    // 2. Fetch existing credit note so we can append our items instead
+    //    of clobbering whatever's already there.
+    const existing = await fetchZohoCreditNote(zohoCreditNoteId);
+    if (!existing) {
+      return res.status(502).json({
+        success: false,
+        message: "Found the Zoho credit note id but couldn't fetch the existing record.",
+      });
+    }
+
+    // 3. Compose the updated payload. Spread the existing line items
+    //    so their line_item_id / rate / name etc. are preserved; append
+    //    the new ones at the end.
+    const existingLineItems = Array.isArray(existing.line_items)
+      ? existing.line_items.map((li) => ({ ...li }))
+      : [];
+
+    // Pricelist on a credit note is stored per-line-item on this org,
+    // not on the credit-note root. Read it off the first existing line
+    // item and stamp the same pricebook_id onto every new line item so
+    // Zoho applies the matching rates instead of the item's default
+    // selling price. Existing line items already carry their own
+    // pricebook_id + rate (we just spread them above), so re-sending
+    // them is a no-op.
+    const linePricebookId =
+      (existingLineItems[0] && existingLineItems[0].pricebook_id) || null;
+    const newLineItems = linePricebookId
+      ? usableItems.map((it) => ({ ...it, pricebook_id: linePricebookId }))
+      : usableItems;
+    const mergedLineItems = existingLineItems.concat(newLineItems);
+
+    const updatePayload = {
+      // PUT requires the date back (Zoho will reject if omitted).
+      date: existing.date,
+      line_items: mergedLineItems,
+    };
+    // Preserve customer linkage so the PUT doesn't unbind it.
+    if (existing.customer_id) updatePayload.customer_id = existing.customer_id;
+    if (note) updatePayload.notes = note;
+    // Keep the credit note in draft. `is_draft: true` is the
+    // documented Zoho flag — without it the PUT auto-promotes a
+    // draft to "open" once required fields land. Only sent when the
+    // record was already draft going in; records past draft (open /
+    // closed / void) are left untouched.
+    if ((existing.status || "").toLowerCase() === "draft") {
+      updatePayload.is_draft = true;
+    }
+
+    // 4. PUT the update.
+    const updateUrl =
+      `https://www.zohoapis.com/inventory/v1/creditnotes/${zohoCreditNoteId}` +
+      `?organization_id=${ZOHO_ORG_ID}`;
+    const updateResp = await handleZohoInventoryPutRequest(
+      updateUrl,
+      updatePayload,
+    );
+    if (!updateResp || updateResp.code !== 0) {
+      const msg =
+        (updateResp && (updateResp.message ||
+          (updateResp.error && updateResp.error.message))) ||
+        "Zoho rejected the credit-note update";
+      console.error("Zoho creditnote PUT failed:", updateResp);
+      return res
+        .status(502)
+        .json({ success: false, message: msg, zohoResponse: updateResp });
+    }
+
+    // 5. Best-effort PDF attach. The credit-note update has already
+    //    landed at this point — an attach failure shouldn't roll back
+    //    the line-item write, so we record the outcome and surface it
+    //    on the response.
+    let attach = { ok: false, message: "no s3 key on row" };
+    if (row.s3Key) {
+      try {
+        const pdfBuffer = await downloadS3Object(row.s3Key);
+        const form = new FormData();
+        form.append("attachment", pdfBuffer, {
+          filename: extractFilename(row.s3Key),
+          contentType: "application/pdf",
+          knownLength: pdfBuffer.length,
+        });
+        const attachUrl =
+          `https://www.zohoapis.com/inventory/v1/creditnotes/${zohoCreditNoteId}/attachment` +
+          `?organization_id=${ZOHO_ORG_ID}`;
+        const attachResp = await handleZohoInventoryMultipartPostRequest(
+          attachUrl,
+          form,
+        );
+        if (attachResp && attachResp.code === 0) {
+          attach = { ok: true };
+        } else {
+          attach = {
+            ok: false,
+            message:
+              (attachResp && attachResp.message) ||
+              "Zoho rejected the attachment",
+          };
+        }
+      } catch (e) {
+        console.warn("Zoho creditnote attach failed:", e.message || e);
+        attach = { ok: false, message: e.message || "attach failed" };
+      }
+    }
+
+    // 6. Mark our row as completed + remember the Zoho id so the
+    //    Review dialog's Submit stays off on re-open.
+    await collection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: "completed",
+          zohoCreditNoteId,
+          zohoSubmittedAt: new Date(),
+        },
+      },
+    );
+
+    return res.json({
+      success: true,
+      zohoCreditNoteId,
+      attach,
+    });
+  } catch (error) {
+    console.error("submitToZoho error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to submit to Zoho",
+    });
+  }
+});
+
+// Resolve a creditNo (the display number like "CN-12345") to its Zoho
+// creditnote_id. Two-tier:
+//   1. Zoho Inventory's /creditnotes list with the contains filter —
+//      cheap, no Analytics-side latency.
+//   2. Fallback to the Analytics view 1404913000003936107 the user
+//      pointed at when (1) returns nothing.
+// Returns the id as a string, or null when neither hit a match.
+async function findZohoCreditNoteId(creditNo) {
+  // (1) Try Inventory first.
+  try {
+    const url =
+      `https://www.zohoapis.com/inventory/v1/creditnotes` +
+      `?organization_id=${ZOHO_ORG_ID}` +
+      `&creditnote_number_contains=${encodeURIComponent(creditNo)}`;
+    const resp = await handleZohoInventoryRequest(url);
+    if (resp && resp.code === 0 && Array.isArray(resp.creditnotes)) {
+      // Prefer an exact match if multiple rows came back from "contains".
+      const exact = resp.creditnotes.find(
+        (cn) => cn.creditnote_number === creditNo,
+      );
+      const chosen = exact || resp.creditnotes[0];
+      if (chosen && chosen.creditnote_id) {
+        return String(chosen.creditnote_id);
+      }
+    }
+  } catch (e) {
+    console.warn(
+      "Zoho Inventory credit-note search failed, falling back to Analytics:",
+      e.message || e,
+    );
+  }
+
+  // (2) Analytics fallback. Same workspace as the rest of the app's
+  // Analytics queries.
+  try {
+    const safe = String(creditNo).replace(/'/g, "''");
+    const config = {
+      responseFormat: "json",
+      selectedColumns: ["Credit Note ID", "Credit Note Number"],
+      criteria: `"Credit Note Number" = '${safe}'`,
+    };
+    const url =
+      `https://analyticsapi.zoho.com/restapi/v2/workspaces/${ZOHO_WORKSPACE_ID}` +
+      `/views/${ZOHO_CREDIT_NOTE_VIEW_ID}/data?CONFIG=` +
+      encodeURIComponent(JSON.stringify(config));
+    const rows = await getViewData(url);
+    if (Array.isArray(rows) && rows.length > 0) {
+      const cnId = rows[0]["Credit Note ID"];
+      if (cnId) return String(cnId);
+    }
+  } catch (e) {
+    console.warn("Analytics credit-note lookup failed:", e.message || e);
+  }
+
+  return null;
+}
+
+// Fetch the credit note's full Zoho record. Returns the `creditnote`
+// object on success, or null when Zoho responds with anything else.
+async function fetchZohoCreditNote(creditnoteId) {
+  const url =
+    `https://www.zohoapis.com/inventory/v1/creditnotes/${creditnoteId}` +
+    `?organization_id=${ZOHO_ORG_ID}`;
+  const resp = await handleZohoInventoryRequest(url);
+  if (resp && resp.code === 0 && resp.creditnote) {
+    return resp.creditnote;
+  }
+  return null;
+}
+
+// Download an S3 object to a Buffer. Reuses the lazy S3 client + the
+// bucket from .env (S3_CREDIT_BUCKET_NAME). Streams the response Body
+// into a Buffer so the FormData upload can pass it through directly.
+async function downloadS3Object(key) {
+  const client = getS3Client();
+  if (!client) {
+    throw new Error("S3 client not configured");
+  }
+  const bucket = process.env.S3_CREDIT_BUCKET_NAME;
+  if (!bucket) {
+    throw new Error("S3_CREDIT_BUCKET_NAME is not configured");
+  }
+  const out = await client.send(
+    new GetObjectCommand({ Bucket: bucket, Key: key }),
+  );
+  return await streamToBuffer(out.Body);
+}
+
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
+  });
+}
+
+// Last path segment of an S3 key (no leading slash needed) — used as
+// the filename for the Zoho attachment so the upload preserves the
+// user's original date stamp instead of a generic name.
+function extractFilename(key) {
+  if (!key) return "credit-note.pdf";
+  const parts = String(key).split("/");
+  return parts[parts.length - 1] || "credit-note.pdf";
 }
 
 // Pull the best human-readable message out of an axios error / generic Error.

@@ -13,7 +13,7 @@
 //   {
 //     creditNo:   string | null,  // sourced from the OCR `parcel_no` field
 //     itemCount:  number,
-//     items:      [{ sku, quantity }],
+//     items:      [{ sku, model, quantity }],  // model is null when OCR didn't fill it
 //     returnNote: string  // newline-joined "Model x Qty (reasons)" lines
 //   }
 //
@@ -49,17 +49,23 @@ function parseOcrResult(body) {
 
     // ── Warranty Stock Back/Refund ─────────────────────────────
     // Each row is an array of fields; we only keep ones with an sku.
+    // Model lives alongside SKU on the warranty rows but is often null
+    // when OCR couldn't read it — we store it as null in that case so
+    // the schema is consistent.
     const warrantyField = findField(extraction, "warranty_stock_backrefund");
     if (warrantyField && Array.isArray(warrantyField.value)) {
       for (const row of warrantyField.value) {
         const sku = (findField(row, "sku") || {}).value;
+        const model = (findField(row, "model") || {}).value;
         const quantity = (findField(row, "quantity") || {}).value;
         if (sku) {
           // Stringify the qty so the schema stays string-typed regardless
           // of whether OCR returned a number or a string for the value —
-          // matches the n8n parser's behavior.
+          // matches the n8n parser's behavior. Model is left null when
+          // empty so consumers can distinguish "missing" from "blank".
           items.push({
             sku: String(sku),
+            model: model == null || model === "" ? null : String(model),
             quantity: String(quantity == null ? 0 : quantity),
           });
         }

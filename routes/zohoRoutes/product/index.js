@@ -7,6 +7,7 @@ const { connectToDatabase } = require("../../../utils/mongodb");
 const {
   getViewData,
   handleZohoInventoryRequest,
+  refreshToken,
 } = require("../../../utils/zohoRequest");
 const { requirePermission, requireAnyPermission } = require("../../../middleware/auth");
 
@@ -161,6 +162,118 @@ router.get("/scanLookup", requireAnyPermission("sqt:case:sendParts", "zoho:colle
       .json({ success: false, message: `Scan lookup failed: ${error.message || error}` });
   }
 });
+
+// Bulk SKU LIKE-search for the Credit Note review dialog. Takes a list
+// of OCR-extracted SKUs and returns, per input SKU, every Active Zoho
+// item whose SKU contains it as a substring. The dialog uses these to
+// populate per-row pickers so the user can disambiguate when OCR gives
+// a partial (e.g. "5470" → "5470-RED", "5470-BLU", …).
+//
+// Same Tools-page permission gate as the credit-note submit flow —
+// admin and iMobile Admin both already qualify.
+router.post(
+  "/skuMatches",
+  requirePermission("zoho:salesOrder:create"),
+  async function (req, res) {
+    try {
+      const incoming = Array.isArray(req.body && req.body.skus)
+        ? req.body.skus
+        : [];
+      // De-dupe + drop empty / non-string entries up front so we don't
+      // fire identical queries multiple times for a duplicated OCR row.
+      const unique = [
+        ...new Set(
+          incoming
+            .filter((s) => typeof s === "string")
+            .map((s) => s.trim())
+            .filter(Boolean),
+        ),
+      ];
+      if (unique.length === 0) {
+        return res.json({ success: true, data: {} });
+      }
+
+      // Proactively refresh the Zoho access token before fanning out.
+      // The reactive refresh inside getViewData has a race window: the
+      // first call's 7309 triggers a refresh, the refresh completes
+      // and clears the in-flight gate, then slower parallel calls
+      // (still in flight with the stale token) return 7309 too and
+      // each trigger their own refresh — Zoho's OAuth endpoint
+      // throttles the burst with "Access Denied". One refresh up
+      // front means every parallel call below sees a fresh token.
+      // Best-effort: if the refresh fails the per-call handlers still
+      // retry with their own dedupe, so the worst case is the
+      // original behaviour.
+      try {
+        await refreshToken();
+      } catch (e) {
+        console.warn("skuMatches token pre-warm failed:", e.message || e);
+      }
+
+      const WORKSPACE_ID = "1404913000003936002";
+      const ITEMS_VIEW_ID = "1404913000003936100";
+      // Cap so a one-letter substring like "a" doesn't return thousands
+      // of rows — el-select with `filterable` will still let the user
+      // narrow further on the client.
+      const MAX_MATCHES_PER_SKU = 25;
+
+      // Escape Zoho Analytics single-quote literal syntax.
+      const esc = (v) => String(v).replace(/'/g, "''");
+
+      const buildUrl = (config) =>
+        `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${ITEMS_VIEW_ID}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+
+      const lookupOne = async (sku) => {
+        const safe = esc(sku);
+        try {
+          const rows = await getViewData(
+            buildUrl({
+              responseFormat: "json",
+              selectedColumns: ["Item ID", "SKU", "Item Name", "Status"],
+              // Active-only so the dropdown isn't polluted with
+              // discontinued items the user can't actually use.
+              criteria: `"SKU" LIKE '%${safe}%' AND "Status" = 'Active'`,
+            }),
+          );
+          if (!Array.isArray(rows)) return [];
+          return rows
+            .slice(0, MAX_MATCHES_PER_SKU)
+            .map((r) => ({
+              itemId: r["Item ID"] ? String(r["Item ID"]) : "",
+              sku: r.SKU || "",
+              name: r["Item Name"] || "",
+              status: r.Status || "",
+            }))
+            .filter((m) => m.itemId);
+        } catch (e) {
+          // One bad lookup shouldn't kill the whole batch — log it and
+          // return an empty list so the dialog can still render the
+          // other rows.
+          console.warn(
+            `[skuMatches] lookup failed for sku=${sku}:`,
+            e.message || e,
+          );
+          return [];
+        }
+      };
+
+      // Fan out — Zoho Analytics handles small parallel bursts fine and
+      // the dialog blocks on this anyway, so faster is better.
+      const matches = await Promise.all(unique.map(lookupOne));
+      const data = {};
+      unique.forEach((sku, i) => {
+        data[sku] = matches[i];
+      });
+      return res.json({ success: true, data });
+    } catch (error) {
+      console.error("skuMatches error:", error);
+      return res.status(500).json({
+        success: false,
+        message: `SKU match lookup failed: ${error.message || error}`,
+      });
+    }
+  },
+);
 
 // Product search powers the SQT "Send Parts" picker (TechElite/Admin) and the
 // Selection collections picker (iMobile Admin/Admin).

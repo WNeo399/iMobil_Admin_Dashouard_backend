@@ -6,6 +6,14 @@ const client_secret = process.env.CLIENT_SECRET;
 
 const workspaceId = "1404913000003936002";
 
+// In-flight refreshToken promise. When several callers (e.g. a bulk
+// endpoint that fans out 10 parallel Analytics queries) all detect an
+// expired token at the same moment, they each used to call
+// refreshToken() — Zoho throttled the burst and returned "Access
+// Denied". This shared promise lets them all await the same single
+// refresh instead.
+let refreshPromise = null;
+
 function isTokenExpired(data) {
   if (!data) return false;
   return (
@@ -20,30 +28,46 @@ function isTokenExpired(data) {
 }
 
 async function refreshToken() {
-  try {
-    const response = await axios.post(
-      "https://accounts.zoho.com/oauth/v2/token",
-      null,
-      {
-        params: {
-          refresh_token: refresh_token,
-          client_id: client_id,
-          client_secret: client_secret,
-          redirect_uri: "https://www.example.com/oauth2callback",
-          grant_type: "refresh_token",
-        },
-      }
-    );
-
-    requestToken = response.data.access_token;
-    console.log("New Access Token:", requestToken);
-    return requestToken;
-  } catch (error) {
-    console.error(
-      "Error refreshing token:",
-      error.response?.data || error.message
-    );
+  // If a refresh is already in flight, share that promise so a burst
+  // of concurrent callers doesn't trigger N OAuth requests at once.
+  if (refreshPromise) {
+    return refreshPromise;
   }
+  refreshPromise = (async () => {
+    try {
+      const response = await axios.post(
+        "https://accounts.zoho.com/oauth/v2/token",
+        null,
+        {
+          params: {
+            refresh_token: refresh_token,
+            client_id: client_id,
+            client_secret: client_secret,
+            redirect_uri: "https://www.example.com/oauth2callback",
+            grant_type: "refresh_token",
+          },
+        }
+      );
+
+      requestToken = response.data.access_token;
+      console.log("New Access Token:", requestToken);
+      return requestToken;
+    } catch (error) {
+      console.error(
+        "Error refreshing token:",
+        error.response?.data || error.message
+      );
+      // Return null so callers know the refresh failed; their existing
+      // null-check logic surfaces the error to the user.
+      return null;
+    } finally {
+      // Clear the gate so the next genuine expiry triggers a fresh
+      // refresh. (If we leave it set, a later expiry would resolve
+      // instantly to the now-stale token.)
+      refreshPromise = null;
+    }
+  })();
+  return refreshPromise;
 }
 
 async function createExportJob(viewId) {
@@ -79,7 +103,6 @@ async function createExportJob(viewId) {
       }
       data = await fetchData(viewId);
     }
-    console.log(data);
     return data.data.jobId;
   } catch (error) {
     console.error("Error in createExportJob:", error);
@@ -308,7 +331,6 @@ async function handleZohoInventoryPutRequest(url, params) {
 
   try {
     let data = await fetchData(url, params);
-    console.log(data);
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
       const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
@@ -331,4 +353,8 @@ module.exports = {
   handleZohoInventoryMultipartPostRequest,
   handleZohoInventoryPutRequest,
   getViewData,
+  // Exported so callers that fan out many parallel Zoho requests can
+  // proactively refresh once up front, avoiding the per-call reactive
+  // refresh storm.
+  refreshToken,
 };
