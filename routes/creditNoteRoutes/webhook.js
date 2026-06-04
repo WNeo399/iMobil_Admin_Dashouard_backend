@@ -39,6 +39,12 @@ router.post("/creditNoteOcr", async function (req, res) {
         creditNo: parsed.creditNo,
         itemCount: parsed.itemCount,
         items: parsed.items,
+        // Sentinel-SKU buckets — see parser.js for the split logic.
+        // Stored as their own arrays so the Review dialog can render
+        // editable sections for each and the submit path can map
+        // them to the fixed Zoho catalogue item-ids.
+        returnDevice: parsed.returnDevice || [],
+        repairDevice: parsed.repairDevice || [],
         returnNote: parsed.returnNote,
         ocrProcessedAt: new Date(),
       };

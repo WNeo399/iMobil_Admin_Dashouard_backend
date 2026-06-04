@@ -38,6 +38,17 @@ const ZOHO_ORG_ID = "746138234";
 const ZOHO_WORKSPACE_ID = "1404913000003936002";
 const ZOHO_CREDIT_NOTE_VIEW_ID = "1404913000003936107";
 
+// Fixed catalogue item-ids the warehouse uses for the two sentinel
+// SKUs in the OCR payload:
+//   A9999 → Received Return Device
+//   R9999 → Received Device for Repair
+// Each entry in returnDevice / repairDevice becomes one Zoho line
+// item pointing at the matching id, with the device model going into
+// the line item's `description` so the credit note carries the model
+// identification without needing a separate product per model.
+const ZOHO_ITEM_ID_RETURN_DEVICE = "2591985000341408805";
+const ZOHO_ITEM_ID_REPAIR_DEVICE = "2591985000341408783";
+
 // Persistence layer — every successful submit gets a row here so we
 // can correlate the OCR document id back to its S3 archive copy
 // without re-querying either upstream. Schema is intentionally narrow
@@ -426,14 +437,18 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
       : [];
     const note =
       req.body && typeof req.body.note === "string" ? req.body.note : "";
+    // Device buckets (A9999 / R9999) — see ZOHO_ITEM_ID_RETURN_DEVICE
+    // / _REPAIR_DEVICE above. Each entry maps to its own Zoho line
+    // item with model as description.
+    const returnDevices = Array.isArray(req.body && req.body.returnDevice)
+      ? req.body.returnDevice
+      : [];
+    const repairDevices = Array.isArray(req.body && req.body.repairDevice)
+      ? req.body.repairDevice
+      : [];
 
-    if (items.length === 0) {
-      return res
-        .status(400)
-        .json({ success: false, message: "items[] is required and must be non-empty" });
-    }
-    // Each item must carry a matched Zoho item id; quantity defaults
-    // to 1 if missing / non-numeric.
+    // Each regular item must carry a matched Zoho item id; quantity
+    // defaults to 1 if missing / non-numeric.
     const usableItems = items
       .map((it) => ({
         item_id: String(it.matchedItemId || ""),
@@ -441,10 +456,32 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
         quantity: Number(it.quantity) > 0 ? Number(it.quantity) : 1,
       }))
       .filter((it) => it.item_id);
-    if (usableItems.length === 0) {
+
+    // Devices: keep entries that have either a non-empty model or a
+    // positive quantity. Quantity defaults to 1 (a single device
+    // received) when missing / zero / non-numeric.
+    const usableReturnDevices = returnDevices
+      .filter((d) => d && ((d.model && String(d.model).trim()) || Number(d.quantity) > 0))
+      .map((d) => ({
+        model: String(d.model || "").trim(),
+        quantity: Number(d.quantity) > 0 ? Number(d.quantity) : 1,
+      }));
+    const usableRepairDevices = repairDevices
+      .filter((d) => d && ((d.model && String(d.model).trim()) || Number(d.quantity) > 0))
+      .map((d) => ({
+        model: String(d.model || "").trim(),
+        quantity: Number(d.quantity) > 0 ? Number(d.quantity) : 1,
+      }));
+
+    if (
+      usableItems.length === 0 &&
+      usableReturnDevices.length === 0 &&
+      usableRepairDevices.length === 0
+    ) {
       return res.status(400).json({
         success: false,
-        message: "No items have a matchedItemId — pick a Zoho match before submitting.",
+        message:
+          "Nothing to submit — pick a Zoho match for at least one item or add a return / repair device.",
       });
     }
 
@@ -498,10 +535,35 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
     // them is a no-op.
     const linePricebookId =
       (existingLineItems[0] && existingLineItems[0].pricebook_id) || null;
-    const newLineItems = linePricebookId
-      ? usableItems.map((it) => ({ ...it, pricebook_id: linePricebookId }))
-      : usableItems;
-    const mergedLineItems = existingLineItems.concat(newLineItems);
+    const stampPricebook = (li) =>
+      linePricebookId ? { ...li, pricebook_id: linePricebookId } : li;
+
+    const newLineItems = usableItems.map(stampPricebook);
+
+    // Device lines — each entry in usableReturnDevices / usable
+    // RepairDevices becomes its own Zoho line item pointing at the
+    // fixed catalogue item-id, with the model on the description.
+    // Quantity comes from the parsed/edited row.
+    const returnDeviceLineItems = usableReturnDevices.map((d) =>
+      stampPricebook({
+        item_id: ZOHO_ITEM_ID_RETURN_DEVICE,
+        quantity: d.quantity,
+        description: d.model,
+      }),
+    );
+    const repairDeviceLineItems = usableRepairDevices.map((d) =>
+      stampPricebook({
+        item_id: ZOHO_ITEM_ID_REPAIR_DEVICE,
+        quantity: d.quantity,
+        description: d.model,
+      }),
+    );
+
+    const mergedLineItems = existingLineItems.concat(
+      newLineItems,
+      returnDeviceLineItems,
+      repairDeviceLineItems,
+    );
 
     const updatePayload = {
       // PUT requires the date back (Zoho will reject if omitted).

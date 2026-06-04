@@ -11,11 +11,19 @@
 //
 // Output:
 //   {
-//     creditNo:   string | null,  // sourced from the OCR `parcel_no` field
-//     itemCount:  number,
-//     items:      [{ sku, model, quantity }],  // model is null when OCR didn't fill it
-//     returnNote: string  // newline-joined "Model x Qty (reasons)" lines
+//     creditNo:      string | null,  // sourced from the OCR `parcel_no` field
+//     itemCount:     number,         // count of regular items only (excludes A9999/R9999)
+//     items:         [{ sku, model, quantity }],
+//     returnDevice:  [{ model, quantity }],  // A9999 rows (Received Return Device)
+//     repairDevice:  [{ model, quantity }],  // R9999 rows (Received Device for Repair)
+//     returnNote:    string  // newline-joined "Model x Qty (reasons)" lines
 //   }
+//
+// A9999 and R9999 are sentinel SKUs the warehouse uses to flag returned
+// devices and repair-in devices respectively — they don't represent real
+// products on their own, so they get peeled off into their own arrays
+// here and submitted to Zoho as line items pointing at the fixed
+// catalogue item-ids on the backend submit path (see index.js).
 //
 // Note: the upstream HandwritingOCR field key is `parcel_no` (the
 // physical parcel sticker the warehouse writes on the box), but we
@@ -29,10 +37,17 @@ function findField(extraction, key) {
   return extraction.find((f) => f && f.key === key);
 }
 
+// Sentinel SKUs the warehouse uses on warranty rows. Compared
+// case-insensitively to defend against OCR/data-entry variants.
+const SKU_RETURN_DEVICE = "A9999";
+const SKU_REPAIR_DEVICE = "R9999";
+
 function parseOcrResult(body) {
   const results = (body && body.results) || [];
   let creditNo = null;
   const items = [];
+  const returnDevice = [];
+  const repairDevice = [];
   const returnNotes = [];
 
   for (const page of results) {
@@ -48,24 +63,38 @@ function parseOcrResult(body) {
     }
 
     // ── Warranty Stock Back/Refund ─────────────────────────────
-    // Each row is an array of fields; we only keep ones with an sku.
-    // Model lives alongside SKU on the warranty rows but is often null
-    // when OCR couldn't read it — we store it as null in that case so
-    // the schema is consistent.
+    // Each row is an array of fields with sku / model / quantity.
+    // We split off the two sentinel SKUs (A9999 / R9999) into their
+    // own buckets — they represent received-device-for-return and
+    // received-device-for-repair respectively, and need to be
+    // submitted to Zoho as line items pointing at fixed catalogue
+    // item-ids (handled on the submit path, not here). Regular SKUs
+    // stay in `items` with their `model` field preserved.
     const warrantyField = findField(extraction, "warranty_stock_backrefund");
     if (warrantyField && Array.isArray(warrantyField.value)) {
       for (const row of warrantyField.value) {
         const sku = (findField(row, "sku") || {}).value;
         const model = (findField(row, "model") || {}).value;
         const quantity = (findField(row, "quantity") || {}).value;
-        if (sku) {
-          // Stringify the qty so the schema stays string-typed regardless
-          // of whether OCR returned a number or a string for the value —
+        if (sku == null || sku === "") continue;
+
+        const skuUpper = String(sku).trim().toUpperCase();
+        const modelStr =
+          model == null || model === "" ? "" : String(model);
+        const qtyNum = Number(quantity) || 0;
+
+        if (skuUpper === SKU_RETURN_DEVICE) {
+          returnDevice.push({ model: modelStr, quantity: qtyNum });
+        } else if (skuUpper === SKU_REPAIR_DEVICE) {
+          repairDevice.push({ model: modelStr, quantity: qtyNum });
+        } else {
+          // Stringify qty so the schema stays string-typed regardless of
+          // whether OCR returned a number or a string for the value —
           // matches the n8n parser's behavior. Model is left null when
           // empty so consumers can distinguish "missing" from "blank".
           items.push({
             sku: String(sku),
-            model: model == null || model === "" ? null : String(model),
+            model: modelStr || null,
             quantity: String(quantity == null ? 0 : quantity),
           });
         }
@@ -99,8 +128,14 @@ function parseOcrResult(body) {
 
   return {
     creditNo,
+    // itemCount stays as just the regular items so the Credit Note
+    // list page's "Items" column reflects orderable products. The
+    // returnDevice / repairDevice arrays have their own counts via
+    // their `.length` when needed.
     itemCount: items.length,
     items,
+    returnDevice,
+    repairDevice,
     returnNote: returnNotes.join("\n"),
   };
 }
