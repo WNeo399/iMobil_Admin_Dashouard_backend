@@ -27,6 +27,12 @@ var creditNoteWebhookRouter = require('./routes/creditNoteRoutes/webhook');
 // pattern as the OCR webhook: outside the auth chain, security via
 // the X-Hub-Signature-256 HMAC plus the GET-handshake verify token.
 var whatsappWebhookRouter = require('./routes/whatsappRoutes/webhook');
+// Public widget submission endpoints — receive form submissions from
+// the embeddable widgets shipped out of the iMobile_Widget repo.
+// Mounted outside the auth chain (third-party sites can't carry our
+// JWT); security via CORS allowlist + origin check + rate limit +
+// honeypot, all configured inside the router.
+var widgetRouter = require('./routes/widgetRoutes/index');
 // TEMPORARY: external-integration endpoint (no auth). Remove together with
 // routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
 var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
@@ -71,6 +77,28 @@ app.use('/webhook', creditNoteWebhookRouter);
 // JWT); request integrity is enforced inside the router via
 // X-Hub-Signature-256 against WHATSAPP_APP_SECRET.
 app.use('/webhook', whatsappWebhookRouter);
+// Widget submission endpoints — POST /widget/<name>. Public; CORS +
+// origin allowlist + rate limit + honeypot live inside the router.
+app.use('/widget', widgetRouter);
+// Static serve for the built widget bundles produced by
+// `npm run build:to-backend` in the iMobile_Widget repo. Each bundle
+// lands at public/widgets/<widget-name>/v<N>.js and is served from
+// /widget-assets/<widget-name>/v<N>.js. The path differs from the
+// on-disk one because /widgets/ would collide with the API
+// router above. Cached briefly so customers see updates promptly;
+// once we move hosting to Cloudflare, this whole mount goes away.
+app.use(
+  '/widget-assets',
+  express.static(path.join(__dirname, 'public', 'widgets'), {
+    maxAge: '5m',
+    immutable: false,
+    setHeaders: (res) => {
+      // Embeds run cross-origin. Static assets need permissive CORS
+      // so the host page can fetch + parse them without complaints.
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    },
+  })
+);
 // All zoho/sqt/users routes require a valid login; per-permission checks are
 // applied inside the routers.
 app.use('/zoho', authenticate, zohoRouter);
