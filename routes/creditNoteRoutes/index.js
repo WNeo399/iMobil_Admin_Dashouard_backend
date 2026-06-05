@@ -516,16 +516,116 @@ router.patch("/:id", GATE, async function (req, res) {
   }
 });
 
+// ── GET /creditNote/:id/zohoDetail ──────────────────────────────────
+// Resolve the row's creditNo → Zoho creditnote_id and fetch the full
+// Zoho Inventory record in one round trip. Surfaces the bits the
+// Review dialog needs to display up front (customer name, pricelist)
+// AND returns the whole `creditnote` object so the dialog can pass it
+// back on submit without us having to re-fetch.
+//
+// This used to live inside submitToZoho as steps 2 + 3 — pulling it
+// out shaves one Zoho fetch off every submit (since the dialog has
+// already done it) and lets the user see who the credit note belongs
+// to before committing the change.
+//
+// Re-called by the frontend whenever the user edits creditNo via the
+// PATCH endpoint, so the displayed customer / pricelist stays in sync
+// with the new lookup target.
+router.get("/:id/zohoDetail", GATE, async function (req, res) {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid id" });
+    }
+
+    const db = await connectToDatabase();
+    const row = await db
+      .collection(CREDIT_NOTE_COLLECTION)
+      .findOne({ _id: new ObjectId(id) });
+    if (!row) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Credit note record not found" });
+    }
+    if (!row.creditNo) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "This row has no creditNo extracted from OCR — can't locate the Zoho credit note.",
+      });
+    }
+
+    const zohoCreditNoteId = await findZohoCreditNoteId(row.creditNo);
+    if (!zohoCreditNoteId) {
+      return res.status(404).json({
+        success: false,
+        message: `Could not find credit note "${row.creditNo}" in Zoho Inventory.`,
+      });
+    }
+
+    const detail = await fetchZohoCreditNote(zohoCreditNoteId);
+    if (!detail) {
+      return res.status(502).json({
+        success: false,
+        message:
+          "Found the Zoho credit note id but couldn't fetch the full record.",
+      });
+    }
+
+    // Resolve the pricebook id with the contact fallback so empty
+    // credit notes (no line items yet) still show a pricelist in the
+    // dialog header. The helper only fires the contact lookup when
+    // the cheaper line-items read returns nothing.
+    const pricebookId = await resolvePricebookId(detail);
+
+    return res.json({
+      success: true,
+      zohoCreditNoteId,
+      customerName: detail.customer_name || null,
+      customerId: detail.customer_id || null,
+      pricebookId,
+      // Status drives the is_draft decision on submit (we only want to
+      // keep the draft flag set when the record is currently draft —
+      // sending is_draft on an open record would demote it).
+      status: detail.status || null,
+      // Hand the full record back too so the Review dialog can hold
+      // onto it and pass it through to submitToZoho, sparing the
+      // backend a re-fetch. The whole shape stays opaque to the
+      // frontend — it just stores + forwards.
+      detail,
+    });
+  } catch (error) {
+    console.error("zohoDetail error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to fetch Zoho credit note detail",
+    });
+  }
+});
+
 // ── POST /creditNote/:id/submitToZoho ────────────────────────────────
 // Pushes the user's matched line items + edited note into the existing
-// Zoho Inventory credit note (resolved by creditNo on the row), then
-// re-uploads the S3 PDF as a Zoho attachment. On success the row's
-// status flips to "completed" so the Credit Note page tree count
-// reflects it and the Review dialog's Submit button stays off on
-// re-open. Body:
+// Zoho Inventory credit note, then re-uploads the S3 PDF as a Zoho
+// attachment. On success the row's status flips to "completed" so the
+// Credit Note page tree count reflects it and the Review dialog's
+// Submit button stays off on re-open. Body:
 //   {
 //     items: [{ matchedItemId, matchedSku, matchedName, quantity }, ...],
-//     note: "..."   // optional, replaces the credit note's notes field
+//     note: "..."                       // optional, replaces notes field
+//     returnDevice, repairDevice        // A9999/R9999 buckets
+//
+//     // Optional Zoho-side hints — when the frontend already fetched
+//     // the credit note via /zohoDetail it should pass these back so
+//     // we skip the resolve + re-fetch entirely. If anything is
+//     // missing we fall back to the old find + fetch flow so this
+//     // endpoint still works for callers that don't go through the
+//     // dialog.
+//     zohoCreditNoteId: "...",
+//     pricebookId: "...",    // resolved by /zohoDetail (with the
+//                            // contact-fallback) so we don't have to
+//                            // re-look-it-up for the line stamping
+//     existing: { ...the full Zoho creditnote object as returned by
+//                  Inventory's GET /creditnotes/:id }
 //   }
 router.post("/:id/submitToZoho", GATE, async function (req, res) {
   try {
@@ -603,23 +703,39 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
       });
     }
 
-    // 1. Resolve creditNo → Zoho creditnote_id.
-    const zohoCreditNoteId = await findZohoCreditNoteId(row.creditNo);
+    // 1 + 2. Resolve creditNo → Zoho creditnote_id and load the
+    //   existing record. The Review dialog calls /zohoDetail on open
+    //   and passes the results back here, so the happy path skips
+    //   both Zoho round trips. Anything missing (or a caller that
+    //   doesn't go through the dialog) falls through to the original
+    //   find + fetch flow so this endpoint still works standalone.
+    let zohoCreditNoteId =
+      (req.body && req.body.zohoCreditNoteId &&
+        String(req.body.zohoCreditNoteId)) ||
+      null;
+    let existing =
+      req.body && req.body.existing && typeof req.body.existing === "object"
+        ? req.body.existing
+        : null;
+
     if (!zohoCreditNoteId) {
-      return res.status(404).json({
-        success: false,
-        message: `Could not find credit note "${row.creditNo}" in Zoho Inventory.`,
-      });
+      zohoCreditNoteId = await findZohoCreditNoteId(row.creditNo);
+      if (!zohoCreditNoteId) {
+        return res.status(404).json({
+          success: false,
+          message: `Could not find credit note "${row.creditNo}" in Zoho Inventory.`,
+        });
+      }
     }
 
-    // 2. Fetch existing credit note so we can append our items instead
-    //    of clobbering whatever's already there.
-    const existing = await fetchZohoCreditNote(zohoCreditNoteId);
     if (!existing) {
-      return res.status(502).json({
-        success: false,
-        message: "Found the Zoho credit note id but couldn't fetch the existing record.",
-      });
+      existing = await fetchZohoCreditNote(zohoCreditNoteId);
+      if (!existing) {
+        return res.status(502).json({
+          success: false,
+          message: "Found the Zoho credit note id but couldn't fetch the existing record.",
+        });
+      }
     }
 
     // 3. Compose the updated payload. Spread the existing line items
@@ -630,14 +746,25 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
       : [];
 
     // Pricelist on a credit note is stored per-line-item on this org,
-    // not on the credit-note root. Read it off the first existing line
-    // item and stamp the same pricebook_id onto every new line item so
-    // Zoho applies the matching rates instead of the item's default
-    // selling price. Existing line items already carry their own
-    // pricebook_id + rate (we just spread them above), so re-sending
-    // them is a no-op.
-    const linePricebookId =
-      (existingLineItems[0] && existingLineItems[0].pricebook_id) || null;
+    // not on the credit-note root. Three-tier resolution:
+    //   1. body.pricebookId — Review dialog already resolved it via
+    //      /zohoDetail (which handles the contact fallback), so the
+    //      happy path skips any extra round trip here.
+    //   2. existing.line_items[0].pricebook_id — the cheap read off
+    //      the credit note's existing rows.
+    //   3. resolvePricebookId(existing) — falls all the way back to
+    //      the customer's default pricebook via the Contacts API for
+    //      the no-items-yet case.
+    // Existing line items already carry their own pricebook_id + rate
+    // (we just spread them above), so re-sending those is a no-op;
+    // the stamp only matters for the NEW line items below.
+    let linePricebookId =
+      (req.body && req.body.pricebookId && String(req.body.pricebookId)) ||
+      (existingLineItems[0] && existingLineItems[0].pricebook_id) ||
+      null;
+    if (!linePricebookId) {
+      linePricebookId = await resolvePricebookId(existing);
+    }
     const stampPricebook = (li) =>
       linePricebookId ? { ...li, pricebook_id: linePricebookId } : li;
 
@@ -834,6 +961,55 @@ async function fetchZohoCreditNote(creditnoteId) {
   const resp = await handleZohoInventoryRequest(url);
   if (resp && resp.code === 0 && resp.creditnote) {
     return resp.creditnote;
+  }
+  return null;
+}
+
+// Resolve the pricebook (pricelist) id for a credit note.
+//
+// Two-tier:
+//   1. existing.line_items[0].pricebook_id — on this org Zoho stores
+//      the pricebook per-line, so as long as there's at least one
+//      existing item we can read it straight off without an extra
+//      round trip.
+//   2. Fall back to the customer's default pricebook via the Contacts
+//      API. Only kicks in when (1) returns nothing — i.e. a freshly
+//      created credit note that has no items yet — so the cheap path
+//      stays cheap for the common case.
+//
+// Returns the pricebook_id as a string, or null when neither tier
+// produced one (e.g. customer has no default pricebook, or the
+// contact lookup failed).
+async function resolvePricebookId(existing) {
+  if (existing && Array.isArray(existing.line_items)) {
+    const fromLineItems =
+      existing.line_items[0] && existing.line_items[0].pricebook_id;
+    if (fromLineItems) return String(fromLineItems);
+  }
+  // Need a customer to fall back on. Without customer_id we can't
+  // query — the credit note must already be linked to a contact.
+  if (!existing || !existing.customer_id) return null;
+  try {
+    const url =
+      `https://www.zohoapis.com/inventory/v1/contacts/${existing.customer_id}` +
+      `?organization_id=${ZOHO_ORG_ID}`;
+    const resp = await handleZohoInventoryRequest(url);
+    if (
+      resp &&
+      resp.code === 0 &&
+      resp.contact &&
+      resp.contact.pricebook_id
+    ) {
+      return String(resp.contact.pricebook_id);
+    }
+  } catch (e) {
+    // Swallow — caller treats null as "no pricelist", which makes
+    // the new line items use Zoho's catalogue default rate. Better
+    // than failing the whole submit on a flaky contacts call.
+    console.warn(
+      "Contact pricebook fallback failed:",
+      e.message || e,
+    );
   }
   return null;
 }
