@@ -19,6 +19,10 @@ var repairRouter = require('./routes/repairRoutes/index');
 // Credit Note OCR submission — forwards PDFs to HandwritingOCR using
 // the bearer token kept in .env, so credentials stay server-side.
 var creditNoteRouter = require('./routes/creditNoteRoutes/index');
+// Admin-side endpoints for reviewing widget Special Order
+// submissions. Same gate as Credit Note (zoho:salesOrder:create) so
+// the same role can triage what came in via the embedded widget.
+var specialOrderRouter = require('./routes/specialOrderRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -107,6 +111,7 @@ app.use('/dashboard', authenticate, dashboardRouter);
 app.use('/users', authenticate, usersRouter);
 app.use('/repair', authenticate, repairRouter);
 app.use('/creditNote', authenticate, creditNoteRouter);
+app.use('/specialOrder', authenticate, specialOrderRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
