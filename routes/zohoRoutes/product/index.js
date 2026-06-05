@@ -302,7 +302,10 @@ router.get("/searchProduct", requireAnyPermission("sqt:case:sendParts", "zoho:co
         code: 0,
         success: true,
         msg: "",
-        data: data.payload.products,
+        // Expand multi-variant products into one row per variant so
+        // the autocomplete picker shows each shoppable SKU
+        // independently. See expandProductVariants() below.
+        data: expandProductVariants(data.payload && data.payload.products),
       }),
     );
   } else {
@@ -315,6 +318,77 @@ router.get("/searchProduct", requireAnyPermission("sqt:case:sendParts", "zoho:co
     );
   }
 });
+
+// Zoho Commerce returns one row per PRODUCT, with multi-variant
+// products carrying their per-variant SKUs in `variants[]`. Variants
+// are distinct items on the Zoho Inventory side (different
+// item_ids, different stock levels), so the picker has to surface
+// them as separate options — otherwise "iPhone 13" lands as one row
+// and the user can only ever pick the first variant's SKU.
+//
+// Flatten the response: products with no variants pass through
+// unchanged; products with variants emit one row per variant. Each
+// expanded row carries the variant's SKU as the top-level `sku`
+// (so existing consumers reading `p.sku` Just Work), a combined
+// product+variant display name, and a `variant_id` for any caller
+// that needs to round-trip back to the original variant. Other
+// product-level fields (`documents`, `images`, `product_id`, etc.)
+// are preserved verbatim so the picker thumbnails still render.
+function expandProductVariants(products) {
+  const out = [];
+  if (!Array.isArray(products)) return out;
+  for (const p of products) {
+    if (!p) continue;
+    const variants = Array.isArray(p.variants) ? p.variants : [];
+    if (variants.length === 0) {
+      // No variants — pass through. Drop the empty variants array
+      // to keep the response shape consistent with expanded rows.
+      const { variants: _v, ...rest } = p;
+      out.push(rest);
+      continue;
+    }
+    for (const v of variants) {
+      if (!v) continue;
+      const variantSku = String(
+        v.sku || v.variant_sku || ""
+      ).trim();
+      // Skip variants without an actual SKU — they can't be picked /
+      // ordered anyway, and emitting an empty-sku row would confuse
+      // the downstream filter chain.
+      if (!variantSku) continue;
+      // Strip the full variants array off each expanded row — it'd
+      // otherwise repeat the same array on every expanded sibling
+      // and bloat the response.
+      const { variants: _v, ...productRest } = p;
+      out.push({
+        ...productRest,
+        sku: variantSku,
+        name: combinedDisplayName(p.name, v.name || v.variant_name),
+        variant_id: v.variant_id || v.id || null,
+        // Keep the variant payload itself in case a consumer wants
+        // attribute info (size / colour / etc.) without re-fetching.
+        variant: v,
+      });
+    }
+  }
+  return out;
+}
+
+// Build a display name that fuses product + variant without ending
+// up with "iPhone 13 — iPhone 13" when Zoho returned the same
+// string for both. Conservative: when the variant name is empty,
+// identical to the product, or already starts with the product
+// name, we trust whatever's longest rather than concatenating.
+function combinedDisplayName(productName, variantName) {
+  const p = String(productName || "").trim();
+  const v = String(variantName || "").trim();
+  if (!v) return p;
+  if (!p) return v;
+  if (v === p) return p;
+  if (v.startsWith(p + " ")) return v;
+  if (p.includes(v)) return p;
+  return `${p} — ${v}`;
+}
 
 
 const priceListIdMap = {
