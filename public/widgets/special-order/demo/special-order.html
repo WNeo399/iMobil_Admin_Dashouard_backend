@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Special Order Widget — Embed Demo</title>
+    <!--
+      This page mimics how a real embedder will integrate the widget:
+      one div + one script tag, no framework on the host page. Use
+      this for end-to-end verification of the BUILT bundle:
+
+        npm run build      → produces dist/special-order/v1.js
+        npm run preview    → serves dist/ at localhost:5175
+
+      Then open http://localhost:5175/demo/special-order.html — the
+      script tag below resolves to the locally-built bundle because
+      `npm run preview` serves dist/ as root.
+
+      Once the widget is hosted on Railway, swap the script src to
+      the production URL to verify the live bundle end-to-end on a
+      static page.
+    -->
+    <style>
+      body {
+        margin: 0;
+        padding: 40px 20px;
+        background: #f3f4f6;
+        font: 14px/1.5 system-ui, sans-serif;
+        color: #1f2937;
+      }
+      .demo {
+        max-width: 720px;
+        margin: 0 auto;
+      }
+      .demo > h1 { margin: 0 0 4px; font-size: 22px; }
+      .demo > p  { margin: 0 0 24px; color: #6b7280; }
+    </style>
+  </head>
+  <body>
+    <div class="demo">
+      <h1>Special Order — Embed Demo</h1>
+      <p>
+        The widget below is loaded from the built IIFE bundle, exactly
+        as a third-party embedder would integrate it.
+      </p>
+      <!--
+        Mount element. The widget's entry script finds this by id
+        convention: #imobile-<widget-name>.
+      -->
+      <div
+        id="imobile-special-order"
+        data-api-base="https://imbadmin-back.up.railway.app"
+      ></div>
+    </div>
+
+    <!--
+      Script src points at the relative path the dev preview serves
+      (npm run preview puts dist/ at root). When deployed to Railway
+      this becomes
+        https://imbadmin-back.up.railway.app/widget-assets/special-order/v1.js
+    -->
+    <script src="/special-order/v1.js" defer></script>
+  </body>
+</html>
