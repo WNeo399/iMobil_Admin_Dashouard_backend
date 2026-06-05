@@ -49,7 +49,13 @@ router.get("/list", GATE, async function (req, res) {
 
     const db = await connectToDatabase();
     const collection = db.collection(COLLECTION);
-    const [data, total, distinctWidgets] = await Promise.all([
+    // We need the distinct widget names in the collection so the
+    // page's filter dropdown can render them. `collection.distinct()`
+    // would be the natural fit but it's NOT in MongoDB Stable API
+    // V1 — and utils/mongodb.js enables `strict: true`, so calling
+    // it returns APIStrictError. A $group aggregation gives the same
+    // result and IS in V1.
+    const [data, total, widgetGroups] = await Promise.all([
       collection
         .find(filter)
         .sort({ widget: 1, origin: 1 })
@@ -57,7 +63,9 @@ router.get("/list", GATE, async function (req, res) {
         .limit(pageSize)
         .toArray(),
       collection.countDocuments(filter),
-      collection.distinct("widget"),
+      collection
+        .aggregate([{ $group: { _id: "$widget" } }])
+        .toArray(),
     ]);
 
     return res.json({
@@ -66,7 +74,10 @@ router.get("/list", GATE, async function (req, res) {
       total,
       page,
       pageSize,
-      widgets: (distinctWidgets || []).sort(),
+      widgets: (widgetGroups || [])
+        .map((g) => g._id)
+        .filter(Boolean)
+        .sort(),
     });
   } catch (error) {
     console.error("List widget origins error:", error);
