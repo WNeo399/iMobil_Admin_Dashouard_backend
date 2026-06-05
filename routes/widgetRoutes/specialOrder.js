@@ -18,6 +18,7 @@
 
 var express = require("express");
 var multer = require("multer");
+var cors = require("cors");
 var crypto = require("crypto");
 var sharp = require("sharp");
 var router = express.Router();
@@ -26,8 +27,14 @@ const {
   PutObjectCommand,
 } = require("@aws-sdk/client-s3");
 const { connectToDatabase } = require("../../utils/mongodb");
+const { getAllowedOrigins } = require("../../utils/widgetOrigins");
 
 const COLLECTION = "imb_special_orders";
+// Widget name — used to look up THIS widget's origin allowlist from
+// imb_widget_origins. Must match the widget folder name in
+// iMobile_Widget/src/widgets/ so admins configuring the allowlist see
+// the same name they use everywhere else.
+const WIDGET_NAME = "special-order";
 
 // ── Limits ─────────────────────────────────────────────────────────
 // Per-image cap: matches the widget's client-side check so a sneaky
@@ -100,23 +107,25 @@ function getBucketName() {
   );
 }
 
-// ── Origin allowlist (shared with router) ──────────────────────────
-// Imported lazily to avoid a circular dep with index.js.
-function isAllowedOrigin(req) {
-  // eslint-disable-next-line global-require
-  const parent = require("./index");
-  const allowed = parent.allowedOrigins || [];
-  if (allowed.length === 0) return false;
+// ── Origin allowlist (per-widget, DB-backed) ───────────────────────
+// Both the CORS preflight check and the in-handler origin check go
+// through getAllowedOrigins(WIDGET_NAME), which caches for 60s with
+// manual invalidation on admin writes — so adding an origin via the
+// System → Widget Origins page is effective immediately.
+
+async function isAllowedOrigin(req) {
+  const allowed = await getAllowedOrigins(WIDGET_NAME);
+  if (allowed.size === 0) return false;
   const origin = req.get("Origin");
-  if (origin && allowed.includes(origin)) return true;
-  // Some embeds (e.g. file:// pages, certain WebView wrappers)
-  // don't send Origin but do send Referer. Match its origin half
-  // against the allowlist as a fallback.
+  if (origin && allowed.has(origin)) return true;
+  // Some embeds (e.g. file:// pages, certain WebView wrappers) don't
+  // send Origin but do send Referer. Match its origin half against
+  // the allowlist as a fallback.
   const referer = req.get("Referer");
   if (referer) {
     try {
       const refOrigin = new URL(referer).origin;
-      if (allowed.includes(refOrigin)) return true;
+      if (allowed.has(refOrigin)) return true;
     } catch {
       // Malformed Referer — treat as unauthenticated.
     }
@@ -124,12 +133,42 @@ function isAllowedOrigin(req) {
   return false;
 }
 
+// CORS middleware specific to this widget — every preflight + actual
+// request runs through the same allowlist lookup. `origin` callback
+// returns either the matched origin string (echoed back in the
+// Access-Control-Allow-Origin header) or an Error which cors() turns
+// into a CORS failure. Origin-less requests (same-origin, curl) pass
+// through here but get caught by isAllowedOrigin() in the handler.
+const widgetCors = cors({
+  origin: async (origin, callback) => {
+    if (!origin) return callback(null, true);
+    try {
+      const allowed = await getAllowedOrigins(WIDGET_NAME);
+      if (allowed.has(origin)) return callback(null, origin);
+      return callback(new Error(`Origin ${origin} not allowed`));
+    } catch (e) {
+      // DB failure — fail closed. Better to 5xx an embed than to
+      // expose the endpoint while the allowlist is unreachable.
+      console.error("[specialOrder] CORS lookup failed:", e.message || e);
+      return callback(e);
+    }
+  },
+  credentials: false,
+  maxAge: 3600,
+});
+
+// Preflight needs an explicit OPTIONS handler with the same CORS
+// middleware so the browser's preflight succeeds before the POST.
+router.options("/", widgetCors);
+
 // ── Handler ────────────────────────────────────────────────────────
-router.post("/", upload.array("images", MAX_IMAGES), async function (req, res) {
+router.post("/", widgetCors, upload.array("images", MAX_IMAGES), async function (req, res) {
   try {
     // 1. Origin check. CORS already filtered the browser case; this
-    //    rejects non-browser callers (curl, scripts) too.
-    if (!isAllowedOrigin(req)) {
+    //    rejects non-browser callers (curl, scripts) too. Uses the
+    //    same per-widget allowlist as the CORS middleware so the
+    //    two can't disagree.
+    if (!(await isAllowedOrigin(req))) {
       console.warn(
         `[specialOrder] rejected submission from origin=${req.get("Origin")} referer=${req.get("Referer")}`,
       );

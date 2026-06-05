@@ -23,6 +23,11 @@ var creditNoteRouter = require('./routes/creditNoteRoutes/index');
 // submissions. Same gate as Credit Note (zoho:salesOrder:create) so
 // the same role can triage what came in via the embedded widget.
 var specialOrderRouter = require('./routes/specialOrderRoutes/index');
+// Admin CRUD for the per-widget origin allowlist that the public
+// /widget/* endpoints consult on every submission. Gated by
+// system:user:manage — system-tier admins manage who can talk to
+// the public widget endpoints.
+var widgetOriginRouter = require('./routes/widgetOriginRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -112,6 +117,7 @@ app.use('/users', authenticate, usersRouter);
 app.use('/repair', authenticate, repairRouter);
 app.use('/creditNote', authenticate, creditNoteRouter);
 app.use('/specialOrder', authenticate, specialOrderRouter);
+app.use('/widgetOrigin', authenticate, widgetOriginRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
