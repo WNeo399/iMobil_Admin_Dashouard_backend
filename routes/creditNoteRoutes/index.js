@@ -413,6 +413,109 @@ router.get("/list", GATE, async function (req, res) {
   }
 });
 
+// ── PATCH /creditNote/:id ───────────────────────────────────────────
+// Partial-update endpoint for the small set of OCR-extracted fields the
+// user is allowed to correct from the Review dialog before submitting
+// to Zoho — currently:
+//   - creditNo        (the parcel/credit-note number; OCR misreads happen)
+//   - items[]         (specifically the per-row sku, when OCR garbles it
+//                      or splits a row incorrectly)
+//
+// Anything else on the row stays untouched. Items are replaced as a
+// whole array — the frontend always sends the current full list, so
+// last-write-wins is fine and avoids per-index merge complexity.
+//
+// Returns the updated row so the caller can sync its local cache
+// without a second round-trip.
+router.patch("/:id", GATE, async function (req, res) {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid id" });
+    }
+
+    const body = req.body || {};
+    const update = {};
+
+    // creditNo: trim + non-empty check. Empty string is rejected
+    // because every downstream consumer (Zoho lookup, list filter)
+    // assumes a non-empty string and silently mis-behaves with "".
+    if (Object.prototype.hasOwnProperty.call(body, "creditNo")) {
+      const cn = String(body.creditNo || "").trim();
+      if (!cn) {
+        return res.status(400).json({
+          success: false,
+          message: "creditNo cannot be empty",
+        });
+      }
+      update.creditNo = cn;
+    }
+
+    // items: array of {sku, model?, quantity?}. We coerce each row to
+    // the canonical shape and drop unknown fields so the persisted
+    // documents stay consistent with what the OCR parser produces.
+    // A missing items array means "don't touch items"; an empty array
+    // is allowed (legitimate state for a credit note with no lines).
+    if (Object.prototype.hasOwnProperty.call(body, "items")) {
+      if (!Array.isArray(body.items)) {
+        return res.status(400).json({
+          success: false,
+          message: "items must be an array",
+        });
+      }
+      update.items = body.items.map((it) => {
+        const sku = String((it && it.sku) || "").trim();
+        const model =
+          it && it.model != null && String(it.model).trim() !== ""
+            ? String(it.model)
+            : null;
+        // Quantity stays string-typed to match what the OCR parser
+        // produces — keeps the schema stable across rows that came in
+        // via OCR and rows the user touched.
+        const quantity =
+          it && it.quantity != null ? String(it.quantity) : "0";
+        return { sku, model, quantity };
+      });
+      // Recompute itemCount whenever items changes so the list page's
+      // Items column stays in sync without a separate write.
+      update.itemCount = update.items.length;
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Nothing to update — provide creditNo and/or items",
+      });
+    }
+
+    update.updatedAt = new Date();
+
+    const db = await connectToDatabase();
+    const collection = db.collection(CREDIT_NOTE_COLLECTION);
+    const result = await collection.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: update },
+      { returnDocument: "after" },
+    );
+    // The Node driver's findOneAndUpdate returns either a doc directly
+    // (newer driver) or { value: doc } (older driver) — handle both so
+    // a driver bump doesn't silently break this endpoint.
+    const updatedRow = result && (result.value || result);
+    if (!updatedRow || !updatedRow._id) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Credit note record not found" });
+    }
+
+    return res.json({ success: true, data: updatedRow });
+  } catch (error) {
+    console.error("Patch credit note error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update credit note" });
+  }
+});
+
 // ── POST /creditNote/:id/submitToZoho ────────────────────────────────
 // Pushes the user's matched line items + edited note into the existing
 // Zoho Inventory credit note (resolved by creditNo on the row), then
