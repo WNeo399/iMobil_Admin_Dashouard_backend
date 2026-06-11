@@ -831,12 +831,89 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
     const stampPricebook = (li) =>
       linePricebookId ? { ...li, pricebook_id: linePricebookId } : li;
 
-    const newLineItems = usableItems.map(stampPricebook);
+    // ── Dedupe new items against existing lines ───────────────────
+    // When the user picks a match whose item_id is already on the
+    // credit note, we OVERWRITE the existing line's quantity with
+    // the dialog value instead of appending a duplicate. Rules:
+    //
+    //   1. Aggregate the dialog rows by matched item_id, summing
+    //      qtys — so two dialog rows of the same itemId (qty 3 +
+    //      qty 2) collapse into one update (qty 5).
+    //
+    //   2. Walk the existing line items in order. The FIRST existing
+    //      occurrence of a matched item_id keeps its line_item_id
+    //      (so Zoho's history of that line stays intact) and gets
+    //      the user's qty. Subsequent occurrences of the same
+    //      item_id are dropped — Zoho's line_items array can't carry
+    //      multiple lines for the same catalogue item once we've
+    //      committed to "the dialog qty is the authoritative qty
+    //      for that item."
+    //
+    //   3. Item ids the user picked that aren't on the credit note
+    //      yet get appended as new lines, stamped with the resolved
+    //      pricebook so the rates match.
+    //
+    //   4. Devices (A9999 / R9999) are NOT deduped — each represents
+    //      a distinct physical unit and getting them collapsed
+    //      together would lose the per-device model description.
+    //      They always append.
+    const userItemQty = new Map();
+    const userItemSample = new Map();
+    for (const it of usableItems) {
+      if (!it || !it.item_id) continue;
+      const id = String(it.item_id);
+      userItemQty.set(id, (userItemQty.get(id) || 0) + (Number(it.quantity) || 0));
+      if (!userItemSample.has(id)) userItemSample.set(id, it);
+    }
+
+    const handledItemIds = new Set();
+    const mergedExistingLineItems = [];
+    for (const li of existingLineItems) {
+      if (!li || !li.item_id) {
+        // No item_id (rare; some line types don't have one) — keep
+        // verbatim and don't try to merge.
+        mergedExistingLineItems.push({ ...li });
+        continue;
+      }
+      const id = String(li.item_id);
+      if (userItemQty.has(id)) {
+        if (!handledItemIds.has(id)) {
+          // First existing occurrence — keep the line_item_id and
+          // every other field, just replace qty. Note: the existing
+          // line already carries its own pricebook_id; we don't
+          // stampPricebook here because that's only for NEW lines.
+          handledItemIds.add(id);
+          mergedExistingLineItems.push({ ...li, quantity: userItemQty.get(id) });
+        }
+        // Subsequent existing duplicate — drop. Falling through the
+        // loop without pushing accomplishes that.
+      } else {
+        // User didn't touch this item — preserve verbatim.
+        mergedExistingLineItems.push({ ...li });
+      }
+    }
+
+    // New line items: one per unique itemId the user picked that
+    // wasn't already on the credit note. Quantity is the summed
+    // total from step 1.
+    const newLineItems = [];
+    for (const [itemId, qty] of userItemQty) {
+      if (handledItemIds.has(itemId)) continue;
+      const sample = userItemSample.get(itemId);
+      newLineItems.push(
+        stampPricebook({
+          item_id: itemId,
+          name: sample && sample.name ? sample.name : undefined,
+          quantity: qty,
+        }),
+      );
+    }
 
     // Device lines — each entry in usableReturnDevices / usable
     // RepairDevices becomes its own Zoho line item pointing at the
     // fixed catalogue item-id, with the model on the description.
-    // Quantity comes from the parsed/edited row.
+    // Quantity comes from the parsed/edited row. Always appended
+    // (no dedup — see rule 4 in the dedup block above).
     const returnDeviceLineItems = usableReturnDevices.map((d) =>
       stampPricebook({
         item_id: ZOHO_ITEM_ID_RETURN_DEVICE,
@@ -852,7 +929,7 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
       }),
     );
 
-    const mergedLineItems = existingLineItems.concat(
+    const mergedLineItems = mergedExistingLineItems.concat(
       newLineItems,
       returnDeviceLineItems,
       repairDeviceLineItems,
