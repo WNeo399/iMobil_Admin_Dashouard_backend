@@ -14,28 +14,23 @@
 //   1. Verify X-Twilio-Signature via Twilio's official SDK.
 //   2. ACK Twilio immediately with an empty TwiML <Response/>. We
 //      don't reply via TwiML because content templates require the
-//      Messages REST API (TwiML only supports freeform text/media).
-//   3. Persist the event into imb_whatsapp_event (upsert by
+//      Messages REST API (TwiML only supports freeform text/media),
+//      and our state-machine replies need to vary per session
+//      anyway.
+//   3. Persist the raw event into imb_whatsapp_event (upsert by
 //      MessageSid so retries collapse).
-//   4. Send the configured content template back to the sender as
-//      a separate REST call (fire-and-forget — its failure must not
-//      block the ACK or fail the persist).
+//   4. Hand the parsed payload off to the workflow state machine
+//      (utils/whatsappWorkflow.js) which owns session lookup, reply
+//      decisions, and the special-order archive on completion.
 
 var express = require("express");
 var router = express.Router();
 const { connectToDatabase } = require("../../utils/mongodb");
 const { validateTwilioRequest } = require("../../utils/twilioSignature");
-const { getTwilioClient } = require("../../utils/twilioClient");
+const { handleInboundMessage } = require("../../utils/whatsappWorkflow");
 const twiml = require("twilio").twiml;
 
 const COLLECTION = "imb_whatsapp_event";
-
-// Content template that gets sent back as the auto-reply. Configured
-// in the Twilio console → Messaging → Content Builder. Hard-coded
-// here because there's only one auto-reply template right now; if a
-// per-route or per-business-hour template ever lands, swap this for
-// an env-var or a small lookup table.
-const AUTOREPLY_TEMPLATE_SID = "HXd444333a8f58cd76818012416fa9b9e1";
 
 function makeHandler(viaFallback) {
   return async function (req, res) {
@@ -66,14 +61,17 @@ function makeHandler(viaFallback) {
         );
       }
 
+      // Hand off to the workflow state machine. It owns the
+      // session, the replies (list-picker template OR freeform text
+      // depending on state), and the special-order archive on
+      // completion. handleInboundMessage swallows its own errors so
+      // we don't need a try/catch here, but keep one anyway as
+      // belt-and-braces.
       try {
-        await sendAutoReply(req.body);
+        await handleInboundMessage(req.body);
       } catch (e) {
-        // Log the Twilio error code if present — most useful for
-        // diagnosing template-not-approved / channel-not-active /
-        // 24h-window-expired classes of failure.
         console.error(
-          "[twilio inbound] auto-reply failed:",
+          "[twilio inbound] workflow failed:",
           e && e.code ? `code=${e.code} ` : "",
           e.message || e,
         );
@@ -140,35 +138,6 @@ async function persistInbound(body, viaFallback) {
     },
     { upsert: true },
   );
-}
-
-// Send the configured content template back to the customer. Fire-
-// and-forget from the caller's perspective; if Twilio rejects (no
-// channel, template not approved, etc.) we log and move on.
-async function sendAutoReply(body) {
-  if (!body || !body.From) return;
-  const from = process.env.TWILIO_WHATSAPP_NUMBER;
-  if (!from) {
-    console.warn(
-      "[twilio inbound] TWILIO_WHATSAPP_NUMBER not set — skipping auto-reply.",
-    );
-    return;
-  }
-  const client = getTwilioClient();
-  if (!client) {
-    console.warn(
-      "[twilio inbound] Twilio client unavailable — skipping auto-reply. Set TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN.",
-    );
-    return;
-  }
-  // Send the content template to whoever sent us the message
-  // (body.From is already in 'whatsapp:+...' form). No
-  // contentVariables — current template has no placeholders.
-  await client.messages.create({
-    from,
-    to: body.From,
-    contentSid: AUTOREPLY_TEMPLATE_SID,
-  });
 }
 
 router.post("/", makeHandler(false));
