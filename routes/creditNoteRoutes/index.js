@@ -21,7 +21,7 @@ var multer = require("multer");
 var FormData = require("form-data");
 var router = express.Router();
 const { ObjectId } = require("mongodb");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { requirePermission } = require("../../middleware/auth");
 const { connectToDatabase } = require("../../utils/mongodb");
 const {
@@ -516,6 +516,70 @@ router.patch("/:id", GATE, async function (req, res) {
   }
 });
 
+// ── DELETE /creditNote/:id ──────────────────────────────────────────
+// Remove a credit-note row from imb_credit_note and, best-effort,
+// drop the associated PDF from S3. The DB row is the index — leaving
+// the S3 object around without it just creates orphan storage. If
+// the S3 delete fails we still return success (we logged it) because
+// the Mongo deletion is the primary action and recovering the DB
+// row is much harder than re-deleting an S3 object.
+//
+// Same permission gate as the other admin paths
+// (zoho:salesOrder:create).
+router.delete("/:id", GATE, async function (req, res) {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid id" });
+    }
+    const db = await connectToDatabase();
+    const collection = db.collection(CREDIT_NOTE_COLLECTION);
+    // Read first so we know which S3 key (if any) to clean up.
+    const row = await collection.findOne({ _id: new ObjectId(id) });
+    if (!row) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Credit note record not found" });
+    }
+
+    await collection.deleteOne({ _id: new ObjectId(id) });
+
+    // Best-effort S3 cleanup. We surface the outcome on the response
+    // (s3 = { ok, message? }) so the caller can warn the user if the
+    // object stuck around, but never roll back the DB delete on an
+    // S3 failure — the row is gone and the user expects it gone.
+    let s3 = { ok: true };
+    if (row.s3Key) {
+      const client = getS3Client();
+      const bucket = process.env.S3_CREDIT_BUCKET_NAME;
+      if (!client || !bucket) {
+        s3 = { ok: false, message: "S3 not configured; PDF left in bucket" };
+      } else {
+        try {
+          await client.send(
+            new DeleteObjectCommand({ Bucket: bucket, Key: row.s3Key }),
+          );
+        } catch (e) {
+          console.warn(
+            `[creditNote delete] S3 cleanup failed for ${row.s3Key}:`,
+            e.message || e,
+          );
+          s3 = { ok: false, message: e.message || "S3 delete failed" };
+        }
+      }
+    } else {
+      s3 = { ok: true, skipped: true };
+    }
+
+    return res.json({ success: true, s3 });
+  } catch (error) {
+    console.error("Delete credit note error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to delete credit note" });
+  }
+});
+
 // ── GET /creditNote/:id/zohoDetail ──────────────────────────────────
 // Resolve the row's creditNo → Zoho creditnote_id and fetch the full
 // Zoho Inventory record in one round trip. Surfaces the bits the
@@ -676,17 +740,16 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
         quantity: Number(d.quantity) > 0 ? Number(d.quantity) : 1,
       }));
 
-    if (
-      usableItems.length === 0 &&
-      usableReturnDevices.length === 0 &&
-      usableRepairDevices.length === 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Nothing to submit — pick a Zoho match for at least one item or add a return / repair device.",
-      });
-    }
+    // Empty-payload guard removed deliberately: the user can submit
+    // a credit note that has no extra line items or devices to add,
+    // e.g. when the only change is the note text, the PDF
+    // attachment, or the lifecycle status. The PUT below still
+    // re-sends Zoho's existing line items unchanged (because
+    // mergedLineItems falls back to just `existingLineItems` when
+    // nothing was added), and the PDF attach + status flip downstream
+    // still run, so an empty payload is a meaningful action — it
+    // marks the row as completed and ensures the PDF is on the Zoho
+    // credit note.
 
     const db = await connectToDatabase();
     const collection = db.collection(CREDIT_NOTE_COLLECTION);
