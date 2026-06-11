@@ -10,6 +10,9 @@
 //       text only         → "please send a photo"
 //       photo only        → "please send a description"
 //       both present      → thank you + complete the session
+//   - At any point in an active session the customer can reply
+//     "cancel" / "stop" / "exit" / etc. (full list in CANCEL_KEYWORDS)
+//     to end the flow without submitting — state becomes 'cancelled'.
 //   - Sessions auto-expire after 24h of silence so an abandoned
 //     half-filled session can't trap a future customer.
 //
@@ -38,6 +41,31 @@ const OPTION_SPECIAL_ORDER = "special_order_start";
 // 24h of silence → session auto-expires. Evaluated on every inbound
 // message access; no background job needed.
 const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+// Cancel-intent recognition. Matched ONLY when the trimmed body
+// equals one of these words exactly (after stripping trailing
+// punctuation) — substring matching would false-positive on
+// legitimate descriptions like "I want to cancel my appointment."
+// Length cap (≤30 chars) further narrows it down.
+const CANCEL_KEYWORDS = new Set([
+  "cancel",
+  "stop",
+  "quit",
+  "exit",
+  "end",
+  "abort",
+  "nevermind",
+  "never mind",
+  "nope",
+  "no thanks",
+  "no thank you",
+]);
+
+// Appended to every prompt that asks the customer to do something so
+// they always know the escape hatch. Kept as a separate trailer (with
+// a blank line) rather than inlined into each prompt so it reads as
+// a clearly-separate instruction, not part of the main ask.
+const CANCEL_HINT = '\n\nReply "Cancel" any time to end this request.';
 
 let _indexEnsured = false;
 async function ensureIndex(db) {
@@ -78,7 +106,8 @@ async function handleInboundMessage(body) {
       const session = await upsertNewSession(db, body);
       await sendText(
         body.From,
-        "Great — please send a description of what you'd like to order, along with one or more photos."
+        "Great — please send a description of what you'd like to order, along with one or more photos." +
+          CANCEL_HINT,
       );
       console.log(
         `[whatsapp workflow] started session ${session._id} for waId=${waId}`,
@@ -94,6 +123,23 @@ async function handleInboundMessage(body) {
         `[whatsapp workflow] expired stale session ${session._id} for waId=${waId}`,
       );
       session = null;
+    }
+
+    // ── Cancel intent in an active session ─────────────────────
+    // Cancel keyword OUTSIDE an active session is deliberately
+    // ignored — there's nothing to cancel, so the picker gets sent
+    // like any other no-session inbound. Cancelling only makes
+    // sense when something's mid-flow.
+    if (session && isCancelKeyword(body)) {
+      await markSessionCancelled(db, session._id);
+      await sendText(
+        body.From,
+        "No problem — your special order request has been cancelled. Message us any time to start a new one.",
+      );
+      console.log(
+        `[whatsapp workflow] cancelled session ${session._id} for waId=${waId}`,
+      );
+      return;
     }
 
     // ── No active session + freeform message → re-show picker ──
@@ -140,7 +186,8 @@ async function handleInboundMessage(body) {
     if (hasDescription && !hasImages) {
       await sendText(
         body.From,
-        "Got it — please also send one or more photos of the item.",
+        "Got it — please also send one or more photos of the item." +
+          CANCEL_HINT,
       );
       return;
     }
@@ -148,7 +195,8 @@ async function handleInboundMessage(body) {
     if (!hasDescription && hasImages) {
       await sendText(
         body.From,
-        "Got the photo — please send a description of what you'd like to order.",
+        "Got the photo — please send a description of what you'd like to order." +
+          CANCEL_HINT,
       );
       return;
     }
@@ -157,7 +205,8 @@ async function handleInboundMessage(body) {
     // (e.g. emoji-only after trimming). Re-ask both.
     await sendText(
       body.From,
-      "Please send a description of what you'd like to order, along with one or more photos.",
+      "Please send a description of what you'd like to order, along with one or more photos." +
+        CANCEL_HINT,
     );
   } catch (e) {
     // Last-resort safety net — the webhook handler has already
@@ -170,6 +219,23 @@ async function handleInboundMessage(body) {
 }
 
 // ── Detection ──────────────────────────────────────────────────────
+
+// True when the inbound message is a standalone cancel keyword.
+// Rules:
+//   - Trim + lowercase, strip trailing punctuation (so "Cancel!" /
+//     "Cancel." count).
+//   - Whole-message match against CANCEL_KEYWORDS — substring
+//     matching would false-positive on "I want to cancel my old
+//     appointment" or "the device won't stop turning on".
+//   - Length cap (≤30 chars) is belt-and-braces against any
+//     legitimate short sentence that happens to end on a keyword.
+function isCancelKeyword(body) {
+  if (!body || !body.Body) return false;
+  const text = String(body.Body).trim().toLowerCase();
+  if (!text || text.length > 30) return false;
+  const normalized = text.replace(/[.!?,]+$/, "");
+  return CANCEL_KEYWORDS.has(normalized);
+}
 
 // Robust detection for the "user tapped Special Order" event.
 // Twilio's webhook payload for interactive-message replies has
@@ -307,6 +373,23 @@ async function markSessionExpired(db, sessionId) {
         state: "expired",
         expiredAt: new Date(),
         expireReason: "timeout",
+      },
+    },
+  );
+}
+
+// User-initiated cancel via the keyword path. Stored as its own
+// terminal state ('cancelled') alongside 'completed' and 'expired'
+// so future analytics queries can tell user-cancel apart from
+// abandonment-timeout from happy-path completion.
+async function markSessionCancelled(db, sessionId) {
+  await db.collection(SESSION_COLLECTION).updateOne(
+    { _id: sessionId },
+    {
+      $set: {
+        state: "cancelled",
+        cancelledAt: new Date(),
+        cancelReason: "user_keyword",
       },
     },
   );

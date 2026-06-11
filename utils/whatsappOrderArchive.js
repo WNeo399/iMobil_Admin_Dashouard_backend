@@ -145,17 +145,31 @@ async function archiveSessionAsSpecialOrder(session) {
     }
   }
 
+  // Source shape mirrors the widget endpoint's
+  // routes/widgetRoutes/specialOrder.js — { origin, referer, ip,
+  // userAgent } — so the admin review page can read source.origin /
+  // source.ip uniformly across both channels. Without this the
+  // "From" row in the dialog was empty for WhatsApp records.
+  // WhatsApp-specific fields (channel, waId, etc.) sit alongside
+  // for downstream consumers that branch on channel.
+  const source = {
+    origin: buildOriginLabel(session),
+    referer: null,
+    ip: null,
+    userAgent: null,
+    // WhatsApp-specific extras
+    channel: "whatsapp",
+    waId: session.waId,
+    from: session.from || null,
+    profileName: session.profileName || null,
+    sessionId: session._id || null,
+  };
+
   const doc = {
     name: session.profileName || `WhatsApp ${session.waId}`,
     description: (session.collected && session.collected.description) || "",
     images: persistedImages,
-    source: {
-      channel: "whatsapp",
-      waId: session.waId,
-      from: session.from || null,
-      profileName: session.profileName || null,
-      sessionId: session._id || null,
-    },
+    source,
     status: "new",
     createdAt: new Date(),
   };
@@ -163,6 +177,32 @@ async function archiveSessionAsSpecialOrder(session) {
   const db = await connectToDatabase();
   const result = await db.collection(SPECIAL_ORDERS_COLLECTION).insertOne(doc);
   return result.insertedId;
+}
+
+// Build a humanly-meaningful string for the admin page's "From"
+// column. Strips the "whatsapp:" prefix off the channel address so
+// it reads as a phone number, and prepends the customer's profile
+// name when WhatsApp gave us one. Falls back gracefully when
+// profileName is empty.
+//
+//   { profileName: 'John', from: 'whatsapp:+15551234567' }
+//     → "WhatsApp · John (+15551234567)"
+//   { profileName: null,  from: 'whatsapp:+15551234567' }
+//     → "WhatsApp (+15551234567)"
+//   { profileName: null,  from: null, waId: '15551234567' }
+//     → "WhatsApp (+15551234567)"
+function buildOriginLabel(session) {
+  let number = "";
+  if (session.from) {
+    number = String(session.from).replace(/^whatsapp:/i, "");
+  } else if (session.waId) {
+    number = `+${session.waId}`;
+  }
+  const numPart = number ? ` (${number})` : "";
+  if (session.profileName) {
+    return `WhatsApp · ${session.profileName}${numPart}`;
+  }
+  return `WhatsApp${numPart}`;
 }
 
 // Twilio media URLs require HTTP Basic Auth using AccountSid +
