@@ -32,10 +32,15 @@ var widgetOriginRouter = require('./routes/widgetOriginRoutes/index');
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
 var creditNoteWebhookRouter = require('./routes/creditNoteRoutes/webhook');
-// Public webhook endpoint for Meta's WhatsApp Cloud API. Same mount
-// pattern as the OCR webhook: outside the auth chain, security via
-// the X-Hub-Signature-256 HMAC plus the GET-handshake verify token.
-var whatsappWebhookRouter = require('./routes/whatsappRoutes/webhook');
+// Twilio WhatsApp webhook router. Exposes:
+//   POST /webhook/twilio/whatsapp           inbound messages
+//   POST /webhook/twilio/whatsapp/fallback  primary-down fallback
+//   POST /webhook/twilio/whatsapp/status    outbound delivery receipts
+// Mounted outside the auth chain (Twilio's servers can't carry our
+// JWT) — integrity via X-Twilio-Signature, verified per-route.
+// Replaces the earlier Meta Cloud API webhook now that we route
+// WhatsApp through Twilio's Business Sender.
+var twilioRouter = require('./routes/twilioRoutes/index');
 // Public widget submission endpoints — receive form submissions from
 // the embeddable widgets shipped out of the iMobile_Widget repo.
 // Mounted outside the auth chain (third-party sites can't carry our
@@ -56,17 +61,11 @@ app.set('views', path.join(__dirname, 'views'));
 app.set('view engine', 'jade');
 
 app.use(logger('dev'));
-// `verify` stashes the raw request bytes on req.rawBody so webhook
-// endpoints can recompute HMAC signatures over the exact payload Meta
-// signed — once express.json() parses the body, the original byte
-// sequence is gone and any re-serialised JSON won't match the digest.
-// The callback runs on every request but only retains a Buffer
-// reference, so the overhead is negligible.
-app.use(express.json({
-  verify: function (req, _res, buf) {
-    if (buf && buf.length) req.rawBody = buf;
-  }
-}));
+// Plain express.json — the rawBody-capture verify callback was only
+// here for Meta's WhatsApp HMAC (which signs raw bytes); Twilio
+// signs the URL + sorted form params instead, so we don't need to
+// hold onto the original buffer anymore.
+app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -79,13 +78,10 @@ app.use(tempIntegrationRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
-// WhatsApp Cloud API webhook — exposes:
-//   GET  /webhook/whatsapp  → Meta's subscription verification handshake
-//   POST /webhook/whatsapp  → inbound message + status notifications
-// Public for the same reason as the OCR webhook (Meta can't carry our
-// JWT); request integrity is enforced inside the router via
-// X-Hub-Signature-256 against WHATSAPP_APP_SECRET.
-app.use('/webhook', whatsappWebhookRouter);
+// Twilio WhatsApp webhook router — see twilioRoutes/index.js for the
+// list of sub-routes. Mounted public-side; X-Twilio-Signature is
+// verified inside each handler.
+app.use('/webhook/twilio', twilioRouter);
 // Widget submission endpoints — POST /widget/<name>. Public; CORS +
 // origin allowlist + rate limit + honeypot live inside the router.
 app.use('/widget', widgetRouter);
