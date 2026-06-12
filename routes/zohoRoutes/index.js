@@ -109,23 +109,27 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
       return res.status(404).json({ success: false, message: "Collection not found" });
     }
 
-    // Source the item IDs differently per collection type, then converge on the
-    // shared inventory fetch. Selection has the IDs ready on the document, so
-    // it skips the Analytics round-trip entirely.
-    let itemIds = [];
-    if (collectionData.type === "Criteria") {
-      const criteria = collectionData?.rules?.[0]?.criteria?.equals;
-      if (!criteria) {
-        return res.status(400).json({ success: false, message: "Collection criteria not found" });
-      }
-      itemIds = await getItemIdsFromCriteria(criteria);
-    } else if (collectionData.type === "Selection") {
-      itemIds = (collectionData.products || [])
-        .map((p) => p && p.itemId)
-        .filter(Boolean);
-    } else {
-      // Unknown / unset type — return empty rather than error so the UI degrades
-      // gracefully on legacy / malformed records.
+    // Collections can carry BOTH a criteria expression AND manually
+    // picked products — the resolved item set is the union of the two
+    // sources, deduped. Resolution is content-driven rather than
+    // type-driven: the stored `type` field is now a display label only
+    // (Criteria / Selection / Combined, derived on save by the
+    // frontend). Legacy docs work unchanged because they only ever
+    // have one source populated.
+    const criteria = collectionData?.rules?.[0]?.criteria?.equals;
+    const criteriaIds =
+      criteria && String(criteria).trim()
+        ? await getItemIdsFromCriteria(criteria)
+        : [];
+    const selectedIds = (collectionData.products || [])
+      .map((p) => p && p.itemId)
+      .filter(Boolean);
+
+    const itemIds = [...new Set([...criteriaIds, ...selectedIds])];
+    if (itemIds.length === 0) {
+      // Neither source produced anything (empty collection or a
+      // criteria that matched nothing) — empty list rather than an
+      // error so the UI degrades gracefully.
       return res.json([]);
     }
 
