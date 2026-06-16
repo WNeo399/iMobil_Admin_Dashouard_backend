@@ -2,10 +2,11 @@
 // decommissioned. Do not extend or rely on this for permanent functionality.
 // To remove: delete this file and the `tempIntegrationRouter` mount in app.js.
 //
-// POST /integration/case-status
-// Body: { repairDeskTicketNumber, updateStatus, updateBy }
-// Looks up the case by repairDeskTicketNumber, sets `status`, and appends a
-// `statusHistory` entry attributed to `updateBy`.
+// POST /integration/case-status/:caseId
+// Body: { updateStatus, updateBy }
+// Looks up the case by `caseId` (path param), sets `status`, and appends a
+// `statusHistory` entry attributed to `updateBy`. `caseId` may also be sent
+// in the body as a fallback for callers that can't put it in the path.
 
 const express = require("express");
 const { connectToDatabase } = require("../utils/mongodb");
@@ -27,6 +28,9 @@ const STATUS_LABEL_TO_VALUE = {
   "repaired & collected": "repaired-and-collected",
   "waiting solvup": "waiting-solvup",
   "unrepairable": "unrepairable",
+  // RepairDesk's "Unrepairable & Hold" has no dashboard equivalent —
+  // there's no unrepairable-hold state, so it folds into "unrepairable".
+  "unrepairable & hold": "unrepairable",
   "ber": "ber",
   "completed": "completed",
   "cancelled": "cancelled",
@@ -46,19 +50,21 @@ function resolveStatusFromLabel(label) {
 
 const COLLECTION = "sqt_cases";
 
-router.post("/integration/case-status", async function (req, res) {
+router.post("/integration/case-status/:caseId", async function (req, res) {
   try {
     const body = req.body || {};
-    const repairDeskTicketNumber = body.repairDeskTicketNumber
-      ? String(body.repairDeskTicketNumber).trim()
+    // caseId comes from the path param; fall back to the body so a
+    // caller that can't templatise the URL still works.
+    const caseId = (req.params.caseId || body.caseId)
+      ? String(req.params.caseId || body.caseId).trim()
       : "";
     const updateStatus = body.updateStatus ? String(body.updateStatus).trim() : "";
     const updateBy = body.updateBy ? String(body.updateBy).trim() : "";
 
-    if (!repairDeskTicketNumber) {
+    if (!caseId) {
       return res
         .status(400)
-        .json({ success: false, message: "repairDeskTicketNumber is required" });
+        .json({ success: false, message: "caseId is required" });
     }
     if (!updateStatus) {
       return res.status(400).json({ success: false, message: "updateStatus is required" });
@@ -87,17 +93,17 @@ router.post("/integration/case-status", async function (req, res) {
     // this webhook back; without the guard we'd push the same status into
     // Mongo again (creating a duplicate statusHistory entry) and the
     // history would grow on every edit.
-    const existing = await collection.findOne({ repairDeskTicketNumber });
+    const existing = await collection.findOne({ caseId });
     if (!existing) {
       return res.status(404).json({
         success: false,
-        message: `No case found with repairDeskTicketNumber "${repairDeskTicketNumber}"`,
+        message: `No case found with caseId "${caseId}"`,
       });
     }
     if (existing.status === resolvedStatus) {
       return res.json({
         success: true,
-        message: `Case ${repairDeskTicketNumber} already at ${resolvedStatus} — no change`,
+        message: `Case ${caseId} already at ${resolvedStatus} — no change`,
         data: existing,
       });
     }
@@ -111,7 +117,7 @@ router.post("/integration/case-status", async function (req, res) {
     };
 
     const result = await collection.findOneAndUpdate(
-      { repairDeskTicketNumber },
+      { caseId },
       {
         $set: { status: resolvedStatus, updatedAt: now },
         $push: { statusHistory: historyEntry },
@@ -125,13 +131,13 @@ router.post("/integration/case-status", async function (req, res) {
       // unlikely but handle it cleanly anyway.
       return res.status(404).json({
         success: false,
-        message: `No case found with repairDeskTicketNumber "${repairDeskTicketNumber}"`,
+        message: `No case found with caseId "${caseId}"`,
       });
     }
 
     return res.json({
       success: true,
-      message: `Case ${repairDeskTicketNumber} moved to ${resolvedStatus}`,
+      message: `Case ${caseId} moved to ${resolvedStatus}`,
       data: updated,
     });
   } catch (error) {
