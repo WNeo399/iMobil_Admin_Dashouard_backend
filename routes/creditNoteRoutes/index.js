@@ -49,11 +49,13 @@ const ZOHO_CREDIT_NOTE_VIEW_ID = "1404913000003936107";
 const ZOHO_ITEM_ID_RETURN_DEVICE = "2591985000341408805";
 const ZOHO_ITEM_ID_REPAIR_DEVICE = "2591985000341408783";
 
-// Warehouse / location the credit note is booked against. Sent on the
-// PUT (location_id at the root, warehouse_id on each line item) so the
-// returned stock lands in the right Zoho Inventory warehouse. Same id
-// for both fields today; kept separate as they're distinct Zoho fields.
+// Location the credit note is booked against. This org runs Zoho
+// Inventory's "Locations" model, so it's `location_id` both at the
+// root of the credit note AND on each line item (the older
+// `warehouse_id` field is rejected as "Invalid Element warehouse id").
 const ZOHO_CREDIT_NOTE_LOCATION_ID = "2591985000065610085";
+// Kept as a separate constant for the line-item stamp in case the
+// per-line location ever needs to differ from the root.
 const ZOHO_CREDIT_NOTE_WAREHOUSE_ID = "2591985000065610085";
 
 // Persistence layer — every successful submit gets a row here so we
@@ -936,13 +938,16 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
       }),
     );
 
-    // Stamp the warehouse on EVERY line item (existing + new + device)
-    // so each returned line is booked into the right warehouse. Same
-    // value as the credit-note location_id today, but kept as its own
-    // constant since they're distinct Zoho fields.
+    // Stamp the location on EVERY line item (existing + new + device)
+    // so each returned line books into the right Zoho location.
+    //
+    // NOTE: this org runs Zoho Inventory's "Locations" model, not the
+    // older "Warehouses" model — so the per-line field is `location_id`,
+    // NOT `warehouse_id`. Sending warehouse_id gets rejected with
+    // "Invalid Element warehouse id". Same id as the root location_id.
     const mergedLineItems = mergedExistingLineItems
       .concat(newLineItems, returnDeviceLineItems, repairDeviceLineItems)
-      .map((li) => ({ ...li, warehouse_id: ZOHO_CREDIT_NOTE_WAREHOUSE_ID }));
+      .map((li) => ({ ...li, location_id: ZOHO_CREDIT_NOTE_WAREHOUSE_ID }));
 
     const updatePayload = {
       // PUT requires the date back (Zoho will reject if omitted).
