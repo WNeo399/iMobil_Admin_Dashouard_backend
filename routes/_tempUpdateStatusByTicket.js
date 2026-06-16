@@ -2,11 +2,11 @@
 // decommissioned. Do not extend or rely on this for permanent functionality.
 // To remove: delete this file and the `tempIntegrationRouter` mount in app.js.
 //
-// POST /integration/case-status/:caseId
-// Body: { updateStatus, updateBy }
-// Looks up the case by `caseId` (path param), sets `status`, and appends a
-// `statusHistory` entry attributed to `updateBy`. `caseId` may also be sent
-// in the body as a fallback for callers that can't put it in the path.
+// POST /integration/case-status/:caseId   (or caseId in the body)
+// Body: { caseId?, updateStatus, updateBy }
+// Looks up the case by `caseId` — taken from the path param OR the body —
+// sets `status`, and appends a `statusHistory` entry attributed to
+// `updateBy`.
 
 const express = require("express");
 const { connectToDatabase } = require("../utils/mongodb");
@@ -50,7 +50,10 @@ function resolveStatusFromLabel(label) {
 
 const COLLECTION = "sqt_cases";
 
-router.post("/integration/case-status/:caseId", async function (req, res) {
+// Accept both forms so callers can pass caseId in the path OR the body:
+//   POST /integration/case-status/:caseId
+//   POST /integration/case-status         (caseId in the JSON body)
+router.post(["/integration/case-status", "/integration/case-status/:caseId"], async function (req, res) {
   try {
     const body = req.body || {};
     // caseId comes from the path param; fall back to the body so a
