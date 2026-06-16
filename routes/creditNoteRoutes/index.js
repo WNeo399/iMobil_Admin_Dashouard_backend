@@ -49,6 +49,10 @@ const ZOHO_CREDIT_NOTE_VIEW_ID = "1404913000003936107";
 const ZOHO_ITEM_ID_RETURN_DEVICE = "2591985000341408805";
 const ZOHO_ITEM_ID_REPAIR_DEVICE = "2591985000341408783";
 
+// Warehouse location the credit note is booked against. Sent on the
+// PUT so the returned stock lands in the right Zoho Inventory location.
+const ZOHO_CREDIT_NOTE_LOCATION_ID = "2591985000065610085";
+
 // Persistence layer — every successful submit gets a row here so we
 // can correlate the OCR document id back to its S3 archive copy
 // without re-querying either upstream. Schema is intentionally narrow
@@ -938,6 +942,8 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
     const updatePayload = {
       // PUT requires the date back (Zoho will reject if omitted).
       date: existing.date,
+      // Book the credit note against the configured warehouse location.
+      location_id: ZOHO_CREDIT_NOTE_LOCATION_ID,
       line_items: mergedLineItems,
     };
     // Preserve customer linkage so the PUT doesn't unbind it.
