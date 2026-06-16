@@ -90,6 +90,92 @@ router.get("/skuLookup", requireAnyPermission("sqt:case:sendParts", "zoho:collec
   }
 });
 
+// Bulk SKU → Item ID resolver. Exact match (unlike /skuMatches which is
+// a LIKE search), one Analytics query per chunk of 100 SKUs rather than
+// one per SKU — so the Create Oz Order flow can resolve a whole order's
+// worth of matched SKUs to Zoho item_ids without an N-round-trip storm.
+// Pre-warms the access token before fanning out for the same reason the
+// /skuMatches endpoint does.
+//
+// Body: { skus: ["21280", "13261", ...] }
+// Resp: { success, data: { "21280": { itemId, sku }, "missing": null, ... } }
+//        — a sku with no inventory match maps to null so the caller can
+//          flag it rather than silently dropping the line.
+router.post(
+  "/skuLookupBulk",
+  requireAnyPermission("zoho:salesOrder:create", "zoho:collection:edit"),
+  async function (req, res) {
+    try {
+      const incoming = Array.isArray(req.body && req.body.skus) ? req.body.skus : [];
+      const unique = [
+        ...new Set(
+          incoming
+            .filter((s) => s != null)
+            .map((s) => String(s).trim())
+            .filter(Boolean),
+        ),
+      ];
+      if (unique.length === 0) {
+        return res.json({ success: true, data: {} });
+      }
+
+      const WORKSPACE_ID = "1404913000003936002";
+      const ITEMS_VIEW_ID = "1404913000003936100";
+      const esc = (v) => String(v).replace(/'/g, "''");
+      const buildUrl = (config) =>
+        `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${ITEMS_VIEW_ID}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+
+      // Proactive refresh so the parallel chunk queries below don't each
+      // trip their own 7309-refresh and get throttled.
+      try {
+        await refreshToken();
+      } catch (e) {
+        console.warn("skuLookupBulk token pre-warm failed:", e.message || e);
+      }
+
+      // Chunk into IN clauses of 100 so the Analytics criteria stays a
+      // sane length for large orders.
+      const chunks = [];
+      for (let i = 0; i < unique.length; i += 100) chunks.push(unique.slice(i, i + 100));
+
+      const data = {};
+      // Seed every requested sku to null so unmatched ones are explicit.
+      for (const s of unique) data[s] = null;
+
+      const responses = await Promise.all(
+        chunks.map((chunk) => {
+          const inList = chunk.map((s) => `'${esc(s)}'`).join(",");
+          return getViewData(
+            buildUrl({
+              responseFormat: "json",
+              selectedColumns: ["Item ID", "SKU"],
+              criteria: `"SKU" IN (${inList})`,
+            }),
+          );
+        }),
+      );
+
+      for (const rows of responses) {
+        if (!Array.isArray(rows)) continue;
+        for (const r of rows) {
+          const sku = r && r.SKU != null ? String(r.SKU) : "";
+          const itemId = r && r["Item ID"] != null ? String(r["Item ID"]) : "";
+          if (sku && itemId && Object.prototype.hasOwnProperty.call(data, sku)) {
+            data[sku] = { itemId, sku };
+          }
+        }
+      }
+
+      return res.json({ success: true, data });
+    } catch (error) {
+      console.error("Bulk SKU lookup error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: `Bulk SKU lookup failed: ${error.message || error}` });
+    }
+  },
+);
+
 // Resolve a scanned code (SKU or barcode) to its Zoho Inventory item.
 // Tries the SKU column first; if no match, falls back to the Barcode
 // column (vendor / manufacturer barcode). Returns the matched item plus

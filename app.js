@@ -28,6 +28,11 @@ var specialOrderRouter = require('./routes/specialOrderRoutes/index');
 // system:user:manage — system-tier admins manage who can talk to
 // the public widget endpoints.
 var widgetOriginRouter = require('./routes/widgetOriginRoutes/index');
+// IMB parts catalogue — reference data (brand/category/model/quality)
+// + the imb_products SKU catalogue CRUD + the Oz matcher endpoint.
+// Gated by the collection permissions (reused — same admins manage
+// iMobile product data).
+var catalogueRouter = require('./routes/catalogueRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -114,6 +119,7 @@ app.use('/repair', authenticate, repairRouter);
 app.use('/creditNote', authenticate, creditNoteRouter);
 app.use('/specialOrder', authenticate, specialOrderRouter);
 app.use('/widgetOrigin', authenticate, widgetOriginRouter);
+app.use('/catalogue', authenticate, catalogueRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
