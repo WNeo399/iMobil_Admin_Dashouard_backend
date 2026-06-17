@@ -943,11 +943,17 @@ router.post("/:id/submitToZoho", GATE, async function (req, res) {
     //
     // NOTE: this org runs Zoho Inventory's "Locations" model, not the
     // older "Warehouses" model — so the per-line field is `location_id`,
-    // NOT `warehouse_id`. Sending warehouse_id gets rejected with
-    // "Invalid Element warehouse id". Same id as the root location_id.
+    // NOT `warehouse_id`. The existing line items we spread back came
+    // from Zoho's READ response, which still includes a `warehouse_id`
+    // field; sending that back on the PUT gets rejected with "Invalid
+    // Element warehouse_id". So strip warehouse_id off every line before
+    // stamping location_id. Same id as the root location_id.
     const mergedLineItems = mergedExistingLineItems
       .concat(newLineItems, returnDeviceLineItems, repairDeviceLineItems)
-      .map((li) => ({ ...li, location_id: ZOHO_CREDIT_NOTE_WAREHOUSE_ID }));
+      .map((li) => {
+        const { warehouse_id, ...rest } = li || {};
+        return { ...rest, location_id: ZOHO_CREDIT_NOTE_WAREHOUSE_ID };
+      });
 
     const updatePayload = {
       // PUT requires the date back (Zoho will reject if omitted).
