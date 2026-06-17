@@ -47,14 +47,17 @@ router.get("/list", GATE, async function (req, res) {
     const db = await connectToDatabase();
     const collection = db.collection(COLLECTION);
 
-    const baseFilter = {};
+    // fullFilter = search + status (used for the visible page + total).
+    // The tree-panel counts intentionally ignore BOTH search and status
+    // so the per-status badges show true totals and don't jump around
+    // as the user types in the search box.
+    const fullFilter = {};
     if (search) {
       // Escape regex metacharacters so a "." or "+" in a name can't
       // change the search semantics.
       const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      baseFilter.name = { $regex: safe, $options: "i" };
+      fullFilter.name = { $regex: safe, $options: "i" };
     }
-    const fullFilter = { ...baseFilter };
     if (status) {
       if (!ALLOWED_STATUSES.includes(String(status))) {
         return res
@@ -72,11 +75,10 @@ router.get("/list", GATE, async function (req, res) {
         .limit(pageSize)
         .toArray(),
       collection.countDocuments(fullFilter),
+      // Counts over ALL documents — no search/status filter — so the
+      // tree badges are stable totals.
       collection
-        .aggregate([
-          { $match: baseFilter },
-          { $group: { _id: "$status", count: { $sum: 1 } } },
-        ])
+        .aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
         .toArray(),
     ]);
 

@@ -368,16 +368,17 @@ router.get("/list", GATE, async function (req, res) {
     const db = await connectToDatabase();
     const collection = db.collection(CREDIT_NOTE_COLLECTION);
 
-    // baseFilter = search only (used for the counts rollup).
-    // fullFilter = baseFilter + status (used for the visible page).
-    const baseFilter = {};
+    // fullFilter = search + status (used for the visible page + total).
+    // The tree-panel counts intentionally ignore BOTH search and status
+    // so the per-status badges show the true totals and don't jump
+    // around as the user types in the search box.
+    const fullFilter = {};
     if (search) {
       // Escape regex metacharacters so a "+" or "." in a creditNo can't
       // turn the search into an unexpected pattern.
       const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      baseFilter.creditNo = { $regex: safe, $options: "i" };
+      fullFilter.creditNo = { $regex: safe, $options: "i" };
     }
-    const fullFilter = { ...baseFilter };
     if (status) fullFilter.status = String(status);
 
     const [data, total, countsRaw] = await Promise.all([
@@ -391,11 +392,10 @@ router.get("/list", GATE, async function (req, res) {
         .limit(pageSize)
         .toArray(),
       collection.countDocuments(fullFilter),
+      // Counts over ALL documents — no search/status filter — so the
+      // tree badges are stable totals.
       collection
-        .aggregate([
-          { $match: baseFilter },
-          { $group: { _id: "$status", count: { $sum: 1 } } },
-        ])
+        .aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }])
         .toArray(),
     ]);
 
