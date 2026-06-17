@@ -31,11 +31,24 @@ router.get("/products", VIEW, async (req, res) => {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
 
+    // Each filter accepts a single id OR a comma-separated list (the
+    // Products page sends multiple ids from the multi-select cascaders).
+    // One value → equality; many → $in.
+    const multi = (v) =>
+      String(v)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const eqOrIn = (v) => {
+      const list = multi(v);
+      return list.length > 1 ? { $in: list } : list[0];
+    };
+
     const filter = {};
-    if (brand) filter["brand.id"] = String(brand);
-    if (category) filter["category.id"] = String(category);
-    if (quality) filter["quality.id"] = String(quality);
-    if (model) filter["compatible_models.id"] = String(model);
+    if (brand) filter["brand.id"] = eqOrIn(brand);
+    if (category) filter["category.id"] = eqOrIn(category);
+    if (quality) filter["quality.id"] = eqOrIn(quality);
+    if (model) filter["compatible_models.id"] = eqOrIn(model);
     if (search) {
       const safe = String(search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       filter.$or = [
