@@ -5,6 +5,11 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
 const { syncCaseStatus } = require("../../utils/repairDesk");
 const { requirePermission } = require("../../middleware/auth");
+const {
+  TERMINAL_RETURN_STATUSES,
+  buildReturnTracking,
+  computeReturnSummary,
+} = require("../../utils/returnTracking");
 
 // The generic /status endpoint serves several transitions; the permission it
 // requires depends on the target status. (BER is internal; the rest are
@@ -626,6 +631,15 @@ router.post(
       const db = await connectToDatabase();
       const collection = db.collection(COLLECTION);
 
+      // Need the current doc to (re)build return tracking off its zohoOrders /
+      // any existing tracker when entering a terminal status.
+      const theCase = await collection.findOne({ _id: new ObjectId(id) });
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+
       const now = new Date();
       const historyEntry = {
         status,
@@ -634,10 +648,37 @@ router.post(
         note: note || null,
       };
 
+      const setFields = { status, updatedAt: now };
+      // Return tracking: entering a terminal status initialises / reconciles
+      // the tracker (parts to return + device, for ber/unrepairable). Moving
+      // back out of a terminal status deactivates it but keeps the record for
+      // audit.
+      if (TERMINAL_RETURN_STATUSES.includes(status)) {
+        // The Mark Unrepairable dialog passes deviceExpected — whether the shop
+        // currently has the customer's device on hand for return. It seeds the
+        // returnTracking device.expected flag.
+        const rtOpts = {};
+        if (typeof req.body.deviceExpected === "boolean") {
+          rtOpts.deviceExpected = req.body.deviceExpected;
+        }
+        setFields.returnTracking = buildReturnTracking(
+          theCase,
+          status,
+          now,
+          rtOpts,
+        );
+      } else if (theCase.returnTracking && theCase.returnTracking.active) {
+        setFields.returnTracking = {
+          ...theCase.returnTracking,
+          active: false,
+          updatedAt: now,
+        };
+      }
+
       const result = await collection.findOneAndUpdate(
         { _id: new ObjectId(id) },
         {
-          $set: { status, updatedAt: now },
+          $set: setFields,
           $push: { statusHistory: historyEntry },
         },
         { returnDocument: "after" },
@@ -1323,6 +1364,253 @@ router.post(
       return res
         .status(500)
         .json({ success: false, message: "Failed to delete case" });
+    }
+  },
+);
+
+// ── Return tracking (terminal cases) ─────────────────────────────────────────
+
+// HQ dashboard feed: cases with active return tracking. Defaults to those with
+// something still outstanding (summaryStatus = 'pending'); pass ?status=complete
+// for finished ones or ?status=all for both. Optional shop / reason / search
+// filters + paging. HQ-only (shops don't confirm receipt).
+router.get(
+  "/returns",
+  requirePermission("sqt:case:trackReturn"),
+  async function (req, res, next) {
+    try {
+      const { shopId, reason, search } = req.query;
+      const statusFilter = String(req.query.status || "pending");
+      const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+      const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
+
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      const query = { "returnTracking.active": true };
+      if (statusFilter === "complete") {
+        query["returnTracking.summaryStatus"] = "complete";
+      } else if (statusFilter === "all") {
+        // Everything that actually has items to return (drop 'none').
+        query["returnTracking.summaryStatus"] = { $in: ["pending", "complete"] };
+      } else {
+        query["returnTracking.summaryStatus"] = "pending";
+      }
+
+      if (reason && TERMINAL_RETURN_STATUSES.includes(String(reason))) {
+        query["returnTracking.reason"] = String(reason);
+      }
+      if (shopId && ObjectId.isValid(shopId)) {
+        query.shopId = new ObjectId(shopId);
+      }
+      if (search) {
+        const re = { $regex: String(search), $options: "i" };
+        query.$or = [
+          { caseId: re },
+          { serviceRequestId: re },
+          { "customer.firstName": re },
+          { "customer.lastName": re },
+          { "device.description": re },
+          { "device.imei": re },
+        ];
+      }
+
+      // Stay consistent with the rest of the module — a shop-scoped user only
+      // ever sees their own shops' cases (harmless here since the action is
+      // HQ-gated, but keeps the query uniform).
+      applyShopScope(req, query);
+
+      const totalDocs = await collection.countDocuments(query);
+      const data = await collection
+        .find(query)
+        .sort({ "returnTracking.updatedAt": -1, updatedAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray();
+
+      return res.json({
+        success: true,
+        totalDocs,
+        page,
+        pageSize,
+        totalPages: Math.ceil(totalDocs / pageSize),
+        data,
+      });
+    } catch (error) {
+      console.error("List returns error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to list returns" });
+    }
+  },
+);
+
+// Mark return items received (parts and/or the customer's device). HQ-only,
+// one-step (no in-transit state). Mirrors markRepaired's clone-update-replace
+// approach for the embedded array. Body:
+//   {
+//     parts: [{ zohoSalesOrderId, lineItemIdx, quantityReceived?, received?, note? }],
+//     device: { expected?, received?, note? }
+//   }
+// Either key is optional — send only what changed.
+router.post(
+  "/:id/returns",
+  requirePermission("sqt:case:trackReturn"),
+  authorizeCaseAccess,
+  async function (req, res, next) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+
+      const theCase = await collection.findOne({ _id: new ObjectId(id) });
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      const rt = theCase.returnTracking;
+      if (!rt || !rt.active) {
+        return res.status(400).json({
+          success: false,
+          message: "This case has no active return tracking",
+        });
+      }
+
+      const now = new Date();
+      const who = actor(req);
+
+      // Clone without JSON round-tripping so existing Date fields stay Dates.
+      const next = {
+        active: rt.active,
+        reason: rt.reason,
+        initializedAt: rt.initializedAt || now,
+        parts: (Array.isArray(rt.parts) ? rt.parts : []).map((p) => ({ ...p })),
+        device: rt.device
+          ? { ...rt.device }
+          : {
+              applicable: false,
+              expected: false,
+              received: false,
+              receivedAt: null,
+              receivedBy: null,
+              note: null,
+            },
+        summaryStatus: rt.summaryStatus,
+        updatedAt: now,
+      };
+
+      // ── Parts ── address each update by (zohoSalesOrderId, lineItemIdx).
+      const partUpdates = Array.isArray(req.body && req.body.parts)
+        ? req.body.parts
+        : [];
+      for (const u of partUpdates) {
+        if (!u) continue;
+        const p = next.parts.find(
+          (x) =>
+            String(x.zohoSalesOrderId || "") ===
+              String(u.zohoSalesOrderId || "") &&
+            Number(x.lineItemIdx) === Number(u.lineItemIdx),
+        );
+        if (!p) continue;
+        const toReturn = Number(p.quantityToReturn) || 0;
+        // Resolve the received quantity: explicit quantity wins; otherwise a
+        // `received` boolean means full / none; otherwise leave unchanged.
+        let qty;
+        if (u.quantityReceived !== undefined && u.quantityReceived !== null) {
+          qty = Math.max(0, Math.min(Number(u.quantityReceived) || 0, toReturn));
+        } else if (u.received !== undefined) {
+          qty = u.received ? toReturn : 0;
+        } else {
+          qty = Number(p.quantityReceived) || 0;
+        }
+        p.quantityReceived = qty;
+        p.received = toReturn > 0 && qty >= toReturn;
+        if (u.note !== undefined) p.note = u.note ? String(u.note) : null;
+        if (qty > 0) {
+          p.receivedAt = now;
+          p.receivedBy = who;
+        } else {
+          p.receivedAt = null;
+          p.receivedBy = null;
+        }
+      }
+
+      // ── Device ── only meaningful when applicable (ber / unrepairable).
+      const d = req.body && req.body.device;
+      if (d && next.device.applicable) {
+        if (d.expected !== undefined) next.device.expected = !!d.expected;
+        if (d.note !== undefined) next.device.note = d.note ? String(d.note) : null;
+        if (d.received !== undefined) {
+          next.device.received = !!d.received;
+          next.device.receivedAt = d.received ? now : null;
+          next.device.receivedBy = d.received ? who : null;
+        }
+        // A device that's no longer expected can't also be "received".
+        if (!next.device.expected) {
+          next.device.received = false;
+          next.device.receivedAt = null;
+          next.device.receivedBy = null;
+        }
+      }
+
+      next.summaryStatus = computeReturnSummary(next);
+
+      // Mirror received quantities back onto zohoOrders.lineItems[].quantityReturned
+      // so the Sent Parts view agrees with the Returns view. Never lowers an
+      // existing value (a part used in a repair may already be accounted for).
+      const orders = Array.isArray(theCase.zohoOrders)
+        ? theCase.zohoOrders.map((o) => ({
+            ...o,
+            lineItems: Array.isArray(o.lineItems)
+              ? o.lineItems.map((li) => ({ ...li }))
+              : [],
+          }))
+        : [];
+      for (const p of next.parts) {
+        const order = orders.find(
+          (o) =>
+            String(o.zohoSalesOrderId || "") ===
+            String(p.zohoSalesOrderId || ""),
+        );
+        if (!order) continue;
+        const li = order.lineItems[p.lineItemIdx];
+        if (!li) continue;
+        li.quantityReturned = Math.max(
+          Number(li.quantityReturned) || 0,
+          Number(p.quantityReceived) || 0,
+        );
+      }
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $set: { returnTracking: next, zohoOrders: orders, updatedAt: now } },
+        { returnDocument: "after" },
+      );
+
+      const updated = result ? result.value || result : null;
+      if (!updated) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      return res.json({
+        success: true,
+        message: "Return tracking updated",
+        data: updated,
+      });
+    } catch (error) {
+      console.error("Update returns error:", error);
+      return res.status(500).json({
+        success: false,
+        message: `Failed to update returns: ${error.message || error}`,
+      });
     }
   },
 );
