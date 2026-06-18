@@ -54,6 +54,8 @@ const SHOP_CASE_PERMISSIONS = [
   "sqt:case:markRepaired",
   "sqt:case:markCollected",
   "sqt:case:markUnrepairable",
+  // Raise a request for more parts on an in-progress case.
+  "sqt:case:requireExtraParts",
   "sqt:case:note",
   "sqt:case:editDevice",
 ];

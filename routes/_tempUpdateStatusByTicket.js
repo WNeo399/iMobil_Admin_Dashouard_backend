@@ -10,6 +10,10 @@
 
 const express = require("express");
 const { connectToDatabase } = require("../utils/mongodb");
+const {
+  TERMINAL_RETURN_STATUSES,
+  buildReturnTracking,
+} = require("../utils/returnTracking");
 
 const router = express.Router();
 
@@ -119,10 +123,28 @@ router.post(["/integration/case-status", "/integration/case-status/:caseId"], as
       note: null,
     };
 
+    const setFields = { status: resolvedStatus, updatedAt: now };
+    // Mirror the /sqt/cases/status route: entering a terminal status seeds /
+    // reconciles return tracking, leaving it deactivates. The webhook can't
+    // ask the shop whether they hold the customer's device, so assume it's
+    // expected back (deviceExpected: true). Cancelled has no device either way
+    // — buildReturnTracking only applies the device for ber/unrepairable.
+    if (TERMINAL_RETURN_STATUSES.includes(resolvedStatus)) {
+      setFields.returnTracking = buildReturnTracking(existing, resolvedStatus, now, {
+        deviceExpected: true,
+      });
+    } else if (existing.returnTracking && existing.returnTracking.active) {
+      setFields.returnTracking = {
+        ...existing.returnTracking,
+        active: false,
+        updatedAt: now,
+      };
+    }
+
     const result = await collection.findOneAndUpdate(
       { caseId },
       {
-        $set: { status: resolvedStatus, updatedAt: now },
+        $set: setFields,
         $push: { statusHistory: historyEntry },
       },
       { returnDocument: "after" },

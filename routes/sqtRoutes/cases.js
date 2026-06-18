@@ -16,6 +16,8 @@ const {
 // shop-side actions that shop roles are allowed to perform.)
 const STATUS_PERMISSION = {
   pending: "sqt:case:list",
+  // Shop / shop-owner raise a request for extra parts on an in-progress case.
+  "require-extra-parts": "sqt:case:requireExtraParts",
   "waiting-for-parts": "sqt:case:sendParts",
   "parts-arrived": "sqt:case:partsReceived",
   "waiting-for-drop-off": "sqt:case:customerNotified",
@@ -48,6 +50,10 @@ const ZOHO_CUSTOMFIELD_TICKET_ID = "2591985000317627125";
 const COLLECTION = "sqt_cases";
 
 const VALID_STATUSES = [
+  // Shop-raised request for more parts on an in-progress case. Behaves like
+  // "pending" — admins can send more parts from here, which moves it on to
+  // waiting-for-parts. Listed first so it sits at the top of the status tree.
+  "require-extra-parts",
   "on-hold",
   "pending",
   "waiting-for-parts",
@@ -625,6 +631,13 @@ router.post(
         return res.status(400).json({
           success: false,
           message: `status must be one of: ${VALID_STATUSES.join(", ")}`,
+        });
+      }
+      // A request for extra parts must explain what's needed.
+      if (status === "require-extra-parts" && !(note && String(note).trim())) {
+        return res.status(400).json({
+          success: false,
+          message: "A note describing the extra parts needed is required",
         });
       }
 
