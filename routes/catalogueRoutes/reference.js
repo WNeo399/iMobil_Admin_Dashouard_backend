@@ -13,7 +13,8 @@ var express = require("express");
 var router = express.Router();
 const { requireAnyPermission } = require("../../middleware/auth");
 const { connectToDatabase } = require("../../utils/mongodb");
-const { brandSlug, modelSlug, qualitySlug } = require("../../utils/catalogueSlug");
+const { brandSlug, modelSlug, qualitySlug, slugify } = require("../../utils/catalogueSlug");
+const { deriveSeries } = require("../../utils/modelSeries");
 
 const BRAND = "imb_products_brand";
 const CATEGORY = "imb_products_category";
@@ -139,15 +140,25 @@ router.post("/models", EDIT, async (req, res) => {
   try {
     const name = String((req.body && req.body.name) || "").trim();
     const brand_id = String((req.body && req.body.brand_id) || "").trim();
+    // series groups models within a brand (e.g. iPhone / iPad, S Series /
+    // Note Series / Flip Series / Fold Series). Stored as both a slug key
+    // (series_id) and a display name on the model. Falls back to deriving it
+    // from the name (then "Other") when a client doesn't send one, so older
+    // callers keep working.
+    const series =
+      String((req.body && req.body.series) || "").trim() ||
+      deriveSeries(name) ||
+      "Other";
     if (!name) return res.status(400).json({ success: false, message: "name is required" });
     if (!brand_id) return res.status(400).json({ success: false, message: "brand_id is required" });
+    const series_id = slugify(series);
     const db = await connectToDatabase();
     // Referential check — the brand must exist.
     const brand = await db.collection(BRAND).findOne({ _id: brand_id });
     if (!brand) return res.status(400).json({ success: false, message: `Unknown brand "${brand_id}"` });
     const _id = modelSlug(name);
     if (!_id) return res.status(400).json({ success: false, message: "name produced an empty slug" });
-    const doc = { _id, brand_id, name };
+    const doc = { _id, brand_id, name, series_id, series };
     try {
       await db.collection(MODEL).insertOne(doc);
     } catch (err) {
@@ -175,6 +186,12 @@ router.put("/models/:id", EDIT, async (req, res) => {
     }
     if (Object.prototype.hasOwnProperty.call(body, "brand_id")) {
       update.brand_id = String(body.brand_id || "").trim();
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "series")) {
+      const series = String(body.series || "").trim();
+      if (!series) return res.status(400).json({ success: false, message: "series cannot be empty" });
+      update.series = series;
+      update.series_id = slugify(series);
     }
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ success: false, message: "Nothing to update" });
