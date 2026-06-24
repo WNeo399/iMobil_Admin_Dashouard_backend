@@ -34,6 +34,7 @@ var rateLimit = require("express-rate-limit");
 var router = express.Router();
 
 const specialOrderRouter = require("./specialOrder");
+const svpEnquiryRouter = require("./svpEnquiry");
 
 // ── Rate limit ─────────────────────────────────────────────────────
 // 10 submissions per IP per hour. Generous enough for a real user
@@ -62,5 +63,8 @@ router.use(widgetLimiter);
 
 // ── Sub-routes ──────────────────────────────────────────────────────
 router.use("/specialOrder", specialOrderRouter);
+// Apple SVP lookup enquiries — server-to-server JSON (no images / origin
+// allowlist), guarded by the rate limit above + an optional shared secret.
+router.use("/svpEnquiry", svpEnquiryRouter);
 
 module.exports = router;
