@@ -33,6 +33,7 @@ var widgetOriginRouter = require('./routes/widgetOriginRoutes/index');
 // Gated by the collection permissions (reused — same admins manage
 // iMobile product data).
 var catalogueRouter = require('./routes/catalogueRoutes/index');
+var svpEnquiryRouter = require('./routes/svpEnquiryRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -120,6 +121,7 @@ app.use('/creditNote', authenticate, creditNoteRouter);
 app.use('/specialOrder', authenticate, specialOrderRouter);
 app.use('/widgetOrigin', authenticate, widgetOriginRouter);
 app.use('/catalogue', authenticate, catalogueRouter);
+app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

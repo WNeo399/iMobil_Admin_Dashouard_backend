@@ -62,10 +62,9 @@ const SHOP_CASE_PERMISSIONS = [
 
 const ROLE_PERMISSIONS = {
   [ROLES.ADMIN]: ["*:*:*"],
-  // iMobile Admin owns the iMobile-side modules: Zoho Inventory / Tools and
-  // the Repair (RepairDesk) page. Adding `repair:*:*` here keeps the page
-  // accessible without expanding the wildcard surface.
-  [ROLES.IMOBILE_ADMIN]: ["zoho:*:*", "repair:*:*"],
+  // iMobile Admin owns the iMobile-side modules: Zoho Inventory / Tools, the
+  // Repair (RepairDesk) page, and the Apple SVP genuine-parts enquiries.
+  [ROLES.IMOBILE_ADMIN]: ["zoho:*:*", "repair:*:*", "svp:*:*"],
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
   [ROLES.IMOBILE_REPAIR_ADMIN]: ["repair:*:*"],
