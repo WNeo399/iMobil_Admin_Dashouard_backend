@@ -23,15 +23,35 @@ const PRODUCTS = "imb_products";
 // reads the catalogue.
 const GATE = requireAnyPermission("zoho:salesOrder:create", "zoho:collection:view");
 
-// Frame quality fallback chain (strategy §4a). When a `frame` line
-// requests "No Small Parts" and it isn't stocked for that model, try
-// these in order before declaring NO_QUALITY. Configurable here.
-const FRAME_FALLBACK = {
-  "no small parts": ["A+", "IMB"],
+// Per-category quality fallback chains. When a line's requested grade isn't
+// stocked for that model, try these (in order) before declaring NO_QUALITY.
+// Keys are normalised (lowercase) category + requested-quality. Configurable here.
+//   frame: "No Small Parts" → A+ / IMB (strategy §4a)
+//   back-cover-glass: "High Quality with Lens" → Original / Aftermarket, so a
+//     "Back Cover" line still matches on models that only carry those grades.
+const QUALITY_FALLBACK = {
+  frame: {
+    "no small parts": ["A+", "IMB"],
+  },
+  "back-cover-glass": {
+    "high quality with lens": ["Original", "Aftermarket"],
+  },
 };
 
 // Case/space-insensitive comparison key for quality + colour matching.
 const norm = (v) => String(v == null ? "" : v).trim().toLowerCase();
+
+// OZ orders must never use secondhand stock. The "secondhand" marker lives in
+// the product NAME (e.g. "… [Secondhand] …") even when quality.name reads
+// "Original", so check both. Such products are dropped from the match pool.
+const SECONDHAND_RE = /second\s*hand/i;
+function isSecondhand(p) {
+  if (!p) return false;
+  return (
+    SECONDHAND_RE.test(p.productName || "") ||
+    SECONDHAND_RE.test((p.quality && p.quality.name) || "")
+  );
+}
 
 function shapeSku(p) {
   return {
@@ -67,10 +87,12 @@ function matchLine(line, pool) {
     pool.some((p) => norm(p.quality && p.quality.name) === qNorm);
 
   if (!hasQuality(requestedQ)) {
-    // Frame fallback chain (only for frame + a configured requested grade).
+    // Per-category fallback chain for the requested grade.
     let fellBack = false;
-    if (norm(line.category) === "frame" && FRAME_FALLBACK[requestedQ]) {
-      for (const candidate of FRAME_FALLBACK[requestedQ]) {
+    const catFallback = QUALITY_FALLBACK[norm(line.category)];
+    const chain = catFallback && catFallback[requestedQ];
+    if (chain) {
+      for (const candidate of chain) {
         if (hasQuality(norm(candidate))) {
           effectiveQuality = norm(candidate);
           usedQuality = candidate;
@@ -85,6 +107,9 @@ function matchLine(line, pool) {
         status: "NO_QUALITY",
         skus: [],
         availableQualities,
+        // Full model+category pool so the UI can offer a "pick a product"
+        // dropdown (any quality / colour) instead of just a grade re-pick.
+        candidates: pool.map(shapeSku),
       };
     }
   }
@@ -106,6 +131,9 @@ function matchLine(line, pool) {
         // Surface the fallback even on a colour miss so the UI can
         // still show "A+ substituted" context when the user re-picks.
         usedQuality: usedQuality || undefined,
+        // Full model+category pool so the UI can offer a "pick a product"
+        // dropdown instead of just a colour re-pick.
+        candidates: pool.map(shapeSku),
       };
     }
   }
@@ -145,9 +173,11 @@ router.post("/match", GATE, async (req, res) => {
         if (!modelId || !category) {
           return { line, status: "NO_PART", skus: [] };
         }
-        const pool = await collection
+        const rawPool = await collection
           .find({ "compatible_models.id": modelId, "category.id": category })
           .toArray();
+        // Never offer secondhand stock on an OZ order.
+        const pool = rawPool.filter((p) => !isSecondhand(p));
         return matchLine(line, pool);
       }),
     );
