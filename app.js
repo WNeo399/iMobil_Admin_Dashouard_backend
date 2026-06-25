@@ -34,6 +34,8 @@ var widgetOriginRouter = require('./routes/widgetOriginRoutes/index');
 // iMobile product data).
 var catalogueRouter = require('./routes/catalogueRoutes/index');
 var svpEnquiryRouter = require('./routes/svpEnquiryRoutes/index');
+var svpSerialRouter = require('./routes/svpSerialRoutes/index');
+var svpPublicRouter = require('./routes/svpPublicRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -71,7 +73,9 @@ app.use(logger('dev'));
 // here for Meta's WhatsApp HMAC (which signs raw bytes); Twilio
 // signs the URL + sorted form params instead, so we don't need to
 // hold onto the original buffer anymore.
-app.use(express.json());
+// 2mb limit so the SVP serial-list import (a few thousand serials posted as a
+// JSON array) fits; default 100kb is too small. Still bounded.
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -91,6 +95,9 @@ app.use('/webhook/twilio', twilioRouter);
 // Widget submission endpoints — POST /widget/<name>. Public; CORS +
 // origin allowlist + rate limit + honeypot live inside the router.
 app.use('/widget', widgetRouter);
+// Public Apple SVP serial lookup — GET /svp/lookup. Read-only; rate-limited
+// inside the router (trusted lookup server bypasses via the shared secret).
+app.use('/svp', svpPublicRouter);
 // Static serve for the built widget bundles produced by
 // `npm run build:to-backend` in the iMobile_Widget repo. Each bundle
 // lands at public/widgets/<widget-name>/v<N>.js and is served from
@@ -122,6 +129,7 @@ app.use('/specialOrder', authenticate, specialOrderRouter);
 app.use('/widgetOrigin', authenticate, widgetOriginRouter);
 app.use('/catalogue', authenticate, catalogueRouter);
 app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
+app.use('/svpSerial', authenticate, svpSerialRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
