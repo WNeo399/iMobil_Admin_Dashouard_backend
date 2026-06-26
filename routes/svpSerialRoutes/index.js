@@ -16,6 +16,10 @@ const { normalizeSerial } = require("../../utils/svpSerial");
 
 const COLLECTION = "imb_svp_serials";
 const META = "imb_svp_serials_meta"; // single doc tracking last import
+// Serials spot-checked on the admin page that weren't on record. One doc per
+// normalized serial (serial IS the _id) with a hit count, so the same serial
+// checked twice doesn't duplicate. Downloadable / clearable below.
+const MISSES = "imb_svp_serial_misses";
 
 const VIEW = requirePermission("svp:serial:view");
 const MANAGE = requirePermission("svp:serial:manage");
@@ -27,6 +31,7 @@ router.get("/stats", VIEW, async function (req, res) {
     const db = await connectToDatabase();
     const count = await db.collection(COLLECTION).countDocuments({});
     const meta = await db.collection(META).findOne({ _id: "meta" });
+    const missCount = await db.collection(MISSES).countDocuments({});
     return res.json({
       success: true,
       count,
@@ -34,6 +39,7 @@ router.get("/stats", VIEW, async function (req, res) {
       lastMode: (meta && meta.lastMode) || null,
       lastSubmitted: (meta && meta.lastSubmitted) || null,
       lastBy: (meta && meta.lastBy) || null,
+      missCount,
     });
   } catch (error) {
     console.error("SVP serial stats error:", error);
@@ -56,6 +62,29 @@ router.get("/check", VIEW, async function (req, res) {
     }
     const db = await connectToDatabase();
     const hit = await db.collection(COLLECTION).findOne({ _id: serial });
+
+    // Log serials that came back not-found so staff can download them later
+    // (e.g. to send back to the supplier). Deduplicated by serial with a hit
+    // count; a failure here must not break the check itself.
+    if (!hit) {
+      try {
+        await db.collection(MISSES).updateOne(
+          { _id: serial },
+          {
+            $setOnInsert: { _id: serial, firstCheckedAt: new Date() },
+            $set: {
+              lastCheckedAt: new Date(),
+              lastBy: (req.user && req.user.username) || "system",
+            },
+            $inc: { count: 1 },
+          },
+          { upsert: true },
+        );
+      } catch (logErr) {
+        console.error("SVP serial miss log error:", logErr);
+      }
+    }
+
     return res.json({ success: true, found: !!hit, serial });
   } catch (error) {
     console.error("SVP serial check error:", error);
@@ -111,6 +140,10 @@ router.post("/import", MANAGE, async function (req, res) {
       inserted += r.upsertedCount || 0;
     }
 
+    // Any serial we just put on record is no longer a "not found" — drop it
+    // from the misses log so the download stays a list of still-unknown serials.
+    await db.collection(MISSES).deleteMany({ _id: { $in: serials } });
+
     const total = await col.countDocuments({});
     await db.collection(META).updateOne(
       { _id: "meta" },
@@ -139,6 +172,48 @@ router.post("/import", MANAGE, async function (req, res) {
       success: false,
       message: `Import failed: ${error.message || error}`,
     });
+  }
+});
+
+// ── GET /svpSerial/misses ───────────────────────────────────────────
+// The full list of serials checked here that weren't on record, newest first.
+// The frontend turns this into a CSV download.
+router.get("/misses", VIEW, async function (req, res) {
+  try {
+    const db = await connectToDatabase();
+    const docs = await db
+      .collection(MISSES)
+      .find({})
+      .sort({ lastCheckedAt: -1 })
+      .toArray();
+    const misses = docs.map((m) => ({
+      serial: m._id,
+      count: m.count || 1,
+      firstCheckedAt: m.firstCheckedAt || null,
+      lastCheckedAt: m.lastCheckedAt || null,
+      lastBy: m.lastBy || null,
+    }));
+    return res.json({ success: true, count: misses.length, misses });
+  } catch (error) {
+    console.error("SVP serial misses error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to load not-found serials" });
+  }
+});
+
+// ── DELETE /svpSerial/misses ────────────────────────────────────────
+// Clear the not-found log (after downloading it).
+router.delete("/misses", MANAGE, async function (req, res) {
+  try {
+    const db = await connectToDatabase();
+    const r = await db.collection(MISSES).deleteMany({});
+    return res.json({ success: true, deleted: r.deletedCount || 0 });
+  } catch (error) {
+    console.error("SVP serial misses clear error:", error);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to clear not-found serials" });
   }
 });
 
