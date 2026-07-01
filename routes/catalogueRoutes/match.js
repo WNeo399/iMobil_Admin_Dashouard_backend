@@ -53,6 +53,19 @@ function isSecondhand(p) {
   );
 }
 
+// Colour pre-match: a (possibly less-specific) sheet colour like "Black"
+// matches a more-specific catalogue colour like "Black Titanium" when every
+// word of the requested colour appears in the catalogue colour. `requestedNorm`
+// is already normalised (lowercase). Used only when there's no exact match.
+function colourTokenMatch(requestedNorm, dbColour) {
+  const d = norm(dbColour);
+  if (!requestedNorm || !d) return false;
+  const rTokens = requestedNorm.split(/\s+/).filter(Boolean);
+  if (rTokens.length === 0) return false;
+  const dTokens = new Set(d.split(/\s+/).filter(Boolean));
+  return rTokens.every((t) => dTokens.has(t));
+}
+
 function shapeSku(p) {
   return {
     sku: p.sku,
@@ -116,33 +129,35 @@ function matchLine(line, pool) {
 
   const poolQ = pool.filter((p) => norm(p.quality && p.quality.name) === effectiveQuality);
 
-  // Colour gate — screens carry no colour, so skip it for them.
-  if (!isScreen && requestedC) {
-    const availableColours = [
-      ...new Set(poolQ.map((p) => (p.color != null ? p.color : null)).filter((c) => c != null)),
-    ];
-    const hasColour = poolQ.some((p) => norm(p.color) === requestedC);
-    if (!hasColour) {
+  // Colour matching — screens carry no colour, so skip it for them. Try an
+  // exact colour first; if none, pre-match by token ("Black" → "Black
+  // Titanium"). One match auto-selects below; several become MULTIPLE so the
+  // user picks.
+  let matches;
+  if (isScreen || !requestedC) {
+    matches = poolQ;
+  } else {
+    let cm = poolQ.filter((p) => norm(p.color) === requestedC);
+    if (cm.length === 0) {
+      cm = poolQ.filter((p) => colourTokenMatch(requestedC, p.color));
+    }
+    if (cm.length === 0) {
+      const availableColours = [
+        ...new Set(poolQ.map((p) => (p.color != null ? p.color : null)).filter((c) => c != null)),
+      ];
       return {
         line,
         status: "NO_COLOUR",
         skus: [],
         availableColours,
-        // Surface the fallback even on a colour miss so the UI can
-        // still show "A+ substituted" context when the user re-picks.
         usedQuality: usedQuality || undefined,
         // Full model+category pool so the UI can offer a "pick a product"
         // dropdown instead of just a colour re-pick.
         candidates: pool.map(shapeSku),
       };
     }
+    matches = cm;
   }
-
-  // Final matches: colour-filtered for non-screens, all of poolQ for screens.
-  const matches =
-    isScreen || !requestedC
-      ? poolQ
-      : poolQ.filter((p) => norm(p.color) === requestedC);
 
   const skus = matches.map(shapeSku);
   let status = usedQuality ? "MATCHED_FALLBACK" : "MATCHED";
