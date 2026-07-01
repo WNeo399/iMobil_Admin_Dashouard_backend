@@ -29,6 +29,7 @@ const VALID_STATUSES = [
   "repaired",
   "repaired-and-collected",
   "waiting-solvup",
+  "issue-with-solvup",
   "unrepairable",
   "ber",
   "completed",
@@ -48,6 +49,7 @@ const OPEN_STATUSES = [
   "repairing",
   "repaired",
   "waiting-solvup",
+  "issue-with-solvup",
 ];
 const SHOP_OPEN_STATUSES = [
   "pending",

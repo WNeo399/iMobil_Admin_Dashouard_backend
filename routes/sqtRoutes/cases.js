@@ -26,6 +26,9 @@ const STATUS_PERMISSION = {
   repaired: "sqt:case:markRepaired",
   "repaired-and-collected": "sqt:case:markCollected",
   "waiting-solvup": "sqt:case:selectParts",
+  // Admin-side flag that the Solvup hand-off has a problem. Manual move with a
+  // note — same gate as On Hold / Change Status.
+  "issue-with-solvup": "sqt:case:changeStatus",
   // On Hold is an admin-side action — same gate as other manual transitions.
   // The Change Status dialog already requires a note, which satisfies the
   // "must leave a note" requirement.
@@ -64,6 +67,7 @@ const VALID_STATUSES = [
   "repaired",
   "repaired-and-collected",
   "waiting-solvup",
+  "issue-with-solvup",
   "unrepairable",
   "ber",
   "completed",
@@ -74,7 +78,7 @@ const VALID_STATUSES = [
 // work being handled internally by Admin / TechElite Admin (paused by an
 // admin, or handed off to Solvup). Filtered out of list/counts for
 // shop-scoped users so the shop's view stays focused on what's actionable.
-const ADMIN_ONLY_STATUSES = ["on-hold", "waiting-solvup"];
+const ADMIN_ONLY_STATUSES = ["on-hold", "waiting-solvup", "issue-with-solvup"];
 
 function isShopScopedUser(req) {
   return Array.isArray(req.user && req.user.accessibleShopIds);
