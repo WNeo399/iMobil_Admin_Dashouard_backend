@@ -10,6 +10,7 @@
 
 const express = require("express");
 const { connectToDatabase } = require("../utils/mongodb");
+const { notifyOnStatusChange } = require("../utils/notify");
 const {
   TERMINAL_RETURN_STATUSES,
   buildReturnTracking,
@@ -158,6 +159,15 @@ router.post(["/integration/case-status", "/integration/case-status/:caseId"], as
         success: false,
         message: `No case found with caseId "${caseId}"`,
       });
+    }
+
+    // Notify the shop's users on a real transition into a notifiable status
+    // (e.g. waiting-for-parts). The early no-op guard above already ensures
+    // existing.status !== resolvedStatus here. Must never break the webhook.
+    try {
+      await notifyOnStatusChange(db, updated, existing.status, resolvedStatus);
+    } catch (notifyErr) {
+      console.error("webhook notify error:", notifyErr);
     }
 
     return res.json({

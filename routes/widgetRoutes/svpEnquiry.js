@@ -19,6 +19,8 @@
 var express = require("express");
 var router = express.Router();
 const { connectToDatabase } = require("../../utils/mongodb");
+const { notifyRoles } = require("../../utils/notify");
+const { ROLES } = require("../../constants/roles");
 
 const COLLECTION = "imb_svp_enquiry";
 const MAX = { serial: 100, name: 200, contact: 60, note: 2000 };
@@ -84,6 +86,20 @@ router.post("/", express.json(), async function (req, res) {
 
     const db = await connectToDatabase();
     const result = await db.collection(COLLECTION).insertOne(doc);
+
+    // Notify the iMobile admins who triage SVP enquiries. Best-effort — a
+    // notify failure must never fail the public submission.
+    try {
+      await notifyRoles(db, [ROLES.ADMIN, ROLES.IMOBILE_ADMIN], {
+        type: "svp_enquiry_new",
+        title: "New SVP enquiry",
+        message: `${name} asked about serial ${serial}${contact ? ` — ${contact}` : ""}.`,
+        data: { enquiryId: String(result.insertedId), serial, name },
+      });
+    } catch (notifyErr) {
+      console.error("[svpEnquiry] notify error:", notifyErr);
+    }
+
     return res.json({ success: true, id: String(result.insertedId) });
   } catch (error) {
     console.error("[svpEnquiry] error:", error);

@@ -5,6 +5,7 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
 const { syncCaseStatus } = require("../../utils/repairDesk");
 const { requirePermission } = require("../../middleware/auth");
+const { notifyOnStatusChange } = require("../../utils/notify");
 const {
   TERMINAL_RETURN_STATUSES,
   buildReturnTracking,
@@ -704,6 +705,14 @@ router.post(
           .json({ success: false, message: "Case not found" });
       }
 
+      // Foundation notification hook — fires only on a real transition into a
+      // notifiable status (e.g. waiting-for-parts). Must never break the save.
+      try {
+        await notifyOnStatusChange(db, updated, theCase.status, status);
+      } catch (notifyErr) {
+        console.error("status notify error:", notifyErr);
+      }
+
       // TEMP: mirror the status into RepairDesk. Never blocks the response on
       // RepairDesk being slow/down — syncCaseStatus catches its own errors.
       // Remove together with utils/repairDesk.js when RepairDesk is dropped.
@@ -885,6 +894,19 @@ router.post(
       const updatedCase = updateResult
         ? updateResult.value || updateResult
         : null;
+
+      // Notify the shop's users that a new case is on its way. Fires only on
+      // the real transition into waiting-for-parts; must never break sendParts.
+      try {
+        await notifyOnStatusChange(
+          db,
+          updatedCase || theCase,
+          theCase.status,
+          "waiting-for-parts",
+        );
+      } catch (notifyErr) {
+        console.error("sendParts notify error:", notifyErr);
+      }
 
       // TEMP: mirror the status into RepairDesk via the shared helper. Uses
       // the stored repairDeskTicketId if present, otherwise falls back to a

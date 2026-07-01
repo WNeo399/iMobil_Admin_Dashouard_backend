@@ -36,6 +36,9 @@ var catalogueRouter = require('./routes/catalogueRoutes/index');
 var svpEnquiryRouter = require('./routes/svpEnquiryRoutes/index');
 var svpSerialRouter = require('./routes/svpSerialRoutes/index');
 var svpPublicRouter = require('./routes/svpPublicRoutes/index');
+// Per-user in-app notifications (bell + toast). Scoped to the caller inside
+// the router, so it only needs `authenticate` — no per-permission gate.
+var notificationRouter = require('./routes/notificationRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -58,6 +61,10 @@ var widgetRouter = require('./routes/widgetRoutes/index');
 // TEMPORARY: external-integration endpoint (no auth). Remove together with
 // routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
 var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
+// Inbound shipment webhook from Zoho Flow — attaches delivery method +
+// tracking number to the matching sales order on an SQT case. Public (Zoho
+// Flow can't carry our JWT); optional shared secret inside the router.
+var shipmentWebhookRouter = require('./routes/shipmentWebhookRoutes/index');
 var { authenticate } = require('./middleware/auth');
 
 var app = express();
@@ -85,6 +92,8 @@ app.use('/auth', authRouter);
 // TEMPORARY: mounted before the auth-protected routers so /integration/* stays
 // open to the external caller. Remove when the integration is gone.
 app.use(tempIntegrationRouter);
+// Zoho Flow shipment webhook — GET/POST /integration/shipment. Public.
+app.use('/integration/shipment', shipmentWebhookRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
@@ -130,6 +139,7 @@ app.use('/widgetOrigin', authenticate, widgetOriginRouter);
 app.use('/catalogue', authenticate, catalogueRouter);
 app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
 app.use('/svpSerial', authenticate, svpSerialRouter);
+app.use('/notifications', authenticate, notificationRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
