@@ -62,12 +62,17 @@ async function handleShipment(req, res) {
     const col = db.collection(COLLECTION);
     const now = new Date();
 
-    // Only set fields we actually received, so an early status update (no
-    // tracking yet) can't blank out a tracking number set later.
-    const set = { updatedAt: now, "zohoOrders.$[o].shippingUpdatedAt": now };
-    if (shippingMethod) set["zohoOrders.$[o].shippingMethod"] = shippingMethod;
-    if (trackingNumber) set["zohoOrders.$[o].trackingNumber"] = trackingNumber;
-    if (shipmentStatus) set["zohoOrders.$[o].shipmentStatus"] = shipmentStatus;
+    // Each webhook is the authoritative snapshot of the order's shipping, so a
+    // repeat webhook for the same SO replaces the details wholesale — fields not
+    // provided are cleared. E.g. switching to "Pick Up" with no tracking blanks
+    // a previously-set tracking number.
+    const set = {
+      updatedAt: now,
+      "zohoOrders.$[o].shippingUpdatedAt": now,
+      "zohoOrders.$[o].shippingMethod": shippingMethod || null,
+      "zohoOrders.$[o].trackingNumber": trackingNumber || null,
+      "zohoOrders.$[o].shipmentStatus": shipmentStatus || null,
+    };
 
     const orderFilter = { "zohoOrders.zohoSalesOrderNumber": soNumber };
     const opts = {
