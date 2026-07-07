@@ -39,6 +39,14 @@ var svpPublicRouter = require('./routes/svpPublicRoutes/index');
 // Per-user in-app notifications (bell + toast). Scoped to the caller inside
 // the router, so it only needs `authenticate` — no per-permission gate.
 var notificationRouter = require('./routes/notificationRoutes/index');
+// Purchase Order — read-only view over the supplier's Tencent Docs sheet.
+var purchaseOrderRouter = require('./routes/purchaseOrderRoutes/index');
+// Refurbished Phones — read-only views over the external scraper MySQL DB.
+var refurbishedRouter = require('./routes/refurbishedRoutes/index');
+// InFlow — sales orders + customers. Authenticated read/payment API here;
+// the public ingestion webhook is inflowWebhookRoutes (mounted below).
+var inflowRouter = require('./routes/inflowRoutes/index');
+var inflowWebhookRouter = require('./routes/inflowWebhookRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -94,6 +102,9 @@ app.use('/auth', authRouter);
 app.use(tempIntegrationRouter);
 // Zoho Flow shipment webhook — GET/POST /integration/shipment. Public.
 app.use('/integration/shipment', shipmentWebhookRouter);
+// InFlow sales-order ingestion webhook — GET/POST /integration/inflow. Public
+// (optional INFLOW_WEBHOOK_SECRET shared secret inside the router).
+app.use('/integration/inflow', inflowWebhookRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
@@ -140,6 +151,9 @@ app.use('/catalogue', authenticate, catalogueRouter);
 app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
 app.use('/svpSerial', authenticate, svpSerialRouter);
 app.use('/notifications', authenticate, notificationRouter);
+app.use('/purchaseOrder', authenticate, purchaseOrderRouter);
+app.use('/refurbished', authenticate, refurbishedRouter);
+app.use('/inflow', authenticate, inflowRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

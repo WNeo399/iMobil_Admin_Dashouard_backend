@@ -64,7 +64,12 @@ const ROLE_PERMISSIONS = {
   [ROLES.ADMIN]: ["*:*:*"],
   // iMobile Admin owns the iMobile-side modules: Zoho Inventory / Tools, the
   // Repair (RepairDesk) page, and the Apple SVP genuine-parts enquiries.
-  [ROLES.IMOBILE_ADMIN]: ["zoho:*:*", "repair:*:*", "svp:*:*"],
+  // InFlow: iMobile Admin can view orders + customers; recording payments is
+  // Admin-only (inflow:order:payment, which only "*:*:*" grants).
+  [ROLES.IMOBILE_ADMIN]: [
+    "zoho:*:*", "repair:*:*", "svp:*:*", "po:*:*", "refurb:*:*",
+    "inflow:order:view", "inflow:customer:view",
+  ],
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
   [ROLES.IMOBILE_REPAIR_ADMIN]: ["repair:*:*"],
