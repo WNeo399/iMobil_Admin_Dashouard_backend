@@ -43,6 +43,9 @@ var notificationRouter = require('./routes/notificationRoutes/index');
 var purchaseOrderRouter = require('./routes/purchaseOrderRoutes/index');
 // Refurbished Phones — read-only views over the external scraper MySQL DB.
 var refurbishedRouter = require('./routes/refurbishedRoutes/index');
+// Ask the Data — agentic Claude chat that answers questions by running
+// read-only SQL over the scraper MySQL (see utils/aiSql.js for the guardrails).
+var aiQueryRouter = require('./routes/aiQueryRoutes/index');
 // InFlow — sales orders + customers. Authenticated read/payment API here;
 // the public ingestion webhook is inflowWebhookRoutes (mounted below).
 var inflowRouter = require('./routes/inflowRoutes/index');
@@ -88,6 +91,11 @@ app.use(logger('dev'));
 // here for Meta's WhatsApp HMAC (which signs raw bytes); Twilio
 // signs the URL + sorted form params instead, so we don't need to
 // hold onto the original buffer anymore.
+// The AI assistant ("Ask the Data") accepts image / spreadsheet attachments as
+// base64 image blocks that can exceed the default limit — parse /aiQuery bodies
+// with a larger cap first; the global parser below then skips it (body-parser
+// sets req._body after the first parse, so it isn't re-read at 2mb).
+app.use('/aiQuery', express.json({ limit: '15mb' }));
 // 2mb limit so the SVP serial-list import (a few thousand serials posted as a
 // JSON array) fits; default 100kb is too small. Still bounded.
 app.use(express.json({ limit: '2mb' }));
@@ -153,6 +161,7 @@ app.use('/svpSerial', authenticate, svpSerialRouter);
 app.use('/notifications', authenticate, notificationRouter);
 app.use('/purchaseOrder', authenticate, purchaseOrderRouter);
 app.use('/refurbished', authenticate, refurbishedRouter);
+app.use('/aiQuery', authenticate, aiQueryRouter);
 app.use('/inflow', authenticate, inflowRouter);
 
 // catch 404 and forward to error handler

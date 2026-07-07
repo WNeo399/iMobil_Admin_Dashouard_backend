@@ -72,6 +72,9 @@ const ROLE_PERMISSIONS = {
   // Repair (RepairDesk) page, and the Apple SVP genuine-parts enquiries.
   // InFlow: iMobile Admin can view orders + customers; recording payments is
   // Admin-only (inflow:order:payment, which only "*:*:*" grants).
+  // AI assistant ("Ask the Data") is Admin-only for now — deliberately no
+  // ai:* grant here, so only the Admin role ("*:*:*") sees the orb / can query.
+  // Add "ai:query:use" (or "ai:*:*") here to open it up to iMobile Admin later.
   [ROLES.IMOBILE_ADMIN]: [
     "zoho:*:*", "repair:*:*", "svp:*:*", "po:*:*", "refurb:*:*",
     "inflow:order:view", "inflow:customer:view",
