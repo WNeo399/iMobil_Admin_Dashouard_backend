@@ -62,6 +62,9 @@ async function authenticate(req, res, next) {
       accessibleShopIds: isShopScopedRole(user.role)
         ? shopIds.map((id) => (id instanceof ObjectId ? id : new ObjectId(id)))
         : null,
+      // InFlow customer-portal link — scopes the Statement page to one customer.
+      inflowCustomerId: user.inflowCustomerId || null,
+      inflowCustomerName: user.inflowCustomerName || null,
     };
 
     next();

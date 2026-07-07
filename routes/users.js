@@ -189,6 +189,16 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
       updatedAt: now,
     };
 
+    // InFlow customer link — an inflow-customer login is scoped to one customer.
+    if (role === "inflow-customer") {
+      const cname = String(req.body.inflowCustomerName || "").trim();
+      doc.inflowCustomerName = cname || null;
+      const cust = cname
+        ? await db.collection("inflow_customers").findOne({ nameLower: cname.toLowerCase() })
+        : null;
+      doc.inflowCustomerId = cust ? cust._id : null;
+    }
+
     const result = await collection.insertOne(doc);
     delete doc.passwordHash;
     return res
@@ -243,6 +253,16 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     if (req.body.shopIds !== undefined || req.body.role !== undefined) {
       const sourceIds = req.body.shopIds !== undefined ? req.body.shopIds : existing.shopIds;
       update.shopIds = normalizeShopIdsForRole(sourceIds, effectiveRole);
+    }
+
+    // InFlow customer link — only meaningful for the inflow-customer role.
+    if (effectiveRole === "inflow-customer" && req.body.inflowCustomerName !== undefined) {
+      const cname = String(req.body.inflowCustomerName || "").trim();
+      update.inflowCustomerName = cname || null;
+      const cust = cname
+        ? await db.collection("inflow_customers").findOne({ nameLower: cname.toLowerCase() })
+        : null;
+      update.inflowCustomerId = cust ? cust._id : null;
     }
 
     // Uniqueness checks when username/email changed — skip email when it

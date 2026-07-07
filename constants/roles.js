@@ -11,6 +11,8 @@ const ROLES = {
   TECHELITE_ADMIN: "techelite-admin",
   SHOP_OWNER: "shop-owner",
   REPAIR_SHOP: "repair-shop",
+  // Portal login for an InFlow customer — sees only their own statement.
+  INFLOW_CUSTOMER: "inflow-customer",
 };
 
 const ROLE_LABELS = {
@@ -20,6 +22,7 @@ const ROLE_LABELS = {
   [ROLES.TECHELITE_ADMIN]: "TechElite Admin",
   [ROLES.SHOP_OWNER]: "Repair Shop Owner",
   [ROLES.REPAIR_SHOP]: "Repair Shop",
+  [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -28,11 +31,13 @@ const ROLE_LABELS = {
 const ROLE_GROUPS = {
   IMOBILE: "imobile",
   TECHELITE: "techelite",
+  INFLOW: "inflow",
 };
 
 const ROLE_GROUP_LABELS = {
   [ROLE_GROUPS.IMOBILE]: "iMobile",
   [ROLE_GROUPS.TECHELITE]: "TechElite",
+  [ROLE_GROUPS.INFLOW]: "InFlow",
 };
 
 const ROLE_GROUP_OF = {
@@ -42,6 +47,7 @@ const ROLE_GROUP_OF = {
   [ROLES.TECHELITE_ADMIN]: ROLE_GROUPS.TECHELITE,
   [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
   [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
+  [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -78,6 +84,8 @@ const ROLE_PERMISSIONS = {
   [ROLES.TECHELITE_ADMIN]: ["sqt:*:*", "system:user:manage"],
   [ROLES.SHOP_OWNER]: [...SHOP_CASE_PERMISSIONS],
   [ROLES.REPAIR_SHOP]: [...SHOP_CASE_PERMISSIONS],
+  // InFlow Customer — a portal login for a customer; sees only their statement.
+  [ROLES.INFLOW_CUSTOMER]: ["inflow:statement:view"],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.

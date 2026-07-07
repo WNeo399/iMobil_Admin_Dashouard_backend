@@ -36,6 +36,9 @@ const STATUS_LABEL_TO_VALUE = {
   // RepairDesk's "Unrepairable & Hold" has no dashboard equivalent —
   // there's no unrepairable-hold state, so it folds into "unrepairable".
   "unrepairable & hold": "unrepairable",
+  // "Unrepairable & Returned" likewise has no distinct dashboard state —
+  // fold it into "unrepairable".
+  "unrepairable & returned": "unrepairable",
   "ber": "ber",
   "completed": "completed",
   "cancelled": "cancelled",
