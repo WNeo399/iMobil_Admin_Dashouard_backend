@@ -165,43 +165,185 @@ router.get("/salesorders/:id", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── GET /inflow/salesorders/:id/credits ─────────────────────────────
+// Credit notes for THIS order's customer that still have credit to apply.
+// available = paidAmount - totalAmount  (credit consumed lowers paidAmount).
+router.get("/salesorders/:id/credits", PAY, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const order = await db
+      .collection(ORDERS)
+      .findOne({ _id: new ObjectId(req.params.id) }, { projection: { customerName: 1 } });
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    const name = order.customerName;
+    if (!name) return res.json({ success: true, credits: [] });
+
+    const docs = await db
+      .collection(ORDERS)
+      .find(
+        { customerName: name, totalAmount: { $lt: 0 } },
+        { projection: { invoiceNumber: 1, invoiceDate: 1, invoiceDateRaw: 1, vendor: 1, totalAmount: 1, paidAmount: 1 } },
+      )
+      .toArray();
+
+    const credits = docs
+      .map((c) => {
+        const creditAmount = -num(c.totalAmount);
+        const available = num(c.paidAmount) - num(c.totalAmount);
+        return {
+          _id: c._id,
+          invoiceNumber: c.invoiceNumber,
+          invoiceDate: c.invoiceDate,
+          invoiceDateRaw: c.invoiceDateRaw,
+          vendor: c.vendor || null,
+          creditAmount,
+          applied: creditAmount - available,
+          available,
+        };
+      })
+      .filter((c) => c.available > 0.005)
+      .sort((a, b) => new Date(a.invoiceDate || 0) - new Date(b.invoiceDate || 0));
+
+    return res.json({ success: true, credits });
+  } catch (e) {
+    console.error("InFlow credits list error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load credits" });
+  }
+});
+
 // ── POST /inflow/salesorders/:id/payment ────────────────────────────
+// Records a cash payment and/or applies available credit notes against the
+// order balance. Body: { amount, date, note, credits: [{ creditNoteId, amount }] }.
+// Applying credit is a transfer: the invoice's paidAmount goes up, and the
+// credit note's paidAmount goes down (consuming its available credit), so the
+// customer's overall balance is unchanged.
 router.post("/salesorders/:id/payment", PAY, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Bad id" });
     }
-    const amount = Number(req.body && req.body.amount);
-    if (!Number.isFinite(amount) || amount === 0) {
+    const body = req.body || {};
+    const amount = Number(body.amount) || 0;
+    const hasCash = Number.isFinite(amount) && amount !== 0;
+
+    // Parse + sanitise the requested credit applications.
+    const credits = [];
+    for (const c of Array.isArray(body.credits) ? body.credits : []) {
+      if (!c || !ObjectId.isValid(c.creditNoteId)) continue;
+      const amt = Math.round((Number(c.amount) || 0) * 100) / 100;
+      if (amt > 0) credits.push({ creditNoteId: new ObjectId(c.creditNoteId), amount: amt });
+    }
+    if (!hasCash && credits.length === 0) {
       return res
         .status(400)
-        .json({ success: false, message: "A non-zero payment amount is required." });
+        .json({ success: false, message: "Enter a payment amount or a credit to apply." });
     }
+
     const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
     const _id = new ObjectId(req.params.id);
     const now = new Date();
     let date = now;
-    if (req.body && req.body.date) {
-      const d = new Date(req.body.date);
+    if (body.date) {
+      const d = new Date(body.date);
       if (!isNaN(d.getTime())) date = d;
     }
-    const payment = {
-      _id: new ObjectId(),
-      amount,
-      date,
-      note: String((req.body && req.body.note) || "").trim(),
-      recordedBy: (req.user && (req.user.username || req.user.email)) || null,
-      recordedById: req.user ? req.user._id : null,
-      recordedAt: now,
-    };
+    const by = (req.user && (req.user.username || req.user.email)) || null;
+    const byId = req.user ? req.user._id : null;
 
-    const r = await db.collection(ORDERS).findOneAndUpdate(
+    const order = await col.findOne({ _id }, { projection: { customerName: 1, invoiceNumber: 1 } });
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+
+    const payments = [];
+    const cnUpdates = [];
+    let paidInc = 0;
+
+    if (hasCash) {
+      payments.push({
+        _id: new ObjectId(),
+        amount,
+        date,
+        note: String(body.note || "").trim(),
+        method: "cash",
+        recordedBy: by,
+        recordedById: byId,
+        recordedAt: now,
+      });
+      paidInc += amount;
+    }
+
+    if (credits.length) {
+      const cnDocs = await col
+        .find(
+          { _id: { $in: credits.map((c) => c.creditNoteId) } },
+          { projection: { invoiceNumber: 1, customerName: 1, totalAmount: 1, paidAmount: 1 } },
+        )
+        .toArray();
+      const cnMap = new Map(cnDocs.map((d) => [String(d._id), d]));
+      for (const c of credits) {
+        const cn = cnMap.get(String(c.creditNoteId));
+        if (!cn) return res.status(400).json({ success: false, message: "Credit note not found." });
+        if (num(cn.totalAmount) >= 0) {
+          return res.status(400).json({ success: false, message: `${cn.invoiceNumber} is not a credit note.` });
+        }
+        if (cn.customerName !== order.customerName) {
+          return res.status(400).json({ success: false, message: "Credit note belongs to another customer." });
+        }
+        const available = num(cn.paidAmount) - num(cn.totalAmount);
+        if (c.amount > available + 0.005) {
+          return res
+            .status(400)
+            .json({ success: false, message: `Only ${available.toFixed(2)} available on ${cn.invoiceNumber}.` });
+        }
+        const applicationId = new ObjectId();
+        payments.push({
+          _id: new ObjectId(),
+          amount: c.amount,
+          date,
+          note: "",
+          method: "credit",
+          creditNoteId: c.creditNoteId,
+          creditNoteNumber: cn.invoiceNumber,
+          applicationId,
+          recordedBy: by,
+          recordedById: byId,
+          recordedAt: now,
+        });
+        paidInc += c.amount;
+        cnUpdates.push({
+          cnId: c.creditNoteId,
+          amount: c.amount,
+          application: {
+            applicationId,
+            invoiceId: _id,
+            invoiceNumber: order.invoiceNumber,
+            amount: c.amount,
+            date,
+            appliedAt: now,
+            appliedBy: by,
+          },
+        });
+      }
+    }
+
+    const r = await col.findOneAndUpdate(
       { _id },
-      { $push: { payments: payment }, $inc: { paidAmount: amount }, $set: { updatedAt: now } },
+      { $push: { payments: { $each: payments } }, $inc: { paidAmount: paidInc }, $set: { updatedAt: now } },
       { returnDocument: "after" },
     );
     const doc = r ? r.value || r : null;
     if (!doc) return res.status(404).json({ success: false, message: "Not found" });
+
+    // Consume each credit note (lower its paidAmount + record the application).
+    for (const u of cnUpdates) {
+      await col.updateOne(
+        { _id: u.cnId },
+        { $inc: { paidAmount: -u.amount }, $push: { creditApplications: u.application }, $set: { updatedAt: now } },
+      );
+    }
 
     const total = num(doc.totalAmount);
     const paid = num(doc.paidAmount);
@@ -231,8 +373,21 @@ router.delete("/salesorders/:id/payment/:paymentId", PAY, async (req, res) => {
       .collection(ORDERS)
       .findOne({ _id }, { projection: { payments: 1, totalAmount: 1 } });
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
-    const exists = (order.payments || []).some((p) => p && p._id && String(p._id) === paymentId);
-    if (!exists) return res.status(404).json({ success: false, message: "Payment not found" });
+    const removed = (order.payments || []).find((p) => p && p._id && String(p._id) === paymentId);
+    if (!removed) return res.status(404).json({ success: false, message: "Payment not found" });
+
+    // If this payment applied a credit note, hand the credit back: raise the
+    // credit note's paidAmount by the amount and drop its application record.
+    if (removed.method === "credit" && removed.creditNoteId) {
+      await db.collection(ORDERS).updateOne(
+        { _id: new ObjectId(removed.creditNoteId) },
+        {
+          $inc: { paidAmount: num(removed.amount) },
+          $pull: { creditApplications: { applicationId: removed.applicationId } },
+          $set: { updatedAt: new Date() },
+        },
+      );
+    }
 
     const r = await db.collection(ORDERS).findOneAndUpdate(
       { _id },

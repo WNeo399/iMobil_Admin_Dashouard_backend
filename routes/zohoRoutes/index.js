@@ -83,9 +83,11 @@ async function fetchStockShapedItems(itemIds) {
         sku: item.sku,
         productName: item.name,
         location: locationField?.value || "",
-        stock:
-          Number(item.actual_available_for_sale_stock || 0) -
-          Number(item.actual_committed_stock || 0),
+        // actual_available_for_sale_stock already nets out committed stock —
+        // subtracting actual_committed_stock again double-counted it, so a fully
+        // committed item (e.g. on-hand 2, committed 2 → for-sale 0) showed -2.
+        // Use it as-is, matching the product detail dialog + the location endpoint.
+        stock: Number(item.actual_available_for_sale_stock || 0),
       };
     })
     .sort((a, b) => a.productName.localeCompare(b.productName));
