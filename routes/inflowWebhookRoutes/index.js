@@ -11,7 +11,7 @@
 // Payload (JSON body):
 //   { invoiceNumber, vendor, customerName, invoiceDate ("DD/MM/YYYY"),
 //     subtotal, tax, totalAmount,
-//     lineItems: [{ description, quantity, unitPrice, subTotal }] }
+//     lineItems: [{ sku, description, quantity, unitPrice, subTotal }] }
 //
 // Public (no JWT). Optional shared secret: if INFLOW_WEBHOOK_SECRET is set, the
 // caller must send a matching `x-webhook-secret` header (or `secret` param).
@@ -85,6 +85,7 @@ async function handleWebhook(req, res) {
 
     const lineItems = Array.isArray(p.lineItems)
       ? p.lineItems.map((li) => ({
+          sku: String((li && li.sku) || "").trim(),
           description: String((li && li.description) || ""),
           quantity: num(li && li.quantity),
           unitPrice: num(li && li.unitPrice),
