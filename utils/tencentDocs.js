@@ -62,11 +62,9 @@ async function getTabs(apiId) {
   }));
 }
 
-// Async-export the whole workbook to xlsx, download it, and parse every tab into
-// arrays-of-arrays. Returns { title: rows[][] }. The direct cell-values API
-// (spreadsheet/v3/…/values) is faster but its range params are undocumented for
-// us right now; export is reliable and gives all tabs in one shot.
-async function exportWorkbook(apiId) {
+// Async-export the whole workbook to xlsx, download it, and return the parsed
+// XLSX workbook object (raw — no trimming).
+async function downloadWorkbook(apiId) {
   const e = encodeURIComponent(apiId);
   const start = await (
     await fetch(`${BASE}/drive/v2/files/${e}/async-export`, {
@@ -99,7 +97,14 @@ async function exportWorkbook(apiId) {
   if (!url) throw new Error("Tencent export timed out");
 
   const buf = Buffer.from(await (await fetch(url)).arrayBuffer());
-  const wb = XLSX.read(buf, { type: "buffer" });
+  return XLSX.read(buf, { type: "buffer" });
+}
+
+// Parse every tab into arrays-of-arrays. Returns { title: rows[][] }. The direct
+// cell-values API is faster but its range params are undocumented for reads;
+// export is reliable and gives all tabs in one shot.
+async function exportWorkbook(apiId) {
+  const wb = await downloadWorkbook(apiId);
   // The export pads to the sheet's used range, so trim it: drop fully-blank
   // rows (padding / blank separators), then keep only columns that have a
   // non-blank header (row 0) — dropping padding and any unlabelled column.
@@ -120,7 +125,54 @@ async function exportWorkbook(apiId) {
   return byTitle;
 }
 
-module.exports = { toApiId, poApiId, getTabs, exportWorkbook, PO_FILE };
+// Raw (untrimmed) rows for one tab — keeps real column positions + row indices,
+// which the trimmed exportWorkbook loses. Needed to locate where to append.
+async function getSheetRawRows(apiId, title) {
+  const wb = await downloadWorkbook(apiId);
+  const name = wb.SheetNames.find((n) => n === title);
+  if (!name) throw new Error(`Sheet "${title}" not found`);
+  return XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, defval: "", raw: false });
+}
+
+// Look up a tab's sheetID (used in write ranges) via the sheetbook API.
+async function getSheetId(apiId, title) {
+  const r = await (
+    await fetch(`${BASE}/sheetbook/v2/${encodeURIComponent(apiId)}/sheets-info`, {
+      headers: headers(),
+    })
+  ).json();
+  const list = (r && r.data && r.data.sheetData) || [];
+  const s = list.find((x) => x.title === title);
+  return s ? s.sheetID : null;
+}
+
+// Write a 2-D array of values into a range. range is A1 notation WITHOUT the
+// sheet prefix (e.g. "A5:K5"); sheetId is prepended. PUT overwrites those cells.
+async function putValues(apiId, sheetId, rangeA1, values) {
+  const range = `${sheetId}!${rangeA1}`;
+  const url = `${BASE}/sheetbook/v2/${encodeURIComponent(apiId)}/values/${encodeURIComponent(range)}`;
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ values }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!(r.ok && (j.ret === 0 || j.code === 0 || j.msg === "Succeed"))) {
+    throw new Error(`Tencent write failed (${r.status}): ${JSON.stringify(j).slice(0, 200)}`);
+  }
+  return j;
+}
+
+module.exports = {
+  toApiId,
+  poApiId,
+  getTabs,
+  exportWorkbook,
+  getSheetRawRows,
+  getSheetId,
+  putValues,
+  PO_FILE,
+};
 
 // NOTE ON TOKEN EXPIRY: TENCENT_ACCESS_TOKEN is an OAuth2 access token and will
 // expire. When it does, these calls start returning auth errors. To keep this

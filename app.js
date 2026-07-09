@@ -50,6 +50,8 @@ var aiQueryRouter = require('./routes/aiQueryRoutes/index');
 // the public ingestion webhook is inflowWebhookRoutes (mounted below).
 var inflowRouter = require('./routes/inflowRoutes/index');
 var inflowWebhookRouter = require('./routes/inflowWebhookRoutes/index');
+// Public daily-cron trigger for the Purchase Order UPDATE sync (Tencent → DB).
+var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -113,6 +115,9 @@ app.use('/integration/shipment', shipmentWebhookRouter);
 // InFlow sales-order ingestion webhook — GET/POST /integration/inflow. Public
 // (optional INFLOW_WEBHOOK_SECRET shared secret inside the router).
 app.use('/integration/inflow', inflowWebhookRouter);
+// Purchase Order daily update sync — GET/POST /integration/purchaseOrderSync.
+// Public; protected by the PO_SYNC_SECRET shared secret inside the router.
+app.use('/integration/purchaseOrderSync', purchaseOrderSyncRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
