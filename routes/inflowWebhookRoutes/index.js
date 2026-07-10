@@ -24,6 +24,22 @@ const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
 const VENDORS = "inflow_vendors";
 
+// Canonical vendor display names, keyed by the lowercased/whitespace-collapsed
+// invoice title. Different casings or spacings of the same company on incoming
+// invoices ("Ess International Pty LTD" / "...LTd") collapse to one entry so the
+// dashboard groups them together. Add an alias by mapping its key to the wanted
+// display name.
+const VENDOR_CANONICAL = {
+  "ess international pty ltd": "Ess International Pty Ltd",
+};
+
+function canonicalVendor(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return trimmed;
+  const key = trimmed.toLowerCase().replace(/\s+/g, " ");
+  return VENDOR_CANONICAL[key] || trimmed;
+}
+
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
@@ -78,7 +94,7 @@ async function handleWebhook(req, res) {
     const db = await connectToDatabase();
     const now = new Date();
     const customerName = String(p.customerName || "").trim();
-    const vendorName = String(p.vendor || "").trim();
+    const vendorName = canonicalVendor(p.vendor);
 
     const customerId = await upsertNamed(db, CUSTOMERS, customerName, now);
     const vendorId = await upsertNamed(db, VENDORS, vendorName, now);
