@@ -365,40 +365,70 @@ async function updatePurchaseOrders(db) {
 // for the purchase team to fill in later, matching the manual workflow.
 const WRITE_KEYS = ["orderDate", "sku", "productName", "orderQty"];
 
-async function appendPurchaseOrderRow(rec) {
+// Append one or more newly-created POs to the Tencent sheet(s). Records are
+// grouped by category (each category is its own sheet/tab) and each category is
+// written in a single export + single write — so a 10-item batch spanning two
+// categories costs 2 exports, not 10. Writes only the warehouse-stage columns
+// (订货日期 / SKU / 品名 / 订货数量); note + zoho_id stay in our DB and the
+// purchase/ship/receive columns are left blank for the team to fill in later.
+async function appendPurchaseOrderRows(records) {
   const apiId = poApiId();
-  const rawRows = await getSheetRawRows(apiId, rec.category);
-  if (!rawRows || !rawRows.length) throw new Error(`Sheet "${rec.category}" has no rows`);
-  const header = rawRows[0];
+  const list = (Array.isArray(records) ? records : [records]).filter(Boolean);
+  if (!list.length) return { written: [] };
 
-  // Append on the row AFTER the last one that has any content (1-based for A1).
-  let lastUsed = 0;
-  for (let i = 0; i < rawRows.length; i++) {
-    if ((rawRows[i] || []).some((c) => String(c == null ? "" : c).trim() !== "")) lastUsed = i;
-  }
-  const appendRow1 = lastUsed + 2;
-
-  // Map each write field to its real column via the same header predicates.
-  const colOf = {};
-  for (const key of WRITE_KEYS) {
-    const f = FIELDS.find((x) => x.key === key);
-    colOf[key] = f ? findCol(header, f) : -1;
-  }
-  const present = Object.values(colOf).filter((c) => c >= 0);
-  if (!present.length) throw new Error(`No writable columns in "${rec.category}"`);
-  const maxCol = Math.max(...present);
-
-  const values = { orderDate: rec.orderDate, sku: rec.sku, productName: rec.productName, orderQty: rec.orderQty };
-  const row = new Array(maxCol + 1).fill("");
-  for (const key of WRITE_KEYS) {
-    if (colOf[key] >= 0) row[colOf[key]] = values[key] == null ? "" : String(values[key]);
+  // Group by category, preserving insertion order.
+  const byCat = new Map();
+  for (const rec of list) {
+    if (!byCat.has(rec.category)) byCat.set(rec.category, []);
+    byCat.get(rec.category).push(rec);
   }
 
-  const sheetId = await getSheetId(apiId, rec.category);
-  if (!sheetId) throw new Error(`Sheet id not found for "${rec.category}"`);
-  const rangeA1 = `A${appendRow1}:${XLSX.utils.encode_col(maxCol)}${appendRow1}`;
-  await putValues(apiId, sheetId, rangeA1, [row]);
-  return { row: appendRow1, range: rangeA1 };
+  const written = [];
+  for (const [category, recs] of byCat) {
+    const rawRows = await getSheetRawRows(apiId, category);
+    if (!rawRows || !rawRows.length) throw new Error(`Sheet "${category}" has no rows`);
+    const header = rawRows[0];
+
+    // Append on the row AFTER the last one that has any content (1-based for A1).
+    let lastUsed = 0;
+    for (let i = 0; i < rawRows.length; i++) {
+      if ((rawRows[i] || []).some((c) => String(c == null ? "" : c).trim() !== "")) lastUsed = i;
+    }
+    const appendRow1 = lastUsed + 2;
+
+    // Map each write field to its real column via the same header predicates.
+    const colOf = {};
+    for (const key of WRITE_KEYS) {
+      const f = FIELDS.find((x) => x.key === key);
+      colOf[key] = f ? findCol(header, f) : -1;
+    }
+    const present = Object.values(colOf).filter((c) => c >= 0);
+    if (!present.length) throw new Error(`No writable columns in "${category}"`);
+    const maxCol = Math.max(...present);
+
+    const rows = recs.map((rec) => {
+      const values = { orderDate: rec.orderDate, sku: rec.sku, productName: rec.productName, orderQty: rec.orderQty };
+      const row = new Array(maxCol + 1).fill("");
+      for (const key of WRITE_KEYS) {
+        if (colOf[key] >= 0) row[colOf[key]] = values[key] == null ? "" : String(values[key]);
+      }
+      return row;
+    });
+
+    const sheetId = await getSheetId(apiId, category);
+    if (!sheetId) throw new Error(`Sheet id not found for "${category}"`);
+    const lastRow1 = appendRow1 + rows.length - 1;
+    const rangeA1 = `A${appendRow1}:${XLSX.utils.encode_col(maxCol)}${lastRow1}`;
+    await putValues(apiId, sheetId, rangeA1, rows);
+    written.push({ category, count: rows.length, range: rangeA1 });
+  }
+  return { written };
+}
+
+// Back-compat single-row helper (used by the single Create PO in Stock Monitoring).
+async function appendPurchaseOrderRow(rec) {
+  const { written } = await appendPurchaseOrderRows([rec]);
+  return { range: written[0] ? written[0].range : null };
 }
 
 module.exports = {
@@ -407,6 +437,7 @@ module.exports = {
   updatePurchaseOrders,
   resolveZohoIds,
   appendPurchaseOrderRow,
+  appendPurchaseOrderRows,
   COLLECTION,
   META,
 };

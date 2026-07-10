@@ -14,7 +14,9 @@ const { poApiId, getTabs, exportWorkbook } = require("../../utils/tencentDocs");
 const { connectToDatabase } = require("../../utils/mongodb");
 const {
   syncPurchaseOrders,
+  updatePurchaseOrders,
   appendPurchaseOrderRow,
+  appendPurchaseOrderRows,
   COLLECTION: PO_COLLECTION,
   META: PO_META,
 } = require("../../utils/purchaseOrderSync");
@@ -23,6 +25,61 @@ const VIEW = requirePermission("po:order:view");
 
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Order date in the sheet's native format: YYYY-M-D with NO leading zeros
+// (e.g. "2026-7-10"), matching the purchase team's existing rows. A zero-padded
+// value ("2026-07-10") trips the date column's data validation in Tencent Docs.
+// Computed in the business timezone so it doesn't drift a day at UTC midnight.
+function melbourneOrderDate(now) {
+  const parts = new Intl.DateTimeFormat("en-AU", {
+    timeZone: "Australia/Melbourne",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+  })
+    .formatToParts(now)
+    .reduce((acc, part) => ((acc[part.type] = part.value), acc), {});
+  // Coerce to numbers to strip any locale-added leading zeros ("07" → "7").
+  return `${+parts.year}-${+parts.month}-${+parts.day}`;
+}
+
+// Validate one Create-PO item; returns an error string or null.
+function poItemError(b) {
+  const category = String((b && b.category) || "").trim();
+  const orderQty = Number(b && b.orderQty);
+  const sku = String((b && b.sku) || "").trim();
+  const productName = String((b && b.productName) || "").trim();
+  if (!category) return "Category is required.";
+  if (!Number.isFinite(orderQty) || orderQty <= 0) return "A positive quantity is required.";
+  if (!sku && !productName) return "A product (SKU or name) is required.";
+  return null;
+}
+
+// Build a dashboard-sourced PO record from a request item.
+function poItemToRecord(b, orderDate, now, createdBy) {
+  return {
+    category: String(b.category || "").trim(),
+    orderDate,
+    sku: String(b.sku || "").trim(),
+    productName: String(b.productName || "").trim(),
+    orderQty: Number(b.orderQty),
+    unitPrice: null,
+    supplier: "",
+    orderedAt: "",
+    shippedQty: null,
+    shippedDate: "",
+    dhlTracking: "",
+    receivedDate: "",
+    note: String(b.note || "").trim(),
+    status: "pending",
+    lineTotal: null,
+    zoho_id: b.zoho_id != null && String(b.zoho_id).trim() ? String(b.zoho_id).trim() : null,
+    source: "dashboard",
+    createdBy: createdBy || null,
+    createdAt: now,
+    syncedAt: now,
+  };
 }
 
 // Cache the parsed workbook — an export takes a few seconds and returns the
@@ -120,6 +177,25 @@ router.post("/sync", VIEW, async function (req, res) {
   }
 });
 
+// ── POST /purchaseOrder/updateSync ──────────────────────────────────
+// Incremental sync: pull the Tencent sheet and apply the purchase team's edits
+// to the matching DB rows (updates changed columns, inserts new rows, deletes
+// nothing — dashboard-created rows and our note/zoho_id are preserved). Same
+// logic the daily cron runs; this is the manual, in-app trigger. Slow — it
+// exports the whole workbook.
+router.post("/updateSync", VIEW, async function (req, res) {
+  try {
+    const db = await connectToDatabase();
+    const result = await updatePurchaseOrders(db);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error("PO update sync error:", error);
+    return res
+      .status(502)
+      .json({ success: false, message: error.message || "Update sync failed" });
+  }
+});
+
 // ── GET /purchaseOrder/records ──────────────────────────────────────
 // Read the synced collection — paginated, filterable by category / status /
 // free-text (SKU, product, supplier, DHL#).
@@ -198,46 +274,12 @@ router.get("/categories", VIEW, async function (req, res) {
 router.post("/create", VIEW, async function (req, res) {
   try {
     const b = req.body || {};
-    const category = String(b.category || "").trim();
-    const orderQty = Number(b.orderQty);
-    const sku = String(b.sku || "").trim();
-    const productName = String(b.productName || "").trim();
-    const note = String(b.note || "").trim();
-    const zoho_id = b.zoho_id != null && String(b.zoho_id).trim() ? String(b.zoho_id).trim() : null;
-
-    if (!category) return res.status(400).json({ success: false, message: "Category is required." });
-    if (!Number.isFinite(orderQty) || orderQty <= 0) {
-      return res.status(400).json({ success: false, message: "A positive quantity is required." });
-    }
-    if (!sku && !productName) {
-      return res.status(400).json({ success: false, message: "A product (SKU or name) is required." });
-    }
+    const err = poItemError(b);
+    if (err) return res.status(400).json({ success: false, message: err });
 
     const now = new Date();
-    const p = (n) => String(n).padStart(2, "0");
-    const orderDate = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`;
-    const rec = {
-      category,
-      orderDate,
-      sku,
-      productName,
-      orderQty,
-      unitPrice: null,
-      supplier: "",
-      orderedAt: "",
-      shippedQty: null,
-      shippedDate: "",
-      dhlTracking: "",
-      receivedDate: "",
-      note,
-      status: "pending",
-      lineTotal: null,
-      zoho_id,
-      source: "dashboard",
-      createdBy: (req.user && (req.user.username || req.user.email)) || null,
-      createdAt: now,
-      syncedAt: now,
-    };
+    const createdBy = (req.user && (req.user.username || req.user.email)) || null;
+    const rec = poItemToRecord(b, melbourneOrderDate(now), now, createdBy);
 
     const db = await connectToDatabase();
     const r = await db.collection(PO_COLLECTION).insertOne(rec);
@@ -263,6 +305,52 @@ router.post("/create", VIEW, async function (req, res) {
   } catch (error) {
     console.error("PO create error:", error);
     return res.status(500).json({ success: false, message: "Failed to create purchase order" });
+  }
+});
+
+// ── POST /purchaseOrder/createBatch ─────────────────────────────────
+// Create several POs at once (from the PO page). Each item carries its own
+// category / quantity / note / product. All are inserted (source:"dashboard"),
+// then appended to the Tencent sheet grouped by category — one export + write
+// per distinct category. The Tencent write is non-fatal (DB is the record).
+router.post("/createBatch", VIEW, async function (req, res) {
+  try {
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, message: "No items provided." });
+    if (items.length > 100) return res.status(400).json({ success: false, message: "Too many items (max 100)." });
+
+    // Validate all up-front so we never insert a partial batch.
+    for (let i = 0; i < items.length; i++) {
+      const err = poItemError(items[i]);
+      if (err) return res.status(400).json({ success: false, message: `Item ${i + 1}: ${err}` });
+    }
+
+    const now = new Date();
+    const orderDate = melbourneOrderDate(now);
+    const createdBy = (req.user && (req.user.username || req.user.email)) || null;
+    const records = items.map((b) => poItemToRecord(b, orderDate, now, createdBy));
+
+    const db = await connectToDatabase();
+    const r = await db.collection(PO_COLLECTION).insertMany(records);
+    records.forEach((rec, i) => { rec._id = r.insertedIds[i]; });
+
+    let tencentWritten = false;
+    let tencentError = null;
+    try {
+      await appendPurchaseOrderRows(records);
+      tencentWritten = true;
+    } catch (e) {
+      tencentError = (e && e.message) || String(e);
+      console.error("PO batch Tencent write-back failed:", tencentError);
+    }
+
+    const byCategory = {};
+    for (const rec of records) byCategory[rec.category] = (byCategory[rec.category] || 0) + 1;
+
+    return res.json({ success: true, created: records.length, byCategory, tencentWritten, tencentError });
+  } catch (error) {
+    console.error("PO createBatch error:", error);
+    return res.status(500).json({ success: false, message: "Failed to create purchase orders" });
   }
 });
 
