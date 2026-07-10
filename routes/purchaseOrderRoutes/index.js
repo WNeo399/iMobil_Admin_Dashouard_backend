@@ -9,12 +9,14 @@
 
 var express = require("express");
 var router = express.Router();
+const { ObjectId } = require("mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { poApiId, getTabs, exportWorkbook } = require("../../utils/tencentDocs");
 const { connectToDatabase } = require("../../utils/mongodb");
 const {
   syncPurchaseOrders,
   updatePurchaseOrders,
+  updatePurchaseOrderRow,
   appendPurchaseOrderRow,
   appendPurchaseOrderRows,
   COLLECTION: PO_COLLECTION,
@@ -42,6 +44,22 @@ function melbourneOrderDate(now) {
     .reduce((acc, part) => ((acc[part.type] = part.value), acc), {});
   // Coerce to numbers to strip any locale-added leading zeros ("07" → "7").
   return `${+parts.year}-${+parts.month}-${+parts.day}`;
+}
+
+// Order timestamp for 下单时间 — "YYYY-M-D HH:mm" in Melbourne time.
+function melbourneOrderDateTime(now) {
+  const p = new Intl.DateTimeFormat("en-AU", {
+    timeZone: "Australia/Melbourne",
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .formatToParts(now)
+    .reduce((acc, part) => ((acc[part.type] = part.value), acc), {});
+  return `${+p.year}-${+p.month}-${+p.day} ${p.hour}:${p.minute}`;
 }
 
 // Validate one Create-PO item; returns an error string or null.
@@ -205,16 +223,22 @@ router.get("/records", VIEW, async function (req, res) {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 50, 1), 500);
 
-    const match = {};
-    if (req.query.category) match.category = String(req.query.category);
-    if (req.query.status) match.status = String(req.query.status);
-    // "Not yet received" = everything except the received (收到日期 filled) stage.
-    else if (String(req.query.notReceived) === "true") match.status = { $ne: "received" };
+    // Base match — everything EXCEPT the status / not-received filter, so the
+    // KPI status breakdown can show every status for the current view.
+    const base = {};
+    if (req.query.category) base.category = String(req.query.category);
+    if (req.query.supplier) base.supplier = String(req.query.supplier);
     const search = String(req.query.search || "").trim();
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
-      match.$or = [{ sku: rx }, { productName: rx }, { supplier: rx }, { dhlTracking: rx }];
+      base.$or = [{ sku: rx }, { productName: rx }, { supplier: rx }, { dhlTracking: rx }];
     }
+
+    // Table match adds the status / not-received filter on top of the base.
+    const match = { ...base };
+    if (req.query.status) match.status = String(req.query.status);
+    // "Not yet received" = everything except the received (收到日期 filled) stage.
+    else if (String(req.query.notReceived) === "true") match.status = { $ne: "received" };
 
     const col = db.collection(PO_COLLECTION);
     const total = await col.countDocuments(match);
@@ -237,6 +261,28 @@ router.get("/records", VIEW, async function (req, res) {
     const byCategoryOpen = {};
     for (const r of openAgg) byCategoryOpen[r._id] = r.n;
 
+    // Status breakdown for the KPI cards — over the base match (category /
+    // supplier / search), independent of the currently-selected status.
+    const statusAgg = await col
+      .aggregate([{ $match: base }, { $group: { _id: "$status", n: { $sum: 1 } } }])
+      .toArray();
+    const byStatus = {};
+    for (const r of statusAgg) byStatus[r._id || "unknown"] = r.n;
+
+    // Supplier list for the dropdown — within the current category (not narrowed
+    // by the selected supplier), busiest first.
+    const supMatch = { supplier: { $nin: ["", null] } };
+    if (req.query.category) supMatch.category = String(req.query.category);
+    const supAgg = await col
+      .aggregate([
+        { $match: supMatch },
+        { $group: { _id: "$supplier", n: { $sum: 1 } } },
+        { $sort: { n: -1 } },
+        { $limit: 200 },
+      ])
+      .toArray();
+    const suppliers = supAgg.map((r) => r._id);
+
     return res.json({
       success: true,
       page,
@@ -246,6 +292,8 @@ router.get("/records", VIEW, async function (req, res) {
       lastSyncedAt: meta ? meta.lastSyncedAt : null,
       byCategory: meta ? meta.byCategory : {},
       byCategoryOpen,
+      byStatus,
+      suppliers,
     });
   } catch (error) {
     console.error("PO records error:", error);
@@ -351,6 +399,169 @@ router.post("/createBatch", VIEW, async function (req, res) {
   } catch (error) {
     console.error("PO createBatch error:", error);
     return res.status(500).json({ success: false, message: "Failed to create purchase orders" });
+  }
+});
+
+// ── POST /purchaseOrder/placeOrder ──────────────────────────────────
+// Mark a pending PO as ordered: set 供应商 (required) + 采购单价 (optional),
+// stamp 下单时间 = now, and move status → "ordered". Writes the same fields back
+// to the Tencent sheet row (non-fatal) so the sheet stays authoritative and the
+// next sync doesn't revert them.
+router.post("/placeOrder", VIEW, async function (req, res) {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || "");
+    const supplier = String(b.supplier || "").trim();
+    const hasPrice = b.unitPrice != null && String(b.unitPrice).trim() !== "";
+    const unitPrice = hasPrice ? Number(b.unitPrice) : null;
+
+    if (!id) return res.status(400).json({ success: false, message: "id is required." });
+    if (hasPrice && (!Number.isFinite(unitPrice) || unitPrice < 0)) {
+      return res.status(400).json({ success: false, message: "采购单价 must be a valid non-negative number." });
+    }
+
+    let _id;
+    try { _id = new ObjectId(id); } catch (e) {
+      return res.status(400).json({ success: false, message: "invalid id." });
+    }
+
+    const db = await connectToDatabase();
+    const col = db.collection(PO_COLLECTION);
+    const rec = await col.findOne({ _id });
+    if (!rec) return res.status(404).json({ success: false, message: "PO not found." });
+
+    const orderedAt = melbourneOrderDateTime(new Date());
+    // 供应商 + 采购单价 are both optional. Clear any 缺货 / 已取消 flag — placing the
+    // order supersedes them.
+    const set = { orderedAt, status: "ordered", shortage: false, cancelled: false, syncedAt: new Date() };
+    if (supplier) set.supplier = supplier;
+    if (hasPrice) {
+      set.unitPrice = unitPrice;
+      set.lineTotal = rec.orderQty != null ? Math.round(rec.orderQty * unitPrice * 100) / 100 : null;
+    }
+    await col.updateOne({ _id }, { $set: set });
+
+    // Mirror the order details into the Tencent sheet row (non-fatal).
+    let tencentWritten = false;
+    let tencentError = null;
+    try {
+      const fields = { orderedAt };
+      if (supplier) fields.supplier = supplier;
+      if (hasPrice) fields.unitPrice = unitPrice;
+      await updatePurchaseOrderRow(rec, fields);
+      tencentWritten = true;
+    } catch (e) {
+      tencentError = (e && e.message) || String(e);
+      console.error("PO placeOrder Tencent write-back failed:", tencentError);
+    }
+
+    return res.json({ success: true, status: "ordered", orderedAt, tencentWritten, tencentError });
+  } catch (error) {
+    console.error("PO placeOrder error:", error);
+    return res.status(500).json({ success: false, message: "Failed to place order" });
+  }
+});
+
+// ── POST /purchaseOrder/markShortage ────────────────────────────────
+// Mark a PO as 缺货 (out of stock). This is a dashboard-only flag (there's no
+// sheet column for it) — deriveStatus honours `shortage`, so it survives the
+// incremental sync. DB-only; nothing is written back to Tencent.
+router.post("/markShortage", VIEW, async function (req, res) {
+  try {
+    const id = String((req.body && req.body.id) || "");
+    if (!id) return res.status(400).json({ success: false, message: "id is required." });
+    let _id;
+    try { _id = new ObjectId(id); } catch (e) {
+      return res.status(400).json({ success: false, message: "invalid id." });
+    }
+    const db = await connectToDatabase();
+    const r = await db.collection(PO_COLLECTION).updateOne(
+      { _id },
+      { $set: { shortage: true, cancelled: false, status: "shortage", syncedAt: new Date() } },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "PO not found." });
+    return res.json({ success: true, status: "shortage" });
+  } catch (error) {
+    console.error("PO markShortage error:", error);
+    return res.status(500).json({ success: false, message: "Failed to mark shortage" });
+  }
+});
+
+// ── POST /purchaseOrder/cancelOrder ─────────────────────────────────
+// Mark a PO as 已取消 (cancelled). Dashboard-only flag (no sheet column) —
+// deriveStatus honours `cancelled`, so it survives the incremental sync.
+router.post("/cancelOrder", VIEW, async function (req, res) {
+  try {
+    const id = String((req.body && req.body.id) || "");
+    if (!id) return res.status(400).json({ success: false, message: "id is required." });
+    let _id;
+    try { _id = new ObjectId(id); } catch (e) {
+      return res.status(400).json({ success: false, message: "invalid id." });
+    }
+    const db = await connectToDatabase();
+    const r = await db.collection(PO_COLLECTION).updateOne(
+      { _id },
+      { $set: { cancelled: true, shortage: false, status: "cancelled", syncedAt: new Date() } },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "PO not found." });
+    return res.json({ success: true, status: "cancelled" });
+  } catch (error) {
+    console.error("PO cancelOrder error:", error);
+    return res.status(500).json({ success: false, message: "Failed to cancel order" });
+  }
+});
+
+// ── POST /purchaseOrder/updateDetail ────────────────────────────────
+// Edit an order's 备注 (DB-only — never overwritten by sync) and 订单数量. The
+// quantity is part of the row's match key, so a change is mirrored to the sheet
+// (non-fatal) to keep the next sync from duplicating the row.
+router.post("/updateDetail", VIEW, async function (req, res) {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || "");
+    if (!id) return res.status(400).json({ success: false, message: "id is required." });
+    let _id;
+    try { _id = new ObjectId(id); } catch (e) {
+      return res.status(400).json({ success: false, message: "invalid id." });
+    }
+    const db = await connectToDatabase();
+    const col = db.collection(PO_COLLECTION);
+    const rec = await col.findOne({ _id });
+    if (!rec) return res.status(404).json({ success: false, message: "PO not found." });
+
+    const note = String(b.note || "").trim();
+    const hasQty = b.orderQty != null && String(b.orderQty).trim() !== "";
+    const orderQty = hasQty ? Number(b.orderQty) : rec.orderQty;
+    if (hasQty && (!Number.isFinite(orderQty) || orderQty <= 0)) {
+      return res.status(400).json({ success: false, message: "订单数量 must be a positive number." });
+    }
+
+    const set = { note, syncedAt: new Date() };
+    // 订单数量 can only change while the PO is still 待处理 (pending).
+    const qtyChanged = hasQty && orderQty !== rec.orderQty && rec.status === "pending";
+    if (qtyChanged) {
+      set.orderQty = orderQty;
+      set.lineTotal = rec.unitPrice != null ? Math.round(orderQty * rec.unitPrice * 100) / 100 : rec.lineTotal;
+    }
+    await col.updateOne({ _id }, { $set: set });
+
+    // Quantity is part of the match key → mirror it to the sheet (non-fatal).
+    let tencentWritten = null;
+    let tencentError = null;
+    if (qtyChanged) {
+      tencentWritten = false;
+      try {
+        await updatePurchaseOrderRow(rec, { orderQty });
+        tencentWritten = true;
+      } catch (e) {
+        tencentError = (e && e.message) || String(e);
+        console.error("PO updateDetail Tencent write-back failed:", tencentError);
+      }
+    }
+    return res.json({ success: true, orderQty, note, tencentWritten, tencentError });
+  } catch (error) {
+    console.error("PO updateDetail error:", error);
+    return res.status(500).json({ success: false, message: "Failed to update order" });
   }
 });
 

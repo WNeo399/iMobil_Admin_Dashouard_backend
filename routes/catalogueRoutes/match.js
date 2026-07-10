@@ -26,10 +26,14 @@ const GATE = requireAnyPermission("zoho:salesOrder:create", "zoho:collection:vie
 // Per-category quality fallback chains. When a line's requested grade isn't
 // stocked for that model, try these (in order) before declaring NO_QUALITY.
 // Keys are normalised (lowercase) category + requested-quality. Configurable here.
+//   screen: "JK+" → IMB+ (a model without JK+ screens falls back to IMB+)
 //   frame: "No Small Parts" → A+ / IMB (strategy §4a)
 //   back-cover-glass: "High Quality with Lens" → Original / Aftermarket, so a
 //     "Back Cover" line still matches on models that only carry those grades.
 const QUALITY_FALLBACK = {
+  screen: {
+    "jk+": ["IMB+"],
+  },
   frame: {
     "no small parts": ["A+", "IMB"],
   },

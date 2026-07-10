@@ -113,6 +113,10 @@ function findCol(header, field) {
 }
 
 function deriveStatus(rec) {
+  // "已取消"/"缺货" are manual, dashboard-only flags (no sheet columns), so they
+  // take precedence and survive the sync's status recompute.
+  if (rec.cancelled) return "cancelled";
+  if (rec.shortage) return "shortage";
   if (rec.receivedDate) return "received";
   if (rec.shippedDate || rec.dhlTracking || rec.shippedQty != null) return "shipped";
   if (rec.orderedAt || rec.supplier || rec.unitPrice != null) return "ordered";
@@ -449,10 +453,56 @@ async function appendPurchaseOrderRow(rec) {
   return { range: written[0] ? written[0].range : null };
 }
 
+// Update specific columns of the EXISTING sheet row a record came from (its
+// sourceRow) — used when the dashboard fills in later-stage fields (e.g. marking
+// a pending PO as ordered writes 供应商 / 下单时间 / 采购单价 back to the sheet, so
+// the sheet stays the source of truth and the next sync doesn't revert them).
+// `fields` is a { fieldKey: value } map (keys from FIELDS). Verifies the row
+// still matches the record (SKU) before writing — rows can shift if the sheet was
+// edited since the last sync. Only works for tencent-sourced rows (with sourceRow).
+async function updatePurchaseOrderRow(record, fields) {
+  if (!record || record.sourceRow == null) {
+    throw new Error("This PO has no linked sheet row yet — re-sync before editing it in the sheet.");
+  }
+  const apiId = poApiId();
+  const category = record.category;
+  const rawRows = await getSheetRawRows(apiId, category);
+  if (!rawRows || !rawRows.length) throw new Error(`Sheet "${category}" has no rows`);
+  const header = rawRows[0];
+
+  // A1 row = sourceRow + 1 (raw row 0 = header = A1 row 1).
+  const row1 = record.sourceRow + 1;
+
+  // Safety: confirm the row still holds this record before writing to it.
+  const targetRaw = rawRows[record.sourceRow] || [];
+  const skuField = FIELDS.find((f) => f.key === "sku");
+  const skuCol = skuField ? findCol(header, skuField) : -1;
+  const rowSku = skuCol >= 0 ? cleanStr(targetRaw[skuCol]) : "";
+  if (record.sku && rowSku && rowSku !== cleanStr(record.sku)) {
+    throw new Error(`Sheet row ${row1} no longer matches this PO (SKU mismatch) — re-sync first.`);
+  }
+
+  const sheetId = await getSheetId(apiId, category);
+  if (!sheetId) throw new Error(`Sheet id not found for "${category}"`);
+
+  const written = [];
+  for (const [key, value] of Object.entries(fields)) {
+    const f = FIELDS.find((x) => x.key === key);
+    const col = f ? findCol(header, f) : -1;
+    if (col < 0) continue; // column not present in this sheet — skip
+    const colLetter = XLSX.utils.encode_col(col);
+    const range = `${colLetter}${row1}:${colLetter}${row1}`;
+    await putValues(apiId, sheetId, range, [[value == null ? "" : String(value)]]);
+    written.push(key);
+  }
+  return { row: row1, written };
+}
+
 module.exports = {
   buildPurchaseOrderRecords,
   syncPurchaseOrders,
   updatePurchaseOrders,
+  updatePurchaseOrderRow,
   resolveZohoIds,
   appendPurchaseOrderRow,
   appendPurchaseOrderRows,
