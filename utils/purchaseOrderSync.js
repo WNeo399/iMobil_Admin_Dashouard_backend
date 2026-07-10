@@ -46,6 +46,12 @@ const FIELDS = [
   { key: "note", test: (h) => h.includes("备注") },
 ];
 
+// A dashboard-created PO stores its note UNDER the product name in the 品名 cell
+// (so it's visible in the sheet next to the product), separated by this marker.
+// buildPurchaseOrderRecords splits it back out on read so productName stays clean
+// for row-matching and the note is recovered.
+const NOTE_MARKER = "\n备注：";
+
 function cleanStr(v) {
   return String(v == null ? "" : v).trim();
 }
@@ -148,6 +154,14 @@ async function buildPurchaseOrderRecords() {
       for (const f of FIELDS) {
         const raw = cols[f.key] >= 0 ? row[cols[f.key]] : "";
         rec[f.key] = f.num ? toNum(raw) : cleanStr(raw);
+      }
+      // Recover a note we wrote under the product name, keeping productName clean
+      // (the update sync matches on it). Don't clobber a real 备注-column value.
+      if (rec.productName && rec.productName.includes(NOTE_MARKER)) {
+        const i = rec.productName.indexOf(NOTE_MARKER);
+        const embedded = rec.productName.slice(i + NOTE_MARKER.length).trim();
+        rec.productName = rec.productName.slice(0, i).trim();
+        if (!rec.note) rec.note = embedded;
       }
       if (!rec.sku && !rec.productName && rec.orderQty == null && !rec.orderDate) continue;
       rec.status = deriveStatus(rec);
@@ -407,7 +421,11 @@ async function appendPurchaseOrderRows(records) {
     const maxCol = Math.max(...present);
 
     const rows = recs.map((rec) => {
-      const values = { orderDate: rec.orderDate, sku: rec.sku, productName: rec.productName, orderQty: rec.orderQty };
+      // Put the note under the product name in the 品名 cell (name\n备注：note).
+      const productNameCell = rec.note
+        ? `${rec.productName}${NOTE_MARKER}${rec.note}`
+        : rec.productName;
+      const values = { orderDate: rec.orderDate, sku: rec.sku, productName: productNameCell, orderQty: rec.orderQty };
       const row = new Array(maxCol + 1).fill("");
       for (const key of WRITE_KEYS) {
         if (colOf[key] >= 0) row[colOf[key]] = values[key] == null ? "" : String(values[key]);
