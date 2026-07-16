@@ -242,11 +242,29 @@ router.get("/records", VIEW, async function (req, res) {
 
     const col = db.collection(PO_COLLECTION);
     const total = await col.countDocuments(match);
+    // Sort by 订单日期 oldest → newest. orderDate is "YYYY-M-D" (no zero-padding),
+    // so a string sort misorders it — build a numeric YYYYMMDD key instead. Empty
+    // or unparseable dates fall to ~99999999 and sort last.
     const rows = await col
-      .find(match)
-      .sort({ category: 1, sourceRow: 1 })
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
+      .aggregate([
+        { $match: match },
+        { $addFields: { _od: { $split: [{ $ifNull: ["$orderDate", ""] }, "-"] } } },
+        {
+          $addFields: {
+            _odKey: {
+              $add: [
+                { $multiply: [{ $convert: { input: { $arrayElemAt: ["$_od", 0] }, to: "int", onError: 9999, onNull: 9999 } }, 10000] },
+                { $multiply: [{ $convert: { input: { $arrayElemAt: ["$_od", 1] }, to: "int", onError: 99, onNull: 99 } }, 100] },
+                { $convert: { input: { $arrayElemAt: ["$_od", 2] }, to: "int", onError: 99, onNull: 99 } },
+              ],
+            },
+          },
+        },
+        { $sort: { _odKey: 1, sourceRow: 1 } },
+        { $skip: (page - 1) * pageSize },
+        { $limit: pageSize },
+        { $project: { _od: 0, _odKey: 0 } },
+      ])
       .toArray();
     const meta = await db.collection(PO_META).findOne({ _id: "meta" });
 
@@ -508,6 +526,36 @@ router.post("/cancelOrder", VIEW, async function (req, res) {
   } catch (error) {
     console.error("PO cancelOrder error:", error);
     return res.status(500).json({ success: false, message: "Failed to cancel order" });
+  }
+});
+
+// ── POST /purchaseOrder/quotePrice ──────────────────────────────────
+// Record a 采购单价 quote for a pending / shortage PO. Stored in a dashboard-only
+// `quotedPrice` field — it does NOT change the status (a quote isn't an order),
+// isn't written to the sheet, and survives the sync (not a sync-managed field).
+router.post("/quotePrice", VIEW, async function (req, res) {
+  try {
+    const b = req.body || {};
+    const id = String(b.id || "");
+    if (!id) return res.status(400).json({ success: false, message: "id is required." });
+    const unitPrice = Number(b.unitPrice);
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+      return res.status(400).json({ success: false, message: "采购单价 must be a valid non-negative number." });
+    }
+    let _id;
+    try { _id = new ObjectId(id); } catch (e) {
+      return res.status(400).json({ success: false, message: "invalid id." });
+    }
+    const db = await connectToDatabase();
+    const r = await db.collection(PO_COLLECTION).updateOne(
+      { _id },
+      { $set: { quotedPrice: unitPrice, syncedAt: new Date() } },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "PO not found." });
+    return res.json({ success: true, quotedPrice: unitPrice });
+  } catch (error) {
+    console.error("PO quotePrice error:", error);
+    return res.status(500).json({ success: false, message: "Failed to save quote" });
   }
 });
 

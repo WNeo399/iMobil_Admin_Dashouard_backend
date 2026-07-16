@@ -90,6 +90,81 @@ router.get("/skuLookup", requireAnyPermission("sqt:case:sendParts", "zoho:collec
   }
 });
 
+// Barcode-label data for one SKU: product name + Selling Price (the item's
+// Sales Price) + Platinum-pricebook rate — everything the Tools → Barcode
+// Generator needs to print a product label. Same Analytics views as /skuLookup.
+router.get(
+  "/labelData",
+  requireAnyPermission("zoho:salesOrder:create", "zoho:collection:view"),
+  async function (req, res) {
+    try {
+      const skuRaw = String(req.query.sku || "").trim();
+      if (!skuRaw) {
+        return res.status(400).json({ success: false, message: "sku is required" });
+      }
+
+      const WORKSPACE_ID = "1404913000003936002";
+      const ITEMS_VIEW_ID = "1404913000003936100";
+      const PRICES_VIEW_ID = "1404913000003936194";
+      const PLATINUM_PRICEBOOK_ID = "2591985000001439015";
+
+      const buildUrl = (viewId, config) =>
+        `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${viewId}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+      const esc = (v) => String(v).replace(/'/g, "''");
+      // Rates come back as a number or a string like "AUD 1,234.56".
+      const money = (raw) => {
+        const n = parseFloat(String(raw == null ? "" : raw).replace(/[^0-9.]/g, ""));
+        return Number.isFinite(n) ? n : null;
+      };
+
+      const itemRows = await getViewData(
+        buildUrl(ITEMS_VIEW_ID, {
+          responseFormat: "json",
+          selectedColumns: ["Item ID", "Item Name", "SKU", "Sales Price"],
+          criteria: `"SKU" = '${esc(skuRaw)}'`,
+        }),
+      );
+      if (!Array.isArray(itemRows) || itemRows.length === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: `No inventory item found for SKU "${skuRaw}"` });
+      }
+      const item = itemRows[0];
+      const itemId = item["Item ID"];
+
+      let platinumPrice = null;
+      if (itemId) {
+        const priceRows = await getViewData(
+          buildUrl(PRICES_VIEW_ID, {
+            responseFormat: "json",
+            selectedColumns: ["PriceList Rate"],
+            criteria: `"Product ID" = '${esc(itemId)}' AND "PriceList ID" = '${PLATINUM_PRICEBOOK_ID}'`,
+          }),
+        );
+        if (Array.isArray(priceRows) && priceRows.length > 0) {
+          platinumPrice = money(priceRows[0]["PriceList Rate"]);
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          itemId: itemId ? String(itemId) : null,
+          sku: skuRaw,
+          name: item["Item Name"] || "",
+          sellingPrice: money(item["Sales Price"]),
+          platinumPrice,
+        },
+      });
+    } catch (error) {
+      console.error("labelData error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: `Label data lookup failed: ${error.message || error}` });
+    }
+  },
+);
+
 // Bulk SKU → Item ID resolver. Exact match (unlike /skuMatches which is
 // a LIKE search), one Analytics query per chunk of 100 SKUs rather than
 // one per SKU — so the Create Oz Order flow can resolve a whole order's
