@@ -165,6 +165,70 @@ router.get(
   },
 );
 
+// Bulk SKU → storage location resolver (Items view "Location" column) —
+// used by the Create Sales Order "Print List" picking sheet.
+// Body: { skus: [...] }  Resp: { success, data: { "<sku>": "A1-A1-L4" | null } }
+router.post(
+  "/itemLocations",
+  requireAnyPermission("zoho:salesOrder:create", "zoho:collection:view"),
+  async function (req, res) {
+    try {
+      const incoming = Array.isArray(req.body && req.body.skus) ? req.body.skus : [];
+      const unique = [
+        ...new Set(incoming.filter((s) => s != null).map((s) => String(s).trim()).filter(Boolean)),
+      ];
+      if (unique.length === 0) return res.json({ success: true, data: {} });
+
+      const WORKSPACE_ID = "1404913000003936002";
+      const ITEMS_VIEW_ID = "1404913000003936100";
+      const esc = (v) => String(v).replace(/'/g, "''");
+      const buildUrl = (config) =>
+        `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${ITEMS_VIEW_ID}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+
+      try {
+        await refreshToken();
+      } catch (e) {
+        console.warn("itemLocations token pre-warm failed:", e.message || e);
+      }
+
+      const chunks = [];
+      for (let i = 0; i < unique.length; i += 100) chunks.push(unique.slice(i, i + 100));
+
+      const data = {};
+      for (const s of unique) data[s] = null;
+
+      const responses = await Promise.all(
+        chunks.map((chunk) => {
+          const inList = chunk.map((s) => `'${esc(s)}'`).join(",");
+          return getViewData(
+            buildUrl({
+              responseFormat: "json",
+              selectedColumns: ["SKU", "Location"],
+              criteria: `"SKU" IN (${inList})`,
+            }),
+          );
+        }),
+      );
+      for (const rows of responses) {
+        if (!Array.isArray(rows)) continue;
+        for (const r of rows) {
+          const sku = r && r.SKU != null ? String(r.SKU) : "";
+          if (sku && Object.prototype.hasOwnProperty.call(data, sku)) {
+            const loc = r.Location != null ? String(r.Location).trim() : "";
+            data[sku] = loc || null;
+          }
+        }
+      }
+      return res.json({ success: true, data });
+    } catch (error) {
+      console.error("itemLocations error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: `Location lookup failed: ${error.message || error}` });
+    }
+  },
+);
+
 // Bulk SKU → Item ID resolver. Exact match (unlike /skuMatches which is
 // a LIKE search), one Analytics query per chunk of 100 SKUs rather than
 // one per SKU — so the Create Oz Order flow can resolve a whole order's
