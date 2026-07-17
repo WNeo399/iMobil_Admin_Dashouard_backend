@@ -10,7 +10,12 @@
 
 var express = require("express");
 var router = express.Router();
+const { requirePermission } = require("../../middleware/auth");
 const { exQuery } = require("../../utils/exDb");
+
+// Admin-only for now — no role carries exengine:* except admin's wildcard.
+// Grant "exengine:insights:view" to a role in constants/roles.js to widen.
+const VIEW = requirePermission("exengine:insights:view");
 
 const TTL_MS = 10 * 60 * 1000;
 let cache = { at: 0, rows: null };
@@ -127,7 +132,7 @@ function buildInsights(rows, days) {
   };
 }
 
-router.get("/insights", async function (req, res) {
+router.get("/insights", VIEW, async function (req, res) {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 90, 0), 3650);
     const rows = await getRows();

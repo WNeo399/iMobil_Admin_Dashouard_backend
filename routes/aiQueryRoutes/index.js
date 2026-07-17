@@ -17,6 +17,9 @@ const { runReadOnlySql } = require("../../utils/aiSql");
 const { connectToDatabase } = require("../../utils/mongodb");
 
 const VIEW = requirePermission("ai:query:use");
+// The skill knowledge base is managed separately from using the chat — e.g.
+// the Phone Supplier role can ask questions but must not see the skills.
+const SKILLS = requirePermission("ai:skills:manage");
 
 // Knowledge base of reusable "skills" — admin-authored guidance, structured
 // three levels deep:
@@ -96,8 +99,8 @@ function skillLookup(skills, wanted) {
 }
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-4-8";
-const MAX_ITERS = 10; // max run_sql rounds per question (safety cap vs runaway cost)
-const MAX_TOKENS = 4096;
+const MAX_ITERS = 20; // max tool rounds per question (safety cap vs runaway cost) — multi-model margin lists eat many rounds
+const MAX_TOKENS = 8192; // present_answer tables from multi-model questions can be large
 const ROWS_TO_MODEL = 50; // rows fed back to Claude per query (token budget)
 const ROWS_TO_CLIENT = 200; // rows kept per step for the UI table
 
@@ -159,6 +162,7 @@ Answering — ALWAYS finish by calling the present_answer tool exactly once. Nev
 - view "chart": a trend over time or a numeric comparison across categories — supply charts: 1–3 chart objects {type, title, xLabels, series}. ALSO supply a card with the key facts (model, period, net change, units sold, …) — it is shown above the chart. Metrics with different scales (e.g. stock vs price) go in SEPARATE charts, not one. Use 'line' for time series, 'bar' for category comparisons.
 - view "text": ONLY for out-of-scope declines, refusals, or when the data can't answer — never for a factual answer that could be a card.
 - Always set a one-sentence \`summary\`. If the data can't answer the question, use view "text" and say so briefly.
+- Size limit: keep any table to at most ~40 rows. If the full result is larger, present the most relevant rows and state in the summary how many were omitted — the user can narrow the question or ask for the rest.
 
 Database: jb_marketplace (MySQL 8).
 
@@ -290,6 +294,12 @@ function sanitizeResult(input) {
       : [];
   } else if (view === "card") {
     out.card = sanitizeCard(inp.card && typeof inp.card === "object" ? inp.card : {});
+    // Degenerate payload guard: a "card" with nothing on it renders as an
+    // empty box — fall back to plain text (the summary carries the answer).
+    if (!out.card.title && !out.card.subtitle && !out.card.fields.length) {
+      out.view = "text";
+      delete out.card;
+    }
   } else if (view === "chart") {
     // A chart answer may also carry a card of key facts (model, window,
     // units sold, …) shown above the chart(s).
@@ -381,6 +391,7 @@ router.post("/ask", VIEW, async function (req, res) {
 
   try {
     let queryNo = 0;
+    let retriedOversize = false;
     for (let i = 0; i < MAX_ITERS; i++) {
       if (aborted) return;
       send({ type: "progress", label: i === 0 ? "Thinking…" : "Analysing results…" });
@@ -397,11 +408,72 @@ router.post("/ask", VIEW, async function (req, res) {
       messages.push({ role: "assistant", content: resp.content });
 
       if (resp.stop_reason !== "tool_use") {
-        const answer = resp.content
+        let answer = resp.content
           .filter((b) => b.type === "text")
           .map((b) => b.text)
           .join("\n")
           .trim();
+        // Degenerate ending: max_tokens truncating the present_answer JSON.
+        if (!answer && resp.stop_reason === "max_tokens" && !retriedOversize) {
+          // If the truncated turn still carries a present_answer whose input
+          // survived parsing AND actually has content (truncation often strips
+          // the rows, leaving an empty shell), deliver it rather than retrying.
+          const partial = resp.content.find(
+            (b) => b.type === "tool_use" && b.name === "present_answer" &&
+              b.input && b.input.view && b.input.summary,
+          );
+          if (partial) {
+            const result = sanitizeResult(partial.input);
+            const usable =
+              result.view === "text" ||
+              (result.view === "table" && result.rows && result.rows.length > 0) ||
+              (result.view === "card" && result.card) ||
+              (result.view === "chart" && result.charts && result.charts.length > 0);
+            if (usable) {
+              result.summary = (result.summary + " (Answer truncated — ask for fewer items for the full list.)").trim();
+              send({ type: "result", success: true, answer: result.summary, result, steps, model: resp.model });
+              return res.end();
+            }
+          }
+          // Otherwise retry once, asking for a condensed version. Any tool_use
+          // blocks in the truncated turn MUST be answered with tool_results in
+          // the next message or the API rejects the replay.
+          retriedOversize = true;
+          console.warn("aiQuery answer hit max_tokens — retrying condensed");
+          if (!resp.content.length) {
+            // API rejects an empty assistant content array — drop the turn.
+            messages.pop();
+            messages.push({
+              role: "user",
+              content:
+                "Your previous answer exceeded the output limit and was lost. Present a CONDENSED version now via present_answer: keep any table to the ~30 most relevant rows, state in the summary how many rows were omitted, and keep everything else short. Do not run any more queries.",
+            });
+          } else {
+            const closeOut = resp.content
+              .filter((b) => b.type === "tool_use")
+              .map((b) => ({
+                type: "tool_result",
+                tool_use_id: b.id,
+                content: "Skipped — your answer exceeded the output limit.",
+                is_error: true,
+              }));
+            closeOut.push({
+              type: "text",
+              text:
+                "That answer exceeded the output limit and was lost. Present a CONDENSED version now via present_answer: keep any table to the ~30 most relevant rows, state in the summary how many rows were omitted, and keep everything else short. Do not run any more queries.",
+            });
+            messages.push({ role: "user", content: closeOut });
+          }
+          send({ type: "progress", label: "Condensing the answer…" });
+          continue;
+        }
+        if (!answer) {
+          console.warn("aiQuery empty final answer, stop_reason:", resp.stop_reason);
+          answer =
+            resp.stop_reason === "max_tokens"
+              ? "The answer got too long to deliver in one go — try asking about fewer items at once."
+              : "I couldn't produce an answer for that — please try rephrasing the question.";
+        }
         send({ type: "result", success: true, answer, steps, model: resp.model });
         return res.end();
       }
@@ -508,7 +580,7 @@ function skillPayload(b) {
   };
 }
 
-router.get("/skills", VIEW, async function (req, res) {
+router.get("/skills", SKILLS, async function (req, res) {
   try {
     const db = await connectToDatabase();
     const skills = await db.collection(SKILLS_COLLECTION).find({}).sort({ name: 1 }).toArray();
@@ -519,7 +591,7 @@ router.get("/skills", VIEW, async function (req, res) {
   }
 });
 
-router.post("/skills", VIEW, async function (req, res) {
+router.post("/skills", SKILLS, async function (req, res) {
   try {
     const p = skillPayload(req.body);
     if (!p.name) return res.status(400).json({ success: false, message: "Name is required." });
@@ -540,7 +612,7 @@ router.post("/skills", VIEW, async function (req, res) {
   }
 });
 
-router.put("/skills/:id", VIEW, async function (req, res) {
+router.put("/skills/:id", SKILLS, async function (req, res) {
   try {
     let _id;
     try { _id = new ObjectId(req.params.id); } catch (e) {
@@ -576,7 +648,7 @@ router.put("/skills/:id", VIEW, async function (req, res) {
   }
 });
 
-router.delete("/skills/:id", VIEW, async function (req, res) {
+router.delete("/skills/:id", SKILLS, async function (req, res) {
   try {
     let _id;
     try { _id = new ObjectId(req.params.id); } catch (e) {

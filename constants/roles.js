@@ -13,6 +13,9 @@ const ROLES = {
   REPAIR_SHOP: "repair-shop",
   // Portal login for an InFlow customer — sees only their own statement.
   INFLOW_CUSTOMER: "inflow-customer",
+  // Supplier login — sees the Refurbished Phones market data + the AI Agent
+  // (but not the Agent Skills knowledge base).
+  PHONE_SUPPLIER: "phone-supplier",
 };
 
 const ROLE_LABELS = {
@@ -23,6 +26,7 @@ const ROLE_LABELS = {
   [ROLES.SHOP_OWNER]: "Repair Shop Owner",
   [ROLES.REPAIR_SHOP]: "Repair Shop",
   [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
+  [ROLES.PHONE_SUPPLIER]: "Phone Supplier",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -48,6 +52,7 @@ const ROLE_GROUP_OF = {
   [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
   [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
   [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
+  [ROLES.PHONE_SUPPLIER]: ROLE_GROUPS.IMOBILE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -89,6 +94,10 @@ const ROLE_PERMISSIONS = {
   [ROLES.REPAIR_SHOP]: [...SHOP_CASE_PERMISSIONS],
   // InFlow Customer — a portal login for a customer; sees only their statement.
   [ROLES.INFLOW_CUSTOMER]: ["inflow:statement:view"],
+  // Phone Supplier — Refurbished Phones market data + the AI Agent chat.
+  // Deliberately NOT ai:skills:manage, so the Agent Skills knowledge base
+  // stays hidden from suppliers.
+  [ROLES.PHONE_SUPPLIER]: ["refurb:offer:view", "ai:query:use"],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
