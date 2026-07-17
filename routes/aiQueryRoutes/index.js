@@ -339,7 +339,7 @@ router.post("/ask", VIEW, async function (req, res) {
   }
 
   const raw = Array.isArray(req.body && req.body.messages)
-    ? req.body.messages.slice(-20) // cap history length
+    ? req.body.messages.slice(-10) // cap history: last 10 messages (~5 Q/A pairs)
     : [];
   const messages = [];
   let imageCount = 0;
