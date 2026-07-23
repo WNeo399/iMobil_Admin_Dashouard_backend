@@ -65,6 +65,8 @@ async function authenticate(req, res, next) {
       // InFlow customer-portal link — scopes the Statement page to one customer.
       inflowCustomerId: user.inflowCustomerId || null,
       inflowCustomerName: user.inflowCustomerName || null,
+      // Consignment-shop link — scopes the Consignment pages to one shop.
+      consignShopId: user.consignShopId ? String(user.consignShopId) : null,
     };
 
     next();

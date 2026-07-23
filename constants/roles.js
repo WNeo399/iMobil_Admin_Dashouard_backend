@@ -16,6 +16,9 @@ const ROLES = {
   // Supplier login — sees the Refurbished Phones market data + the AI Agent
   // (but not the Agent Skills knowledge base).
   PHONE_SUPPLIER: "phone-supplier",
+  // Consignment shop login — sees only its own consigned devices; can mark
+  // them received / sold and initiate returns.
+  CONSIGNMENT_SHOP: "consignment-shop",
 };
 
 const ROLE_LABELS = {
@@ -27,6 +30,7 @@ const ROLE_LABELS = {
   [ROLES.REPAIR_SHOP]: "Repair Shop",
   [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
   [ROLES.PHONE_SUPPLIER]: "Phone Supplier",
+  [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -36,12 +40,14 @@ const ROLE_GROUPS = {
   IMOBILE: "imobile",
   TECHELITE: "techelite",
   INFLOW: "inflow",
+  CONSIGNMENT: "consignment",
 };
 
 const ROLE_GROUP_LABELS = {
   [ROLE_GROUPS.IMOBILE]: "iMobile",
   [ROLE_GROUPS.TECHELITE]: "TechElite",
   [ROLE_GROUPS.INFLOW]: "InFlow",
+  [ROLE_GROUPS.CONSIGNMENT]: "Consignment",
 };
 
 const ROLE_GROUP_OF = {
@@ -53,6 +59,7 @@ const ROLE_GROUP_OF = {
   [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
   [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
   [ROLES.PHONE_SUPPLIER]: ROLE_GROUPS.IMOBILE,
+  [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -98,6 +105,13 @@ const ROLE_PERMISSIONS = {
   // Deliberately NOT ai:skills:manage, so the Agent Skills knowledge base
   // stays hidden from suppliers.
   [ROLES.PHONE_SUPPLIER]: ["refurb:offer:view", "ai:query:use"],
+  // Consignment Shop — scoped to the shop on the user record (consignShopId).
+  [ROLES.CONSIGNMENT_SHOP]: [
+    "consign:device:view",
+    "consign:device:receive",
+    "consign:device:sell",
+    "consign:device:return",
+  ],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
