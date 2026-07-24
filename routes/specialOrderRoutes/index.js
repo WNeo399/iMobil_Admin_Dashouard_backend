@@ -11,15 +11,15 @@
 var express = require("express");
 var router = express.Router();
 const { ObjectId } = require("mongodb");
-const { requirePermission } = require("../../middleware/auth");
+const { requireAnyPermission } = require("../../middleware/auth");
 const { connectToDatabase } = require("../../utils/mongodb");
 
 const COLLECTION = "imb_special_orders";
 
-// Same gate as the Credit Note review page — admins + iMobile Admins
-// both already hold zoho:salesOrder:create and that's the same group
-// who should triage incoming customer requests.
-const GATE = requirePermission("zoho:salesOrder:create");
+// ANY of: the original zoho gate (admin / iMobile Admin — same group who
+// triages credit notes) OR the dedicated po:specialOrder:view held by the
+// iMobile Purchase role (covered by its po:*:* grant).
+const GATE = requireAnyPermission("zoho:salesOrder:create", "po:specialOrder:view");
 
 // Status lifecycle:
 //   new        just landed from the widget

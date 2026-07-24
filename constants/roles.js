@@ -19,6 +19,8 @@ const ROLES = {
   // Consignment shop login — sees only its own consigned devices; can mark
   // them received / sold and initiate returns.
   CONSIGNMENT_SHOP: "consignment-shop",
+  // Purchasing staff — the Purchase Order page + Special Order triage only.
+  IMOBILE_PURCHASE: "imobile-purchase",
 };
 
 const ROLE_LABELS = {
@@ -31,6 +33,7 @@ const ROLE_LABELS = {
   [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
   [ROLES.PHONE_SUPPLIER]: "Phone Supplier",
   [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
+  [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -60,6 +63,7 @@ const ROLE_GROUP_OF = {
   [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
   [ROLES.PHONE_SUPPLIER]: ROLE_GROUPS.IMOBILE,
   [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
+  [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -112,6 +116,10 @@ const ROLE_PERMISSIONS = {
     "consign:device:sell",
     "consign:device:return",
   ],
+  // iMobile Purchase — Purchase Order (po:order:view et al) + Special Order
+  // (po:specialOrder:view via the wildcard). Deliberately NOT
+  // zoho:salesOrder:create, which would also unlock the Credit Note page.
+  [ROLES.IMOBILE_PURCHASE]: ["po:*:*"],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
