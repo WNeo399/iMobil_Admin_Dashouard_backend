@@ -52,6 +52,7 @@ var inflowRouter = require('./routes/inflowRoutes/index');
 var inflowWebhookRouter = require('./routes/inflowWebhookRoutes/index');
 var exengineRouter = require('./routes/exengineRoutes/index');
 var consignmentRouter = require('./routes/consignmentRoutes/index');
+var blackbeltRouter = require('./routes/blackbeltRoutes/index');
 // Public daily-cron trigger for the Purchase Order UPDATE sync (Tencent → DB).
 var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
@@ -172,6 +173,7 @@ app.use('/aiQuery', authenticate, aiQueryRouter);
 app.use('/inflow', authenticate, inflowRouter);
 app.use('/exengine', authenticate, exengineRouter);
 app.use('/consignment', authenticate, consignmentRouter);
+app.use('/blackbelt', authenticate, blackbeltRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
