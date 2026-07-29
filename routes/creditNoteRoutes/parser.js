@@ -50,10 +50,21 @@ function parseOcrResult(body) {
   const repairDevice = [];
   const returnNotes = [];
 
+  // Walk EVERY extraction set on EVERY page. Depending on how the
+  // document was assembled, HandwritingOCR delivers multi-page output
+  // either as multiple `results` entries (one per page) or as multiple
+  // sets inside one page's `extractions` array — reading only
+  // `extractions[0]` silently dropped every page after the first for
+  // the latter shape (multi-image credit notes).
+  const extractionSets = [];
   for (const page of results) {
-    const extraction = page && page.extractions && page.extractions[0];
-    if (!extraction) continue;
+    const sets = (page && page.extractions) || [];
+    for (const set of sets) {
+      if (Array.isArray(set)) extractionSets.push(set);
+    }
+  }
 
+  for (const extraction of extractionSets) {
     // ── Credit No (sourced from OCR's `parcel_no`) ────────────
     // Same precedence as the n8n parser: first non-empty value wins,
     // in case a multi-page document repeats the field.

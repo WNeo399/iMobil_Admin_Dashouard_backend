@@ -101,6 +101,8 @@ app.use(logger('dev'));
 // with a larger cap first; the global parser below then skips it (body-parser
 // sets req._body after the first parse, so it isn't re-read at 2mb).
 app.use('/aiQuery', express.json({ limit: '15mb' }));
+// Blackbelt invoice emails upload the client-rendered PDF as base64 (~2-3mb).
+app.use('/blackbelt', express.json({ limit: '10mb' }));
 // 2mb limit so the SVP serial-list import (a few thousand serials posted as a
 // JSON array) fits; default 100kb is too small. Still bounded.
 app.use(express.json({ limit: '2mb' }));

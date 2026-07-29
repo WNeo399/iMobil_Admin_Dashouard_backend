@@ -10,6 +10,7 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { sendMail } = require("../../utils/mailer");
 
 const ACCOUNTS = "blackbelt_accounts";
 const SQT_SHOPS = "sqt_shops";
@@ -229,6 +230,13 @@ router.post("/invoices", INVOICE, async function (req, res) {
 
     const rate = Number(account.negotiatedRate);
     const total = Math.round(qty * rate * 100) / 100;
+    // Due date — user-picked at creation, defaulting to 15 days out.
+    let dueDate = null;
+    if (req.body && req.body.dueDate) {
+      const d = new Date(req.body.dueDate);
+      if (!isNaN(d.getTime())) dueDate = d;
+    }
+    if (!dueDate) dueDate = new Date(Date.now() + 15 * 86400000);
     // Next number = highest ever issued + 1 (NOT count+1, which would reuse
     // a number after a delete). Numbering starts at BBI-10001.
     const last = await db.collection(INVOICES).find({}).sort({ seq: -1 }).limit(1).toArray();
@@ -242,6 +250,7 @@ router.post("/invoices", INVOICE, async function (req, res) {
       qty,
       total,
       note: String((req.body && req.body.note) || "").trim().slice(0, 500),
+      dueDate,
       paymentStatus: "unpaid",
       paidAt: null,
       createdAt: new Date(),
@@ -252,6 +261,102 @@ router.post("/invoices", INVOICE, async function (req, res) {
   } catch (e) {
     console.error("blackbelt invoice create error:", e);
     return res.status(500).json({ success: false, message: "Failed to create invoice" });
+  }
+});
+
+// Email the invoice PDF to the account's configured address.
+// The PDF is generated client-side (same jsPDF template as the preview) and
+// posted here as base64 — the server never re-renders it.
+// CC disabled while testing — restore to "accounts@exyon.com.au" to go live.
+const INVOICE_CC = "";
+
+const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const splitAddresses = (s) => String(s || "").split(/[,;]/).map((x) => x.trim()).filter(Boolean);
+const stripDataUrl = (s) => {
+  const v = String(s || "");
+  const comma = v.indexOf(",");
+  return v.startsWith("data:") && comma !== -1 ? v.slice(comma + 1) : v;
+};
+
+router.post("/invoices/:id/email", INVOICE, async function (req, res) {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ success: false, message: "invalid id" });
+    const b = req.body || {};
+    const pdfBase64 = stripDataUrl(b.pdfBase64);
+    if (!pdfBase64) return res.status(400).json({ success: false, message: "pdfBase64 is required" });
+    if (pdfBase64.length > 8 * 1024 * 1024) {
+      return res.status(400).json({ success: false, message: "PDF too large." });
+    }
+
+    const db = await connectToDatabase();
+    const invoice = await db.collection(INVOICES).findOne({ _id });
+    if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
+    const account = await db.collection(ACCOUNTS).findOne({ _id: invoice.accountId });
+    if (!account) return res.status(404).json({ success: false, message: "Account no longer exists" });
+
+    // Recipients — reviewed/edited in the compose dialog; fall back to the
+    // account's configured address.
+    const toList = splitAddresses(b.to || account.email);
+    if (!toList.length) {
+      return res.status(400).json({
+        success: false,
+        message: `"${account.name}" has no email configured — set it on the Accounts page or enter one in the dialog.`,
+      });
+    }
+    const ccList = splitAddresses(b.cc != null ? b.cc : INVOICE_CC);
+    for (const addr of [...toList, ...ccList]) {
+      if (!EMAIL_RX.test(addr)) {
+        return res.status(400).json({ success: false, message: `"${addr}" doesn't look like a valid email address.` });
+      }
+    }
+
+    const total = Number(invoice.total || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const dueStr = invoice.dueDate
+      ? new Date(invoice.dueDate).toLocaleDateString("en-AU", { day: "numeric", month: "short", year: "numeric", timeZone: "Australia/Melbourne" })
+      : "";
+    const subject = String(b.subject || "").trim().slice(0, 200) || `Invoice ${invoice.number} — Exyon Pty Ltd`;
+    const body = String(b.body || "").slice(0, 5000) ||
+      `Dear ${account.name},\n\n` +
+      `Please find attached invoice ${invoice.number} for $${total}.` +
+      (dueStr ? ` Payment is due by ${dueStr}.` : "") +
+      `\n\nBank details are included on the invoice.\n\nKind regards,\nExyon Pty Ltd`;
+
+    // Extra attachments from the dialog (on top of the invoice PDF).
+    const extras = Array.isArray(b.attachments) ? b.attachments.slice(0, 5) : [];
+    const attachments = [{ filename: `${invoice.number}.pdf`, content: Buffer.from(pdfBase64, "base64") }];
+    for (const a of extras) {
+      const data = stripDataUrl(a && a.dataBase64);
+      if (!data) continue;
+      if (data.length > 5 * 1024 * 1024) {
+        return res.status(400).json({ success: false, message: `Attachment "${a.filename || ""}" is too large (max ~3.5MB).` });
+      }
+      const filename = String((a && a.filename) || "attachment").replace(/[/\\]/g, "_").slice(0, 120);
+      attachments.push({ filename, content: Buffer.from(data, "base64") });
+    }
+
+    await sendMail({
+      to: toList.join(", "),
+      cc: ccList.length ? ccList.join(", ") : undefined,
+      subject,
+      text: body,
+      attachments,
+    });
+
+    await db.collection(INVOICES).updateOne(
+      { _id },
+      { $set: {
+        emailedAt: new Date(),
+        emailedTo: toList.join(", "),
+        emailedCc: ccList.join(", ") || null,
+        emailedBy: (req.user && (req.user.username || req.user.email)) || null,
+        updatedAt: new Date(),
+      } },
+    );
+    return res.json({ success: true, to: toList.join(", "), cc: ccList.join(", ") });
+  } catch (e) {
+    console.error("blackbelt invoice email error:", e);
+    return res.status(502).json({ success: false, message: e.message || "Failed to send the email" });
   }
 });
 
