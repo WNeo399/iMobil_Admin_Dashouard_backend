@@ -705,4 +705,175 @@ router.get("/statement/order/:id", STATEMENT, async (req, res) => {
   }
 });
 
+// ── POST /inflow/salesorders/:id/skumap ─────────────────────────────
+// Map THIS order's line items to real iMobile warehouse SKUs from the
+// user's Excel upload. Body: { rows: [{ barcode, sku }] } where barcode is
+// the line item's current `sku` value. A fresh upload replaces the order's
+// whole mapping (lines not covered by the new file lose their imbSku);
+// dispatch progress on the lines is untouched.
+router.post("/salesorders/:id/skumap", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const rows = Array.isArray(req.body && req.body.rows) ? req.body.rows : null;
+    if (!rows || !rows.length) {
+      return res.status(400).json({ success: false, message: "No mapping rows provided" });
+    }
+    if (rows.length > 10000) {
+      return res.status(400).json({ success: false, message: "Too many rows (max 10,000)" });
+    }
+
+    // Last occurrence of a barcode wins within one upload.
+    const skuByBarcode = new Map();
+    let skipped = 0;
+    for (const r of rows) {
+      const barcode = String((r && r.barcode) || "").trim();
+      const sku = String((r && r.sku) || "").trim();
+      if (!barcode || !sku) { skipped++; continue; }
+      skuByBarcode.set(barcode, sku);
+    }
+    if (!skuByBarcode.size) {
+      return res.status(400).json({ success: false, message: "No usable rows — every row needs both Barcode and SKU" });
+    }
+
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const order = await db.collection(ORDERS).findOne({ _id }, { projection: { lineItems: 1 } });
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    const items = Array.isArray(order.lineItems) ? order.lineItems : [];
+
+    const set = { skuMappedAt: new Date() };
+    const unset = {};
+    let linesMapped = 0;
+    items.forEach((li, i) => {
+      const mapped = li && li.sku ? skuByBarcode.get(li.sku) : undefined;
+      if (mapped) {
+        set[`lineItems.${i}.imbSku`] = mapped;
+        linesMapped++;
+      } else if (li && li.imbSku !== undefined) {
+        unset[`lineItems.${i}.imbSku`] = "";
+      }
+    });
+
+    await db.collection(ORDERS).updateOne(
+      { _id },
+      Object.keys(unset).length ? { $set: set, $unset: unset } : { $set: set },
+    );
+
+    return res.json({
+      success: true,
+      linesMapped,
+      linesTotal: items.length,
+      skipped,
+    });
+  } catch (e) {
+    console.error("InFlow SKU map upload error:", e);
+    return res.status(500).json({ success: false, message: "Failed to map SKUs" });
+  }
+});
+
+// ── GET /inflow/dispatch ────────────────────────────────────────────
+// Orders that have at least one line item mapped to an iMobile SKU, with
+// full line items so the warehouse can record dispatched quantities.
+router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
+
+    const match = { lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } } };
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), "i");
+      match.$or = [
+        { invoiceNumber: rx },
+        { customerName: rx },
+        { "lineItems.imbSku": rx },
+        { "lineItems.sku": rx },
+      ];
+    }
+
+    const [agg] = await db
+      .collection(ORDERS)
+      .aggregate([
+        { $match: match },
+        { $sort: { invoiceDate: -1, _id: -1 } },
+        {
+          $facet: {
+            rows: [
+              { $skip: (page - 1) * pageSize },
+              { $limit: pageSize },
+              { $project: { payments: 0 } },
+            ],
+            total: [{ $count: "n" }],
+          },
+        },
+      ])
+      .toArray();
+
+    const rows = ((agg && agg.rows) || []).map((o) => {
+      const items = Array.isArray(o.lineItems) ? o.lineItems : [];
+      const orderedQty = items.reduce((s, li) => s + num(li && li.quantity), 0);
+      const dispatchedQty = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+      o.orderedQty = orderedQty;
+      o.dispatchedQty = dispatchedQty;
+      o.dispatchStatus =
+        dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched";
+      return withPdf(o);
+    });
+
+    return res.json({
+      success: true,
+      page,
+      pageSize,
+      total: agg && agg.total && agg.total[0] ? agg.total[0].n : 0,
+      rows,
+    });
+  } catch (e) {
+    console.error("InFlow dispatch list error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load dispatch orders" });
+  }
+});
+
+// ── POST /inflow/dispatch/:id/qty ───────────────────────────────────
+// Record the dispatched quantity on one line item. Body: { lineIndex, qty }.
+router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const lineIndex = Number(req.body && req.body.lineIndex);
+    const qty = Number(req.body && req.body.qty);
+    if (!Number.isInteger(lineIndex) || lineIndex < 0) {
+      return res.status(400).json({ success: false, message: "Bad line index" });
+    }
+    if (!Number.isFinite(qty) || qty < 0) {
+      return res.status(400).json({ success: false, message: "Dispatched qty must be 0 or more" });
+    }
+
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const order = await db.collection(ORDERS).findOne({ _id }, { projection: { lineItems: 1 } });
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    if (!Array.isArray(order.lineItems) || lineIndex >= order.lineItems.length) {
+      return res.status(400).json({ success: false, message: "Line item not found" });
+    }
+
+    await db.collection(ORDERS).updateOne(
+      { _id },
+      {
+        $set: {
+          [`lineItems.${lineIndex}.dispatchedQty`]: qty,
+          [`lineItems.${lineIndex}.dispatchedAt`]: new Date(),
+        },
+      },
+    );
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("InFlow dispatch qty error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save dispatched qty" });
+  }
+});
+
 module.exports = router;

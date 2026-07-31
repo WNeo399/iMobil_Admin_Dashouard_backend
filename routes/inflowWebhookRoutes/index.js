@@ -109,6 +109,30 @@ async function handleWebhook(req, res) {
         }))
       : [];
 
+    // Repeat webhooks replace lineItems wholesale — carry the per-invoice
+    // SKU mapping (imbSku, uploaded on the Sales Orders page) and the
+    // warehouse's dispatch progress over from the stored order (greedy match
+    // on sku+description so duplicate lines each keep their own values).
+    const existing = await db
+      .collection(ORDERS)
+      .findOne({ invoiceNumber }, { projection: { lineItems: 1 } });
+    if (existing && Array.isArray(existing.lineItems)) {
+      const pool = existing.lineItems.filter(
+        (li) => li && (li.dispatchedQty != null || li.imbSku),
+      );
+      for (const li of lineItems) {
+        const i = pool.findIndex(
+          (old) => old.sku === li.sku && old.description === li.description,
+        );
+        if (i !== -1) {
+          if (pool[i].imbSku) li.imbSku = pool[i].imbSku;
+          if (pool[i].dispatchedQty != null) li.dispatchedQty = pool[i].dispatchedQty;
+          if (pool[i].dispatchedAt) li.dispatchedAt = pool[i].dispatchedAt;
+          pool.splice(i, 1);
+        }
+      }
+    }
+
     const totalAmount = num(p.totalAmount);
     const set = {
       vendor: vendorName || null,
