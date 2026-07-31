@@ -14,6 +14,24 @@ const workspaceId = "1404913000003936002";
 // refresh instead.
 let refreshPromise = null;
 
+// Zoho access tokens live 1 hour, and the OAuth endpoint itself is rate
+// limited ("You have made too many requests continuously"). So:
+//  · a token refreshed within TOKEN_FRESH_MS is simply reused — pre-warm
+//    calls (one per bulk endpoint hit) become free instead of burning an
+//    OAuth request per dialog open;
+//  · reactive callers (just saw INVALID_OAUTHTOKEN) reuse a token that
+//    was refreshed within REFRESH_GRACE_MS — their failure happened with
+//    the OLD token while someone else was already refreshing (the
+//    "straggler" race that used to fire extra OAuth calls);
+//  · after a FAILED refresh (throttled), FAIL_COOLDOWN_MS blocks
+//    re-attempts so a burst of failing requests can't dig the throttle
+//    hole deeper.
+let lastRefreshAt = 0; // last SUCCESSFUL refresh
+let lastFailAt = 0;    // last FAILED refresh attempt
+const TOKEN_FRESH_MS = 45 * 60 * 1000;
+const REFRESH_GRACE_MS = 15 * 1000;
+const FAIL_COOLDOWN_MS = 20 * 1000;
+
 function isTokenExpired(data) {
   if (!data) return false;
   return (
@@ -27,11 +45,25 @@ function isTokenExpired(data) {
   );
 }
 
-async function refreshToken() {
+// `force` = the caller just saw an INVALID_OAUTHTOKEN response (reactive
+// path). Non-forced callers (pre-warms) reuse any token younger than
+// TOKEN_FRESH_MS; forced callers only reuse one refreshed in the last few
+// seconds (i.e. by a concurrent caller while their request was in flight).
+async function refreshToken(force = false) {
   // If a refresh is already in flight, share that promise so a burst
   // of concurrent callers doesn't trigger N OAuth requests at once.
   if (refreshPromise) {
     return refreshPromise;
+  }
+  const now = Date.now();
+  const freshWindow = force ? REFRESH_GRACE_MS : TOKEN_FRESH_MS;
+  if (requestToken && now - lastRefreshAt < freshWindow) {
+    return requestToken;
+  }
+  // A refresh just failed (likely OAuth throttling) — don't hammer the
+  // endpoint; callers surface the stale-token error instead.
+  if (now - lastFailAt < FAIL_COOLDOWN_MS) {
+    return requestToken || null;
   }
   refreshPromise = (async () => {
     try {
@@ -50,9 +82,12 @@ async function refreshToken() {
       );
 
       requestToken = response.data.access_token;
-      console.log("New Access Token:", requestToken);
+      lastRefreshAt = Date.now();
+      // Deliberately not logging the token value itself.
+      console.log("Zoho access token refreshed.");
       return requestToken;
     } catch (error) {
+      lastFailAt = Date.now();
       console.error(
         "Error refreshing token:",
         error.response?.data || error.message
@@ -97,7 +132,7 @@ async function createExportJob(viewId) {
 
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
-      const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
+      const newAccessToken = await refreshToken(true); // reactive: this call just saw INVALID_OAUTHTOKEN
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
@@ -169,7 +204,7 @@ async function getViewData(url) {
 
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
-      const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
+      const newAccessToken = await refreshToken(true); // reactive: this call just saw INVALID_OAUTHTOKEN
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
@@ -204,7 +239,7 @@ async function handleZohoInventoryRequest(url) {
 
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
-      const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
+      const newAccessToken = await refreshToken(true); // reactive: this call just saw INVALID_OAUTHTOKEN
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
@@ -242,7 +277,7 @@ async function handleZohoInventoryPostRequest(url, params) {
 
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
-      const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
+      const newAccessToken = await refreshToken(true); // reactive: this call just saw INVALID_OAUTHTOKEN
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
@@ -289,7 +324,7 @@ async function handleZohoInventoryMultipartPostRequest(url, formData) {
 
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
-      const newAccessToken = await refreshToken();
+      const newAccessToken = await refreshToken(true); // reactive: this call just saw INVALID_OAUTHTOKEN
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
@@ -333,7 +368,7 @@ async function handleZohoInventoryPutRequest(url, params) {
     let data = await fetchData(url, params);
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
-      const newAccessToken = await refreshToken(); // Ensure refreshToken returns the new token
+      const newAccessToken = await refreshToken(true); // reactive: this call just saw INVALID_OAUTHTOKEN
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
