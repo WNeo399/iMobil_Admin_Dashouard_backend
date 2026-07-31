@@ -74,11 +74,12 @@ const VALID_STATUSES = [
   "cancelled",
 ];
 
-// Admin-side limbo states that shop roles should never see — they represent
-// work being handled internally by Admin / TechElite Admin (paused by an
-// admin, or handed off to Solvup). Filtered out of list/counts for
-// shop-scoped users so the shop's view stays focused on what's actionable.
-const ADMIN_ONLY_STATUSES = ["on-hold", "waiting-solvup", "issue-with-solvup"];
+// Solvup hand-off states are hidden from shop-scoped users entirely —
+// they're internal Admin / TechElite work. On Hold is deliberately NOT in
+// this list any more: shop users can SEE on-hold cases (with the hold
+// reason), but the only action open to them is adding a note — every other
+// shop-side mutation is rejected by blockShopWritesOnHold below.
+const SHOP_HIDDEN_STATUSES = ["waiting-solvup", "issue-with-solvup"];
 
 function isShopScopedUser(req) {
   return Array.isArray(req.user && req.user.accessibleShopIds);
@@ -241,7 +242,10 @@ async function authorizeCaseAccess(req, res, next) {
     const db = await connectToDatabase();
     const c = await db
       .collection(COLLECTION)
-      .findOne({ _id: new ObjectId(id) }, { projection: { shopId: 1 } });
+      .findOne(
+        { _id: new ObjectId(id) },
+        { projection: { shopId: 1, status: 1 } },
+      );
 
     if (!c) {
       return res
@@ -252,6 +256,9 @@ async function authorizeCaseAccess(req, res, next) {
     if (!allowed) {
       return res.status(403).json({ success: false, message: "Forbidden" });
     }
+    // Stash for downstream guards (blockShopWritesOnHold) so they don't
+    // have to re-fetch the case.
+    req.sqtCase = c;
     next();
   } catch (error) {
     console.error("authorizeCaseAccess error:", error);
@@ -259,6 +266,21 @@ async function authorizeCaseAccess(req, res, next) {
       .status(500)
       .json({ success: false, message: "Authorization failed" });
   }
+}
+
+// Shop users can SEE an on-hold case but not act on it — the case is paused
+// admin-side. Adding a note is the one allowed action (the /notes route
+// simply doesn't use this guard). Must run after authorizeCaseAccess, which
+// loads req.sqtCase for scoped users; unscoped roles pass straight through.
+function blockShopWritesOnHold(req, res, next) {
+  if (!isShopScopedUser(req)) return next();
+  if (req.sqtCase && req.sqtCase.status === "on-hold") {
+    return res.status(403).json({
+      success: false,
+      message: "This case is On Hold — only notes can be added",
+    });
+  }
+  return next();
 }
 
 router.get(
@@ -286,12 +308,12 @@ router.get(
         // Strip admin-only statuses from a shop user's request so they can't
         // request them via URL hack.
         if (shopScoped) {
-          arr = arr.filter((s) => !ADMIN_ONLY_STATUSES.includes(s));
+          arr = arr.filter((s) => !SHOP_HIDDEN_STATUSES.includes(s));
         }
         query.status = { $in: arr };
       } else if (shopScoped) {
         // No explicit filter — silently hide admin-only statuses.
-        query.status = { $nin: ADMIN_ONLY_STATUSES };
+        query.status = { $nin: SHOP_HIDDEN_STATUSES };
       }
 
       if (shopId && ObjectId.isValid(shopId)) {
@@ -363,7 +385,7 @@ router.get(
       // what the same user sees in /list.
       const shopScoped = isShopScopedUser(req);
       if (shopScoped) {
-        match.status = { $nin: ADMIN_ONLY_STATUSES };
+        match.status = { $nin: SHOP_HIDDEN_STATUSES };
       }
 
       const pipeline = [];
@@ -381,7 +403,7 @@ router.get(
       // counts object compact and prevents the frontend from rendering
       // empty admin-only nodes in the tree.
       const visibleStatuses = shopScoped
-        ? VALID_STATUSES.filter((s) => !ADMIN_ONLY_STATUSES.includes(s))
+        ? VALID_STATUSES.filter((s) => !SHOP_HIDDEN_STATUSES.includes(s))
         : VALID_STATUSES;
       for (const s of visibleStatuses) counts[s] = 0;
       for (const row of result) {
@@ -623,6 +645,7 @@ router.post(
   "/status/:id",
   requireStatusPermission,
   authorizeCaseAccess,
+  blockShopWritesOnHold,
   async function (req, res, next) {
     try {
       const { id } = req.params;
@@ -946,6 +969,7 @@ router.post(
   "/:id/markRepaired",
   requirePermission("sqt:case:markRepaired"),
   authorizeCaseAccess,
+  blockShopWritesOnHold,
   async function (req, res, next) {
     try {
       const { id } = req.params;
@@ -1039,6 +1063,7 @@ router.post(
   "/:id/partsReceived",
   requirePermission("sqt:case:partsReceived"),
   authorizeCaseAccess,
+  blockShopWritesOnHold,
   async function (req, res, next) {
     try {
       const { id } = req.params;
@@ -1141,6 +1166,7 @@ router.put(
   "/:id/device",
   requirePermission("sqt:case:editDevice"),
   authorizeCaseAccess,
+  blockShopWritesOnHold,
   async function (req, res, next) {
     try {
       const { id } = req.params;
