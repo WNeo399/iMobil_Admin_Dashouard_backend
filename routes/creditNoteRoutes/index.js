@@ -483,17 +483,49 @@ router.patch("/:id", GATE, async function (req, res) {
         // via OCR and rows the user touched.
         const quantity =
           it && it.quantity != null ? String(it.quantity) : "0";
-        return { sku, model, quantity };
+        // The Zoho match the reviewer picked for this row (Save Progress).
+        // Null when no pick yet — the Review dialog re-seeds its pickers
+        // from this on reopen.
+        const matchedItemId =
+          it && it.matchedItemId != null && String(it.matchedItemId).trim() !== ""
+            ? String(it.matchedItemId)
+            : null;
+        return { sku, model, quantity, matchedItemId };
       });
       // Recompute itemCount whenever items changes so the list page's
       // Items column stays in sync without a separate write.
       update.itemCount = update.items.length;
     }
 
+    // Review-progress fields — the note plus the return/repair device
+    // buckets edited in the Review dialog. Coerced to their parser shapes.
+    if (Object.prototype.hasOwnProperty.call(body, "returnNote")) {
+      update.returnNote = String(body.returnNote || "");
+    }
+    const coerceDevices = (list) =>
+      (Array.isArray(list) ? list : [])
+        .filter((d) => d && typeof d === "object")
+        .map((d) => ({
+          model: String(d.model || ""),
+          quantity: Number(d.quantity) || 0,
+        }));
+    if (Object.prototype.hasOwnProperty.call(body, "returnDevice")) {
+      if (!Array.isArray(body.returnDevice)) {
+        return res.status(400).json({ success: false, message: "returnDevice must be an array" });
+      }
+      update.returnDevice = coerceDevices(body.returnDevice);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "repairDevice")) {
+      if (!Array.isArray(body.repairDevice)) {
+        return res.status(400).json({ success: false, message: "repairDevice must be an array" });
+      }
+      update.repairDevice = coerceDevices(body.repairDevice);
+    }
+
     if (Object.keys(update).length === 0) {
       return res.status(400).json({
         success: false,
-        message: "Nothing to update — provide creditNo and/or items",
+        message: "Nothing to update — provide creditNo, items and/or review fields",
       });
     }
 
