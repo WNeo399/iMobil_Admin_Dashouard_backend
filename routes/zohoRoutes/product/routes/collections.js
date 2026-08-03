@@ -1,8 +1,13 @@
 var express = require("express");
 var axios = require("axios");
-var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../../../utils/mongodb");
+
+// This module exports a ROUTER FACTORY rather than a router: the same
+// collection-management endpoints serve both the Spare Parts set
+// (productCollections) and the Accessories set (accessoryCollections),
+// differing only in which Mongo collections they read/write. product/index.js
+// mounts one instance per data set.
 
 // Normalize the `products` payload from a Selection-type collection. We accept
 // either an array of objects ({ itemId, sku, name, imageUrl }) or a plain
@@ -33,6 +38,9 @@ function sanitizeProducts(input) {
   return out;
 }
 
+function createCollectionsRouter({ collectionsName, groupsName }) {
+  const router = express.Router();
+
 router.post("/create", async function (req, res, next) {
   try {
     const { title, type, rules, children, note, status, products } = req.body;
@@ -47,7 +55,7 @@ router.post("/create", async function (req, res, next) {
 
     const db = await connectToDatabase();
 
-    const collection = db.collection("productCollections");
+    const collection = db.collection(collectionsName);
 
     const newCollection = {
       title,
@@ -99,7 +107,7 @@ router.put("/update/:id", async function (req, res, next) {
 
     const db = await connectToDatabase();
 
-    const collection = db.collection("productCollections");
+    const collection = db.collection(collectionsName);
 
     const updateData = {
       updatedAt: new Date(),
@@ -157,7 +165,7 @@ router.get("/list", async function (req, res, next) {
     const pageSize = Math.max(parseInt(req.query.pageSize, 10) || 20, 1);
 
     const db = await connectToDatabase();
-    const collection = db.collection("productCollections");
+    const collection = db.collection(collectionsName);
 
     const query = {};
 
@@ -228,7 +236,7 @@ router.get("/detail/:id", async function (req, res, next) {
 
     const db = await connectToDatabase();
 
-    const collection = db.collection("productCollections");
+    const collection = db.collection(collectionsName);
 
     const data = await collection.findOne({
       _id: new ObjectId(id),
@@ -259,7 +267,7 @@ router.get("/detail/:id", async function (req, res, next) {
 router.get("/getGroup", async function (req, res, next) {
   try {
     const db = await connectToDatabase();
-    const collection = db.collection("productCollectionsGroups");
+    const collection = db.collection(groupsName);
 
     const groups = await collection.find({}).toArray();
 
@@ -280,7 +288,7 @@ router.get("/getGroup", async function (req, res, next) {
 router.post("/updateGroup", async function (req, res, next) {
   try {
     const db = await connectToDatabase();
-    const collection = db.collection("productCollectionsGroups");
+    const collection = db.collection(groupsName);
 
     const data = req.body;
 
@@ -326,7 +334,7 @@ router.post("/delete", async function (req, res, next) {
 
     const db = await connectToDatabase();
 
-    const collection = db.collection("productCollections");
+    const collection = db.collection(collectionsName);
 
     const result = await collection.deleteOne({
       _id: new ObjectId(id),
@@ -353,4 +361,7 @@ router.post("/delete", async function (req, res, next) {
     });
   }
 });
-module.exports = router;
+  return router;
+}
+
+module.exports = createCollectionsRouter;

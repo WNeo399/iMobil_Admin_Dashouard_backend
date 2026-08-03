@@ -11,10 +11,28 @@ const {
 } = require("../../../utils/zohoRequest");
 const { requirePermission, requireAnyPermission } = require("../../../middleware/auth");
 
-var productCollectionRoute = require("./routes/collections");
+var createCollectionsRouter = require("./routes/collections");
 
-// Collections management belongs to the zoho Inventory area
-router.use("/collections", requirePermission("zoho:collection:view"), productCollectionRoute);
+// Collections management belongs to the zoho Inventory area. The same
+// endpoints are mounted twice over separate data sets: Spare Parts
+// (productCollections) and Accessories (accessoryCollections) — the
+// Accessories pages are functional clones that must not share data.
+router.use(
+  "/collections",
+  requirePermission("zoho:collection:view"),
+  createCollectionsRouter({
+    collectionsName: "productCollections",
+    groupsName: "productCollectionsGroups",
+  }),
+);
+router.use(
+  "/accessoryCollections",
+  requirePermission("zoho:collection:view"),
+  createCollectionsRouter({
+    collectionsName: "accessoryCollections",
+    groupsName: "accessoryCollectionsGroups",
+  }),
+);
 
 // Resolve a SKU to its real Zoho Inventory item_id (Commerce product_id ≠
 // Inventory item_id) and pull the Wholesale-pricebook rate. Used by the SQT
@@ -394,6 +412,17 @@ router.get("/scanLookup", requireAnyPermission("sqt:case:sendParts", "zoho:colle
 // populate per-row pickers so the user can disambiguate when OCR gives
 // a partial (e.g. "5470" → "5470-RED", "5470-BLU", …).
 //
+// Short-lived per-SKU match cache. A long credit note review touches the
+// same SKUs repeatedly (dialog reopen, Save Progress round trips, duplicate
+// rows) and each miss costs a Zoho Analytics call that counts against the
+// account-wide rate limit (error 6045). Five minutes is short enough that
+// newly added Zoho items show up quickly; the review dialog's confirm
+// button sends force=true to bypass the cache when the user explicitly
+// wants a fresh lookup.
+const SKU_MATCH_CACHE = new Map(); // sku → { at, matches }
+const SKU_MATCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const SKU_MATCH_CACHE_MAX = 500;
+
 // Same Tools-page permission gate as the credit-note submit flow —
 // admin and iMobile Admin both already qualify.
 router.post(
@@ -404,6 +433,7 @@ router.post(
       const incoming = Array.isArray(req.body && req.body.skus)
         ? req.body.skus
         : [];
+      const force = req.body && req.body.force === true;
       // De-dupe + drop empty / non-string entries up front so we don't
       // fire identical queries multiple times for a duplicated OCR row.
       const unique = [
@@ -413,7 +443,10 @@ router.post(
             .map((s) => s.trim())
             .filter(Boolean),
         ),
-      ];
+        // Hard cap per request — the review dialog now lazy-loads in small
+        // chunks, so anything bigger is a misbehaving caller that would
+        // burn straight through Zoho's rate limit.
+      ].slice(0, 25);
       if (unique.length === 0) {
         return res.json({ success: true, data: {} });
       }
@@ -482,13 +515,45 @@ router.post(
         }
       };
 
-      // Fan out — Zoho Analytics handles small parallel bursts fine and
-      // the dialog blocks on this anyway, so faster is better.
-      const matches = await Promise.all(unique.map(lookupOne));
+      // Serve cache hits first (unless the caller forced a fresh lookup),
+      // then resolve the misses through a small worker pool instead of an
+      // unbounded Promise.all — a long credit note used to fan out one
+      // Zoho call per SKU simultaneously, which tripped the account-wide
+      // request limit (Zoho error 6045).
+      const now = Date.now();
       const data = {};
-      unique.forEach((sku, i) => {
-        data[sku] = matches[i];
-      });
+      const misses = [];
+      for (const sku of unique) {
+        const hit = !force && SKU_MATCH_CACHE.get(sku);
+        if (hit && now - hit.at < SKU_MATCH_CACHE_TTL_MS) {
+          data[sku] = hit.matches;
+        } else {
+          misses.push(sku);
+        }
+      }
+
+      const CONCURRENCY = 3;
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < misses.length) {
+          const sku = misses[cursor++];
+          const matches = await lookupOne(sku);
+          data[sku] = matches;
+          // Cache non-empty results only — an empty list is often a
+          // transient lookup failure (lookupOne swallows errors), and
+          // caching it would hide the real matches for 5 minutes.
+          if (matches.length) {
+            if (SKU_MATCH_CACHE.size >= SKU_MATCH_CACHE_MAX) {
+              SKU_MATCH_CACHE.delete(SKU_MATCH_CACHE.keys().next().value);
+            }
+            SKU_MATCH_CACHE.set(sku, { at: Date.now(), matches });
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, misses.length) }, worker),
+      );
+
       return res.json({ success: true, data });
     } catch (error) {
       console.error("skuMatches error:", error);

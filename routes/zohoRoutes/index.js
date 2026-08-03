@@ -102,9 +102,17 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
       return res.status(400).json({ success: false, message: "Invalid collection id" });
     }
 
+    // scope=accessories reads the Accessories collection set instead of the
+    // Spare Parts one — same page logic, separate data. Whitelisted rather
+    // than taking a raw collection name from the client.
+    const store =
+      String(req.query.scope || "") === "accessories"
+        ? "accessoryCollections"
+        : "productCollections";
+
     const db = await connectToDatabase();
     const collectionData = await db
-      .collection("productCollections")
+      .collection(store)
       .findOne({ _id: new ObjectId(collectionId) });
 
     if (!collectionData) {
