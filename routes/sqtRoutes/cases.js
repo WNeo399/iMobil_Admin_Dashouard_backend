@@ -1363,8 +1363,22 @@ router.post(
       const now = new Date();
       const update = { $set: { partsForInvoice, updatedAt: now } };
 
-      // Selecting at least one part hands the case off to Solvup for invoicing.
-      if (partsForInvoice.length > 0) {
+      if (theCase.status === "waiting-solvup") {
+        // Adjustment from the Waiting Solvup view — the case is already
+        // handed off, so record what changed without a status transition.
+        update.$push = {
+          statusHistory: {
+            status: "waiting-solvup",
+            at: now,
+            updatedBy: actor(req),
+            note:
+              partsForInvoice.length > 0
+                ? `Parts selection updated — ${partsForInvoice.length} part(s)`
+                : "Parts selection cleared",
+          },
+        };
+      } else if (partsForInvoice.length > 0) {
+        // Selecting at least one part hands the case off to Solvup for invoicing.
         update.$set.status = "waiting-solvup";
         update.$push = {
           statusHistory: {
