@@ -23,6 +23,10 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
 const VENDORS = "inflow_vendors";
+// Global customer-barcode → iMobile-SKU mapping list, maintained on the
+// InFlow → SKU Mapping page. Applied at ingest so mapped orders arrive
+// dispatch-ready without any manual step.
+const SKU_MAP = "inflow_sku_map";
 
 // Canonical vendor display names, keyed by the lowercased/whitespace-collapsed
 // invoice title. Different casings or spacings of the same company on incoming
@@ -109,10 +113,27 @@ async function handleWebhook(req, res) {
         }))
       : [];
 
-    // Repeat webhooks replace lineItems wholesale — carry the per-invoice
-    // SKU mapping (imbSku, uploaded on the Sales Orders page) and the
-    // warehouse's dispatch progress over from the stored order (greedy match
-    // on sku+description so duplicate lines each keep their own values).
+    // Stamp the iMobile warehouse SKU on lines whose barcode has a mapping
+    // in the global SKU Mapping list — mapped once, applied to every order.
+    const barcodes = [...new Set(lineItems.map((li) => li.sku).filter(Boolean))];
+    if (barcodes.length) {
+      // Pending mappings (barcode imported without a SKU yet) don't stamp.
+      const maps = await db
+        .collection(SKU_MAP)
+        .find({ barcode: { $in: barcodes }, sku: { $nin: ["", null] } })
+        .toArray();
+      const skuByBarcode = new Map(maps.map((m) => [m.barcode, m.sku]));
+      for (const li of lineItems) {
+        if (skuByBarcode.has(li.sku)) li.imbSku = skuByBarcode.get(li.sku);
+      }
+    }
+
+    // Repeat webhooks replace lineItems wholesale — carry the warehouse's
+    // dispatch progress (and any legacy imbSku stamp not covered by the
+    // mapping list) over from the stored order. Greedy match on
+    // sku+description so duplicate lines each keep their own values. The
+    // fresh mapping above wins over a carried-over imbSku, so mapping
+    // updates propagate on re-ingest.
     const existing = await db
       .collection(ORDERS)
       .findOne({ invoiceNumber }, { projection: { lineItems: 1 } });
@@ -125,7 +146,7 @@ async function handleWebhook(req, res) {
           (old) => old.sku === li.sku && old.description === li.description,
         );
         if (i !== -1) {
-          if (pool[i].imbSku) li.imbSku = pool[i].imbSku;
+          if (pool[i].imbSku && !li.imbSku) li.imbSku = pool[i].imbSku;
           if (pool[i].dispatchedQty != null) li.dispatchedQty = pool[i].dispatchedQty;
           if (pool[i].dispatchedAt) li.dispatchedAt = pool[i].dispatchedAt;
           pool.splice(i, 1);

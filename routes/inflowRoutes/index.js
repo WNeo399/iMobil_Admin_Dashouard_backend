@@ -27,6 +27,12 @@ const STATEMENT = requirePermission("inflow:statement:view");
 const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
 const USERS = "users";
+// Global customer-barcode → iMobile-SKU mapping list (InFlow → SKU
+// Mapping page). Each barcode is mapped ONCE; saving a mapping
+// retro-applies it to existing orders' line items and the webhook looks
+// it up for every future order, so mapped orders arrive dispatch-ready.
+const SKU_MAP = "inflow_sku_map";
+
 // Manually uploaded dispatch lists (Order Dispatch → Upload List). Kept in
 // their own collection — NOT inflow_salesorders — so they can never leak
 // into the Sales Orders page or customer aggregates. Each doc carries a
@@ -809,6 +815,7 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
       manualMatch.$or = [
         { invoiceNumber: rx },
         { linkedInvoiceNumber: rx },
+        { customerName: rx },
         { "lineItems.imbSku": rx },
         { "lineItems.sku": rx },
         { "lineItems.description": rx },
@@ -1096,6 +1103,168 @@ router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── SKU Mapping (customer barcode → iMobile SKU) ────────────────────
+// Stamp `imbSku` onto existing orders' line items for the given mappings.
+// Used after every mapping save/import so orders already in the system
+// pick the mapping up immediately (future orders get it at webhook ingest).
+// Pending mappings (barcode imported without a SKU yet) are skipped.
+async function applySkuMappingsToOrders(db, allMappings) {
+  const mappings = allMappings.filter((m) => m && m.sku);
+  if (!mappings.length) return { modified: 0 };
+  const r = await db.collection(ORDERS).bulkWrite(
+    mappings.map((m) => ({
+      updateMany: {
+        filter: { "lineItems.sku": m.barcode },
+        update: { $set: { "lineItems.$[el].imbSku": m.sku } },
+        arrayFilters: [{ "el.sku": m.barcode }],
+      },
+    })),
+    { ordered: false },
+  );
+  return { modified: r.modifiedCount || 0 };
+}
+
+// GET /inflow/skumap — paginated, searchable mapping list. pending=1
+// narrows to barcodes imported without a SKU yet; pendingTotal always
+// reports how many are waiting for staff input.
+router.get("/skumap", VIEW_ORDERS, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
+    const match = {};
+    const filter =
+      String(req.query.filter || "") ||
+      (String(req.query.pending || "") === "1" ? "pending" : "");
+    if (filter === "pending") match.sku = "";
+    else if (filter === "matched") match.sku = { $ne: "" };
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), "i");
+      match.$or = [{ barcode: rx }, { sku: rx }, { description: rx }];
+    }
+    const [total, allTotal, pendingTotal] = await Promise.all([
+      db.collection(SKU_MAP).countDocuments(match),
+      db.collection(SKU_MAP).countDocuments({}),
+      db.collection(SKU_MAP).countDocuments({ sku: "" }),
+    ]);
+    const rows = await db
+      .collection(SKU_MAP)
+      .find(match)
+      .sort({ updatedAt: -1 })
+      .skip((page - 1) * pageSize)
+      .limit(pageSize)
+      .toArray();
+    return res.json({ success: true, page, pageSize, total, allTotal, pendingTotal, rows });
+  } catch (e) {
+    console.error("InFlow skumap list error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load SKU mappings" });
+  }
+});
+
+// POST /inflow/skumap — create or update ONE mapping (upsert by barcode),
+// then retro-apply it to existing orders. SKU may be empty — the mapping
+// is saved as pending until staff fill the SKU in.
+router.post("/skumap", VIEW_ORDERS, async (req, res) => {
+  try {
+    const barcode = String((req.body && req.body.barcode) || "").trim();
+    const sku = String((req.body && req.body.sku) || "").trim();
+    const description = String((req.body && req.body.description) || "").trim();
+    if (!barcode) {
+      return res.status(400).json({ success: false, message: "Barcode is required" });
+    }
+    const db = await connectToDatabase();
+    const now = new Date();
+    await db.collection(SKU_MAP).updateOne(
+      { barcode },
+      {
+        $set: { sku, description, updatedAt: now, updatedBy: (req.user && req.user.username) || null },
+        $setOnInsert: { barcode, createdAt: now },
+      },
+      { upsert: true },
+    );
+    const applied = await applySkuMappingsToOrders(db, [{ barcode, sku }]);
+    return res.json({ success: true, pending: !sku, ordersUpdated: applied.modified });
+  } catch (e) {
+    console.error("InFlow skumap save error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save SKU mapping" });
+  }
+});
+
+// POST /inflow/skumap/import — bulk rows from an Excel upload:
+// { rows: [{ barcode, sku?, description? }] }. Only the barcode is
+// required — rows without a SKU import as PENDING mappings for staff to
+// fill in on the dashboard. Last occurrence of a barcode wins; mapped
+// rows retro-apply to existing orders.
+router.post("/skumap/import", VIEW_ORDERS, async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body && req.body.rows) ? req.body.rows : null;
+    if (!rows || !rows.length) {
+      return res.status(400).json({ success: false, message: "No mapping rows provided" });
+    }
+    if (rows.length > 5000) {
+      return res.status(400).json({ success: false, message: "Too many rows (max 5,000)" });
+    }
+    const byBarcode = new Map();
+    let skipped = 0;
+    for (const r of rows) {
+      const barcode = String((r && r.barcode) || "").trim();
+      const sku = String((r && r.sku) || "").trim();
+      if (!barcode) { skipped++; continue; }
+      byBarcode.set(barcode, { barcode, sku, description: String((r && r.description) || "").trim() });
+    }
+    if (!byBarcode.size) {
+      return res.status(400).json({ success: false, message: "No usable rows — every row needs a Barcode" });
+    }
+    const db = await connectToDatabase();
+    const now = new Date();
+    const by = (req.user && req.user.username) || null;
+    const mappings = [...byBarcode.values()];
+    await db.collection(SKU_MAP).bulkWrite(
+      mappings.map((m) => ({
+        updateOne: {
+          filter: { barcode: m.barcode },
+          update: {
+            $set: { sku: m.sku, description: m.description, updatedAt: now, updatedBy: by },
+            $setOnInsert: { barcode: m.barcode, createdAt: now },
+          },
+          upsert: true,
+        },
+      })),
+      { ordered: false },
+    );
+    const applied = await applySkuMappingsToOrders(db, mappings);
+    return res.json({
+      success: true,
+      mappings: mappings.length,
+      pending: mappings.filter((m) => !m.sku).length,
+      skipped,
+      ordersUpdated: applied.modified,
+    });
+  } catch (e) {
+    console.error("InFlow skumap import error:", e);
+    return res.status(500).json({ success: false, message: "Failed to import SKU mappings" });
+  }
+});
+
+// DELETE /inflow/skumap/:id — remove a mapping. Lines already stamped on
+// orders keep their imbSku (dispatch progress may depend on it); only
+// future lookups stop.
+router.delete("/skumap/:id", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const r = await db.collection(SKU_MAP).deleteOne({ _id: new ObjectId(req.params.id) });
+    if (r.deletedCount === 0) return res.status(404).json({ success: false, message: "Not found" });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("InFlow skumap delete error:", e);
+    return res.status(500).json({ success: false, message: "Failed to delete SKU mapping" });
+  }
+});
+
 // ── GET /inflow/dispatch/owing ──────────────────────────────────────
 // Outstanding stock across every dispatch source: line items whose
 // dispatched quantity is still short of the ordered quantity, grouped by
@@ -1266,6 +1435,7 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
 
     // Optional: link the record to a sales order right at upload time.
     let linked = { linkedOrderId: null, linkedInvoiceNumber: null };
+    let orderCustomer = null;
     const rawOrderId = req.body && req.body.orderId;
     if (rawOrderId) {
       if (!ObjectId.isValid(rawOrderId)) {
@@ -1273,7 +1443,10 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
       }
       const order = await db
         .collection(ORDERS)
-        .findOne({ _id: new ObjectId(rawOrderId) }, { projection: { invoiceNumber: 1 } });
+        .findOne(
+          { _id: new ObjectId(rawOrderId) },
+          { projection: { invoiceNumber: 1, customerName: 1, customerId: 1 } },
+        );
       if (!order) {
         return res.status(404).json({ success: false, message: "Sales order not found" });
       }
@@ -1283,6 +1456,25 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
         linkedAt: now,
         linkedBy: (req.user && req.user.username) || null,
       };
+      orderCustomer = { customerId: order.customerId || null, customerName: order.customerName || null };
+    }
+
+    // Optional: link a customer directly — used when the dispatch list is
+    // uploaded BEFORE the invoice exists, so the customer's portal login
+    // can already see the dispatch status. An explicitly picked customer
+    // wins; otherwise a linked order's customer is adopted.
+    let customer = { customerId: null, customerName: null };
+    const rawCustomerName = String((req.body && req.body.customerName) || "").trim();
+    if (rawCustomerName) {
+      const cust = await db
+        .collection(CUSTOMERS)
+        .findOne({ nameLower: rawCustomerName.toLowerCase() });
+      if (!cust) {
+        return res.status(404).json({ success: false, message: "Customer not found" });
+      }
+      customer = { customerId: cust._id, customerName: cust.name };
+    } else if (orderCustomer) {
+      customer = orderCustomer;
     }
 
     const doc = {
@@ -1290,6 +1482,7 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
       source: "upload",
       lineItems,
       ...linked,
+      ...customer,
       createdAt: now,
       createdBy: (req.user && req.user.username) || null,
       updatedAt: now,
@@ -1301,6 +1494,7 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
       lines: lineItems.length,
       skipped,
       linkedInvoiceNumber: linked.linkedInvoiceNumber,
+      customerName: customer.customerName,
     });
   } catch (e) {
     console.error("InFlow dispatch upload error:", e);
@@ -1348,7 +1542,10 @@ router.post("/dispatch/manual/:id/link", VIEW_ORDERS, async (req, res) => {
     }
     const order = await db
       .collection(ORDERS)
-      .findOne({ _id: new ObjectId(rawOrderId) }, { projection: { invoiceNumber: 1 } });
+      .findOne(
+        { _id: new ObjectId(rawOrderId) },
+        { projection: { invoiceNumber: 1, customerName: 1, customerId: 1 } },
+      );
     if (!order) return res.status(404).json({ success: false, message: "Sales order not found" });
 
     await db.collection(DISPATCH_UPLOADS).updateOne(
@@ -1359,14 +1556,122 @@ router.post("/dispatch/manual/:id/link", VIEW_ORDERS, async (req, res) => {
           linkedInvoiceNumber: order.invoiceNumber || null,
           linkedAt: now,
           linkedBy: (req.user && req.user.username) || null,
+          // The order is authoritative for the customer once linked — this
+          // is what puts the record on that customer's portal view.
+          customerId: order.customerId || null,
+          customerName: order.customerName || null,
           updatedAt: now,
         },
       },
     );
-    return res.json({ success: true, orderInvoiceNumber: order.invoiceNumber || "" });
+    return res.json({
+      success: true,
+      orderInvoiceNumber: order.invoiceNumber || "",
+      customerName: order.customerName || null,
+    });
   } catch (e) {
     console.error("InFlow dispatch link error:", e);
     return res.status(500).json({ success: false, message: "Failed to link dispatch record" });
+  }
+});
+
+// ── POST /inflow/dispatch/manual/:id/customer ───────────────────────
+// Link (or unlink) an uploaded dispatch record to an existing customer —
+// used when the dispatch list arrives before the invoice exists, so the
+// customer's portal login can already follow the dispatch status. Body:
+// { customerName } to link, { customerName: null } to clear.
+router.post("/dispatch/manual/:id/customer", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const upload = await db
+      .collection(DISPATCH_UPLOADS)
+      .findOne({ _id }, { projection: { _id: 1 } });
+    if (!upload) return res.status(404).json({ success: false, message: "Upload record not found" });
+
+    const now = new Date();
+    const rawName = String((req.body && req.body.customerName) || "").trim();
+    if (!rawName) {
+      await db
+        .collection(DISPATCH_UPLOADS)
+        .updateOne({ _id }, { $set: { customerId: null, customerName: null, updatedAt: now } });
+      return res.json({ success: true, customerName: null });
+    }
+    const cust = await db
+      .collection(CUSTOMERS)
+      .findOne({ nameLower: rawName.toLowerCase() });
+    if (!cust) return res.status(404).json({ success: false, message: "Customer not found" });
+    await db.collection(DISPATCH_UPLOADS).updateOne(
+      { _id },
+      { $set: { customerId: cust._id, customerName: cust.name, updatedAt: now } },
+    );
+    return res.json({ success: true, customerName: cust.name });
+  } catch (e) {
+    console.error("InFlow dispatch customer link error:", e);
+    return res.status(500).json({ success: false, message: "Failed to link customer" });
+  }
+});
+
+// ── GET /inflow/dispatch/mine ───────────────────────────────────────
+// The logged-in CUSTOMER's dispatch status (portal — inflow:statement:view).
+// Read-only: their linked upload records plus their mapped sales orders,
+// with per-line progress. Internal fields (warehouse SKU, uploader, batch
+// details) are deliberately not exposed.
+router.get("/dispatch/mine", STATEMENT, async (req, res) => {
+  try {
+    const name = req.user && req.user.inflowCustomerName;
+    if (!name) return res.json({ success: true, customerName: null, rows: [] });
+    const db = await connectToDatabase();
+    const [uploads, orders] = await Promise.all([
+      db.collection(DISPATCH_UPLOADS).find({ customerName: name }).sort({ createdAt: -1 }).toArray(),
+      db
+        .collection(ORDERS)
+        .find(
+          {
+            customerName: name,
+            lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } },
+          },
+          { projection: { invoiceNumber: 1, invoiceDate: 1, invoiceDateRaw: 1, lineItems: 1 } },
+        )
+        .sort({ invoiceDate: -1 })
+        .toArray(),
+    ]);
+
+    const shape = (rec, recordType) => {
+      const items = Array.isArray(rec.lineItems) ? rec.lineItems : [];
+      const orderedQty = items.reduce((s, li) => s + num(li && li.quantity), 0);
+      const dispatchedQty = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+      return {
+        _id: rec._id,
+        recordType,
+        invoiceNumber: rec.invoiceNumber || "",
+        linkedInvoiceNumber: rec.linkedInvoiceNumber || null,
+        date: rec.invoiceDate || rec.createdAt || null,
+        invoiceDateRaw: rec.invoiceDateRaw || null,
+        orderedQty,
+        dispatchedQty,
+        dispatchStatus:
+          dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched",
+        lineItems: items.map((li) => ({
+          sku: (li && li.sku) || "",
+          description: (li && li.description) || "",
+          quantity: num(li && li.quantity),
+          dispatchedQty: num(li && li.dispatchedQty),
+        })),
+      };
+    };
+
+    const rows = uploads
+      .map((u) => shape(u, "manual"))
+      .concat(orders.map((o) => shape(o, "order")))
+      .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+    return res.json({ success: true, customerName: name, rows });
+  } catch (e) {
+    console.error("InFlow customer dispatch error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load dispatch status" });
   }
 });
 
