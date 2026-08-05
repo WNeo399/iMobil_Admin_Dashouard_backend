@@ -27,6 +27,13 @@ const STATEMENT = requirePermission("inflow:statement:view");
 const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
 const USERS = "users";
+// Manually uploaded dispatch lists (Order Dispatch → Upload List). Kept in
+// their own collection — NOT inflow_salesorders — so they can never leak
+// into the Sales Orders page or customer aggregates. Each doc carries a
+// hand-typed invoiceNumber and pre-mapped lineItems; linking it to a real
+// sales order later transfers the mapping + dispatch progress onto that
+// order and hides the upload from the dispatch list (linkedOrderId set).
+const DISPATCH_UPLOADS = "inflow_dispatch_uploads";
 
 function num(v) {
   const n = Number(v);
@@ -774,8 +781,10 @@ router.post("/salesorders/:id/skumap", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── GET /inflow/dispatch ────────────────────────────────────────────
-// Orders that have at least one line item mapped to an iMobile SKU, with
-// full line items so the warehouse can record dispatched quantities.
+// Orders that have at least one line item mapped to an iMobile SKU, plus
+// unlinked manual dispatch uploads, with full line items so the warehouse
+// can record dispatched quantities. Manual records sort by their upload
+// time (surfaced as invoiceDate) and carry recordType: "manual".
 router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -783,6 +792,7 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
     const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
 
     const match = { lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } } };
+    const manualMatch = { linkedOrderId: null };
     const search = String(req.query.search || "").trim();
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
@@ -792,12 +802,28 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
         { "lineItems.imbSku": rx },
         { "lineItems.sku": rx },
       ];
+      manualMatch.$or = [
+        { invoiceNumber: rx },
+        { "lineItems.imbSku": rx },
+        { "lineItems.sku": rx },
+        { "lineItems.description": rx },
+      ];
     }
 
     const [agg] = await db
       .collection(ORDERS)
       .aggregate([
         { $match: match },
+        { $addFields: { recordType: "order" } },
+        {
+          $unionWith: {
+            coll: DISPATCH_UPLOADS,
+            pipeline: [
+              { $match: manualMatch },
+              { $addFields: { recordType: "manual", invoiceDate: "$createdAt" } },
+            ],
+          },
+        },
         { $sort: { invoiceDate: -1, _id: -1 } },
         {
           $facet: {
@@ -837,7 +863,9 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── POST /inflow/dispatch/:id/qty ───────────────────────────────────
-// Record the dispatched quantity on one line item. Body: { lineIndex, qty }.
+// Record the dispatched quantity on one line item. Body: { lineIndex, qty,
+// type? }. type: "manual" targets an uploaded dispatch record instead of a
+// sales order — the two live in different collections but share the shape.
 router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -851,16 +879,18 @@ router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
     if (!Number.isFinite(qty) || qty < 0) {
       return res.status(400).json({ success: false, message: "Dispatched qty must be 0 or more" });
     }
+    const coll =
+      String((req.body && req.body.type) || "") === "manual" ? DISPATCH_UPLOADS : ORDERS;
 
     const db = await connectToDatabase();
     const _id = new ObjectId(req.params.id);
-    const order = await db.collection(ORDERS).findOne({ _id }, { projection: { lineItems: 1 } });
+    const order = await db.collection(coll).findOne({ _id }, { projection: { lineItems: 1 } });
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
     if (!Array.isArray(order.lineItems) || lineIndex >= order.lineItems.length) {
       return res.status(400).json({ success: false, message: "Line item not found" });
     }
 
-    await db.collection(ORDERS).updateOne(
+    await db.collection(coll).updateOne(
       { _id },
       {
         $set: {
@@ -873,6 +903,360 @@ router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
   } catch (e) {
     console.error("InFlow dispatch qty error:", e);
     return res.status(500).json({ success: false, message: "Failed to save dispatched qty" });
+  }
+});
+
+// ── POST /inflow/dispatch/:id/batch ─────────────────────────────────
+// Record one warehouse dispatch batch (scanned picks). Body: { lines:
+// [{ lineIndex, qty }], type? } — type "manual" targets an uploaded
+// record. Appends a numbered batch (snapshotting sku/description per line
+// so packing lists can be reprinted later) and adds the quantities onto
+// the lines' dispatchedQty. Rejects a batch that would push any line past
+// its ordered quantity.
+router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const incoming = Array.isArray(req.body && req.body.lines) ? req.body.lines : [];
+    // Merge duplicate lineIndex entries so each line gets ONE $set below.
+    const qtyByIndex = new Map();
+    for (const l of incoming) {
+      const idx = Number(l && l.lineIndex);
+      const qty = Number(l && l.qty);
+      if (!Number.isInteger(idx) || idx < 0 || !Number.isFinite(qty) || qty <= 0) continue;
+      qtyByIndex.set(idx, (qtyByIndex.get(idx) || 0) + qty);
+    }
+    if (!qtyByIndex.size) {
+      return res.status(400).json({ success: false, message: "No lines in this batch" });
+    }
+    const coll =
+      String((req.body && req.body.type) || "") === "manual" ? DISPATCH_UPLOADS : ORDERS;
+
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const doc = await db
+      .collection(coll)
+      .findOne({ _id }, { projection: { lineItems: 1, dispatchBatches: 1, invoiceNumber: 1 } });
+    if (!doc) return res.status(404).json({ success: false, message: "Not found" });
+    const items = Array.isArray(doc.lineItems) ? doc.lineItems : [];
+
+    const now = new Date();
+    const set = { updatedAt: now };
+    const batchLines = [];
+    for (const [idx, qty] of qtyByIndex) {
+      const li = items[idx];
+      if (!li) {
+        return res.status(400).json({ success: false, message: `Line ${idx + 1} not found` });
+      }
+      const next = (Number(li.dispatchedQty) || 0) + qty;
+      if (Number(li.quantity) > 0 && next > Number(li.quantity)) {
+        return res.status(400).json({
+          success: false,
+          message: `"${li.imbSku || li.sku || `line ${idx + 1}`}" would exceed its ordered quantity (${li.quantity})`,
+        });
+      }
+      set[`lineItems.${idx}.dispatchedQty`] = next;
+      set[`lineItems.${idx}.dispatchedAt`] = now;
+      batchLines.push({
+        lineIndex: idx,
+        imbSku: li.imbSku || "",
+        sku: li.sku || "",
+        description: li.description || "",
+        qty,
+      });
+    }
+
+    const batch = {
+      // max+1 (not count+1) so numbering stays unique even after a batch
+      // is deleted via the edit endpoint below.
+      batchNo:
+        (Array.isArray(doc.dispatchBatches)
+          ? doc.dispatchBatches.reduce((m, b) => Math.max(m, Number(b && b.batchNo) || 0), 0)
+          : 0) + 1,
+      at: now,
+      by: (req.user && req.user.username) || null,
+      units: batchLines.reduce((s, l) => s + l.qty, 0),
+      lines: batchLines,
+    };
+
+    await db.collection(coll).updateOne({ _id }, { $set: set, $push: { dispatchBatches: batch } });
+    const updated = await db.collection(coll).findOne({ _id }, { projection: { payments: 0 } });
+    return res.json({ success: true, batch, record: updated });
+  } catch (e) {
+    console.error("InFlow dispatch batch error:", e);
+    return res.status(500).json({ success: false, message: "Failed to record dispatch batch" });
+  }
+});
+
+// ── PUT /inflow/dispatch/:id/batch/:batchNo ─────────────────────────
+// Update a recorded batch's quantities. Body: { lines: [{ lineIndex,
+// qty }], type? } covering the batch's lines — qty 0 removes a line, and
+// a batch whose every line hits 0 is deleted. The difference against the
+// old quantities is applied to the affected lineItems' dispatchedQty, so
+// the order's totals stay truthful. Same over-dispatch guard as recording.
+router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const batchNo = Number(req.params.batchNo);
+    if (!Number.isInteger(batchNo) || batchNo <= 0) {
+      return res.status(400).json({ success: false, message: "Bad batch number" });
+    }
+    const incoming = Array.isArray(req.body && req.body.lines) ? req.body.lines : [];
+    const qtyByIndex = new Map();
+    for (const l of incoming) {
+      const idx = Number(l && l.lineIndex);
+      const qty = Number(l && l.qty);
+      if (!Number.isInteger(idx) || idx < 0 || !Number.isFinite(qty) || qty < 0) {
+        return res.status(400).json({ success: false, message: "Bad line quantities" });
+      }
+      qtyByIndex.set(idx, (qtyByIndex.get(idx) || 0) + qty);
+    }
+    const coll =
+      String((req.body && req.body.type) || "") === "manual" ? DISPATCH_UPLOADS : ORDERS;
+
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const doc = await db
+      .collection(coll)
+      .findOne({ _id }, { projection: { lineItems: 1, dispatchBatches: 1 } });
+    if (!doc) return res.status(404).json({ success: false, message: "Not found" });
+    const batches = Array.isArray(doc.dispatchBatches) ? doc.dispatchBatches : [];
+    const bIdx = batches.findIndex((b) => b && Number(b.batchNo) === batchNo);
+    if (bIdx === -1) {
+      return res.status(404).json({ success: false, message: "Batch not found" });
+    }
+    const batch = batches[bIdx];
+    const items = Array.isArray(doc.lineItems) ? doc.lineItems : [];
+
+    const now = new Date();
+    const set = { updatedAt: now };
+    const newLines = [];
+    for (const bl of batch.lines || []) {
+      if (!bl) continue;
+      const idx = Number(bl.lineIndex);
+      // Lines not covered by the payload keep their recorded quantity.
+      const newQty = qtyByIndex.has(idx) ? qtyByIndex.get(idx) : Number(bl.qty) || 0;
+      const delta = newQty - (Number(bl.qty) || 0);
+      if (delta !== 0) {
+        const li = items[idx];
+        if (!li) {
+          return res.status(400).json({ success: false, message: `Line ${idx + 1} not found` });
+        }
+        const next = (Number(li.dispatchedQty) || 0) + delta;
+        if (next < 0) {
+          return res.status(400).json({
+            success: false,
+            message: `"${li.imbSku || li.sku || `line ${idx + 1}`}" would drop below 0 dispatched`,
+          });
+        }
+        if (Number(li.quantity) > 0 && next > Number(li.quantity)) {
+          return res.status(400).json({
+            success: false,
+            message: `"${li.imbSku || li.sku || `line ${idx + 1}`}" would exceed its ordered quantity (${li.quantity})`,
+          });
+        }
+        set[`lineItems.${idx}.dispatchedQty`] = next;
+        set[`lineItems.${idx}.dispatchedAt`] = now;
+      }
+      if (newQty > 0) newLines.push({ ...bl, qty: newQty });
+    }
+
+    if (newLines.length) {
+      set[`dispatchBatches.${bIdx}.lines`] = newLines;
+      set[`dispatchBatches.${bIdx}.units`] = newLines.reduce((s, l) => s + l.qty, 0);
+      set[`dispatchBatches.${bIdx}.editedAt`] = now;
+      set[`dispatchBatches.${bIdx}.editedBy`] = (req.user && req.user.username) || null;
+      await db.collection(coll).updateOne({ _id }, { $set: set });
+    } else {
+      // Every line zeroed — the batch itself goes away. Two steps because
+      // $pull can't run alongside a positional $set on the same array.
+      await db.collection(coll).updateOne({ _id }, { $set: set });
+      await db
+        .collection(coll)
+        .updateOne({ _id }, { $pull: { dispatchBatches: { batchNo } } });
+    }
+
+    const updated = await db.collection(coll).findOne({ _id }, { projection: { payments: 0 } });
+    return res.json({
+      success: true,
+      removed: !newLines.length,
+      record: updated,
+    });
+  } catch (e) {
+    console.error("InFlow dispatch batch update error:", e);
+    return res.status(500).json({ success: false, message: "Failed to update batch" });
+  }
+});
+
+// ── POST /inflow/dispatch/manual ────────────────────────────────────
+// Create a dispatch record from an uploaded Excel list. The invoice number
+// is typed by the user; rows come pre-mapped ({ barcode, sku, description,
+// quantity } where sku is the real iMobile warehouse SKU). The record can
+// be linked to a real sales order later.
+router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
+  try {
+    const invoiceNumber = String((req.body && req.body.invoiceNumber) || "").trim();
+    if (!invoiceNumber) {
+      return res.status(400).json({ success: false, message: "Invoice # is required" });
+    }
+    const rows = Array.isArray(req.body && req.body.rows) ? req.body.rows : null;
+    if (!rows || !rows.length) {
+      return res.status(400).json({ success: false, message: "No rows provided" });
+    }
+    if (rows.length > 2000) {
+      return res.status(400).json({ success: false, message: "Too many rows (max 2,000)" });
+    }
+
+    let skipped = 0;
+    const lineItems = [];
+    for (const r of rows) {
+      const imbSku = String((r && r.sku) || "").trim();
+      const quantity = Number(r && r.quantity);
+      if (!imbSku || !Number.isFinite(quantity) || quantity <= 0) { skipped++; continue; }
+      lineItems.push({
+        // Same line shape as a sales order: sku = the barcode, imbSku = the
+        // warehouse SKU — so the dispatch page (and the link step) treat
+        // manual lines exactly like mapped order lines.
+        sku: String((r && r.barcode) || "").trim(),
+        imbSku,
+        description: String((r && r.description) || "").trim(),
+        quantity,
+      });
+    }
+    if (!lineItems.length) {
+      return res.status(400).json({ success: false, message: "No usable rows — every row needs a SKU and a positive Quantity" });
+    }
+
+    const db = await connectToDatabase();
+    const now = new Date();
+    const doc = {
+      invoiceNumber,
+      source: "upload",
+      lineItems,
+      linkedOrderId: null,
+      createdAt: now,
+      createdBy: (req.user && req.user.username) || null,
+      updatedAt: now,
+    };
+    const r = await db.collection(DISPATCH_UPLOADS).insertOne(doc);
+    return res.json({ success: true, id: r.insertedId, lines: lineItems.length, skipped });
+  } catch (e) {
+    console.error("InFlow dispatch upload error:", e);
+    return res.status(500).json({ success: false, message: "Failed to create dispatch record" });
+  }
+});
+
+// ── POST /inflow/dispatch/manual/:id/link ───────────────────────────
+// Link an uploaded dispatch record to a real sales order. Transfers the
+// iMobile SKU mapping and any dispatch progress onto the order's line
+// items (greedy match by barcode, so duplicate lines each consume one),
+// then hides the upload from the dispatch list via linkedOrderId.
+router.post("/dispatch/manual/:id/link", VIEW_ORDERS, async (req, res) => {
+  try {
+    const orderId = req.body && req.body.orderId;
+    if (!ObjectId.isValid(req.params.id) || !ObjectId.isValid(orderId)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const upload = await db
+      .collection(DISPATCH_UPLOADS)
+      .findOne({ _id: new ObjectId(req.params.id) });
+    if (!upload) return res.status(404).json({ success: false, message: "Upload record not found" });
+    if (upload.linkedOrderId) {
+      return res.status(400).json({ success: false, message: "This record is already linked to an order" });
+    }
+    const order = await db
+      .collection(ORDERS)
+      .findOne(
+        { _id: new ObjectId(orderId) },
+        { projection: { lineItems: 1, invoiceNumber: 1, dispatchBatches: 1 } },
+      );
+    if (!order) return res.status(404).json({ success: false, message: "Sales order not found" });
+
+    const orderLines = Array.isArray(order.lineItems) ? order.lineItems : [];
+    const used = new Set();
+    const set = { skuMappedAt: new Date(), updatedAt: new Date() };
+    let linesMatched = 0;
+    for (const li of upload.lineItems || []) {
+      if (!li) continue;
+      const idx = orderLines.findIndex(
+        (ol, i) => !used.has(i) && ol && ol.sku && li.sku && ol.sku === li.sku,
+      );
+      if (idx === -1) continue;
+      used.add(idx);
+      linesMatched++;
+      set[`lineItems.${idx}.imbSku`] = li.imbSku;
+      if (li.dispatchedQty != null) {
+        set[`lineItems.${idx}.dispatchedQty`] = li.dispatchedQty;
+        if (li.dispatchedAt) set[`lineItems.${idx}.dispatchedAt`] = li.dispatchedAt;
+      }
+    }
+
+    // Carry the upload's recorded batches over so packing lists stay
+    // reprintable from the order. Batch lines snapshot sku/description/qty,
+    // so the upload-relative lineIndex values don't matter post-transfer;
+    // batch numbers continue the order's own sequence.
+    const orderUpdate = { $set: set };
+    const maxBatchNo = Array.isArray(order.dispatchBatches)
+      ? order.dispatchBatches.reduce((m, b) => Math.max(m, Number(b && b.batchNo) || 0), 0)
+      : 0;
+    const transferredBatches = (upload.dispatchBatches || []).map((b, i) => ({
+      ...b,
+      batchNo: maxBatchNo + i + 1,
+    }));
+    if (transferredBatches.length) {
+      orderUpdate.$push = { dispatchBatches: { $each: transferredBatches } };
+    }
+
+    await db.collection(ORDERS).updateOne({ _id: order._id }, orderUpdate);
+    await db.collection(DISPATCH_UPLOADS).updateOne(
+      { _id: upload._id },
+      {
+        $set: {
+          linkedOrderId: order._id,
+          linkedInvoiceNumber: order.invoiceNumber || null,
+          linkedAt: new Date(),
+          linkedBy: (req.user && req.user.username) || null,
+        },
+      },
+    );
+
+    return res.json({
+      success: true,
+      linesMatched,
+      linesTotal: (upload.lineItems || []).length,
+      orderInvoiceNumber: order.invoiceNumber || "",
+    });
+  } catch (e) {
+    console.error("InFlow dispatch link error:", e);
+    return res.status(500).json({ success: false, message: "Failed to link dispatch record" });
+  }
+});
+
+// ── DELETE /inflow/dispatch/manual/:id ──────────────────────────────
+// Remove an uploaded dispatch record that was created by mistake. Linked
+// records are kept for audit (their progress already lives on the order).
+router.delete("/dispatch/manual/:id", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const upload = await db
+      .collection(DISPATCH_UPLOADS)
+      .findOne({ _id: new ObjectId(req.params.id) }, { projection: { linkedOrderId: 1 } });
+    if (!upload) return res.status(404).json({ success: false, message: "Not found" });
+    if (upload.linkedOrderId) {
+      return res.status(400).json({ success: false, message: "Already linked to an order — cannot delete" });
+    }
+    await db.collection(DISPATCH_UPLOADS).deleteOne({ _id: upload._id });
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("InFlow dispatch delete error:", e);
+    return res.status(500).json({ success: false, message: "Failed to delete dispatch record" });
   }
 });
 
