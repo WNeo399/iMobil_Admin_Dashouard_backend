@@ -993,8 +993,25 @@ router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
     };
 
     await db.collection(coll).updateOne({ _id }, { $set: set, $push: { dispatchBatches: batch } });
+
+    // Auto Fulfill closed the record without those barcodes ever needing a
+    // mapping — drop their PENDING entries (sku still empty) so the SKU
+    // Mapping list doesn't accumulate noise. Mapped entries are untouched.
+    let mappingsRemoved = 0;
+    if (req.body && req.body.autoFulfill === true) {
+      const unmappedBarcodes = [
+        ...new Set(items.filter((li) => li && li.sku && !li.imbSku).map((li) => li.sku)),
+      ];
+      if (unmappedBarcodes.length) {
+        const cleanup = await db
+          .collection(SKU_MAP)
+          .deleteMany({ barcode: { $in: unmappedBarcodes }, sku: "" });
+        mappingsRemoved = cleanup.deletedCount || 0;
+      }
+    }
+
     const updated = await db.collection(coll).findOne({ _id }, { projection: { payments: 0 } });
-    return res.json({ success: true, batch, record: updated });
+    return res.json({ success: true, batch, record: updated, mappingsRemoved });
   } catch (e) {
     console.error("InFlow dispatch batch error:", e);
     return res.status(500).json({ success: false, message: "Failed to record dispatch batch" });
