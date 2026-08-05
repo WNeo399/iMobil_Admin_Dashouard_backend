@@ -30,9 +30,11 @@ const USERS = "users";
 // Manually uploaded dispatch lists (Order Dispatch → Upload List). Kept in
 // their own collection — NOT inflow_salesorders — so they can never leak
 // into the Sales Orders page or customer aggregates. Each doc carries a
-// hand-typed invoiceNumber and pre-mapped lineItems; linking it to a real
-// sales order later transfers the mapping + dispatch progress onto that
-// order and hides the upload from the dispatch list (linkedOrderId set).
+// hand-typed invoiceNumber and pre-mapped lineItems. A record can be
+// linked to a sales order (at upload time or later) — the link is PURELY a
+// relationship (linkedOrderId + linkedInvoiceNumber); nothing is
+// transferred and the record stays on the dispatch list, where the
+// warehouse keeps dispatching from it.
 const DISPATCH_UPLOADS = "inflow_dispatch_uploads";
 
 function num(v) {
@@ -792,7 +794,9 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
     const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
 
     const match = { lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } } };
-    const manualMatch = { linkedOrderId: null };
+    // Manual records stay listed whether linked or not — the link is just a
+    // relationship to a sales order, not a hand-off.
+    const manualMatch = {};
     const search = String(req.query.search || "").trim();
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
@@ -804,6 +808,7 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
       ];
       manualMatch.$or = [
         { invoiceNumber: rx },
+        { linkedInvoiceNumber: rx },
         { "lineItems.imbSku": rx },
         { "lineItems.sku": rx },
         { "lineItems.description": rx },
@@ -1091,6 +1096,43 @@ router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── GET /inflow/dispatch/manual ─────────────────────────────────────
+// Unlinked manual dispatch records, for the Sales Orders page's "Link
+// Dispatch" picker (the reverse direction of the dispatch page's Link
+// action — same underlying link endpoint either way).
+router.get("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const match = { linkedOrderId: null };
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), "i");
+      match.$or = [{ invoiceNumber: rx }, { "lineItems.imbSku": rx }, { "lineItems.sku": rx }];
+    }
+    const rows = await db
+      .collection(DISPATCH_UPLOADS)
+      .find(match)
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .toArray();
+    return res.json({
+      success: true,
+      rows: rows.map((r) => ({
+        _id: r._id,
+        invoiceNumber: r.invoiceNumber,
+        createdAt: r.createdAt,
+        createdBy: r.createdBy || null,
+        lineCount: Array.isArray(r.lineItems) ? r.lineItems.length : 0,
+        units: (r.lineItems || []).reduce((s, li) => s + (num(li && li.quantity) || 0), 0),
+        dispatchedUnits: (r.lineItems || []).reduce((s, li) => s + (num(li && li.dispatchedQty) || 0), 0),
+      })),
+    });
+  } catch (e) {
+    console.error("InFlow dispatch manual list error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load dispatch records" });
+  }
+});
+
 // ── POST /inflow/dispatch/manual ────────────────────────────────────
 // Create a dispatch record from an uploaded Excel list. The invoice number
 // is typed by the user; rows come pre-mapped ({ barcode, sku, description,
@@ -1132,17 +1174,45 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
 
     const db = await connectToDatabase();
     const now = new Date();
+
+    // Optional: link the record to a sales order right at upload time.
+    let linked = { linkedOrderId: null, linkedInvoiceNumber: null };
+    const rawOrderId = req.body && req.body.orderId;
+    if (rawOrderId) {
+      if (!ObjectId.isValid(rawOrderId)) {
+        return res.status(400).json({ success: false, message: "Bad order id" });
+      }
+      const order = await db
+        .collection(ORDERS)
+        .findOne({ _id: new ObjectId(rawOrderId) }, { projection: { invoiceNumber: 1 } });
+      if (!order) {
+        return res.status(404).json({ success: false, message: "Sales order not found" });
+      }
+      linked = {
+        linkedOrderId: order._id,
+        linkedInvoiceNumber: order.invoiceNumber || null,
+        linkedAt: now,
+        linkedBy: (req.user && req.user.username) || null,
+      };
+    }
+
     const doc = {
       invoiceNumber,
       source: "upload",
       lineItems,
-      linkedOrderId: null,
+      ...linked,
       createdAt: now,
       createdBy: (req.user && req.user.username) || null,
       updatedAt: now,
     };
     const r = await db.collection(DISPATCH_UPLOADS).insertOne(doc);
-    return res.json({ success: true, id: r.insertedId, lines: lineItems.length, skipped });
+    return res.json({
+      success: true,
+      id: r.insertedId,
+      lines: lineItems.length,
+      skipped,
+      linkedInvoiceNumber: linked.linkedInvoiceNumber,
+    });
   } catch (e) {
     console.error("InFlow dispatch upload error:", e);
     return res.status(500).json({ success: false, message: "Failed to create dispatch record" });
@@ -1150,86 +1220,61 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── POST /inflow/dispatch/manual/:id/link ───────────────────────────
-// Link an uploaded dispatch record to a real sales order. Transfers the
-// iMobile SKU mapping and any dispatch progress onto the order's line
-// items (greedy match by barcode, so duplicate lines each consume one),
-// then hides the upload from the dispatch list via linkedOrderId.
+// Link (re-link, or unlink) an uploaded dispatch record to a sales order.
+// PURELY a relationship — nothing is transferred and the record stays on
+// the dispatch list; the warehouse keeps dispatching from it. Body:
+// { orderId } to link, { orderId: null } to unlink.
 router.post("/dispatch/manual/:id/link", VIEW_ORDERS, async (req, res) => {
   try {
-    const orderId = req.body && req.body.orderId;
-    if (!ObjectId.isValid(req.params.id) || !ObjectId.isValid(orderId)) {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Bad id" });
     }
     const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
     const upload = await db
       .collection(DISPATCH_UPLOADS)
-      .findOne({ _id: new ObjectId(req.params.id) });
+      .findOne({ _id }, { projection: { _id: 1 } });
     if (!upload) return res.status(404).json({ success: false, message: "Upload record not found" });
-    if (upload.linkedOrderId) {
-      return res.status(400).json({ success: false, message: "This record is already linked to an order" });
+
+    const now = new Date();
+    const rawOrderId = req.body && req.body.orderId;
+    if (rawOrderId == null || rawOrderId === "") {
+      await db.collection(DISPATCH_UPLOADS).updateOne(
+        { _id },
+        {
+          $set: {
+            linkedOrderId: null,
+            linkedInvoiceNumber: null,
+            linkedAt: null,
+            linkedBy: null,
+            updatedAt: now,
+          },
+        },
+      );
+      return res.json({ success: true, unlinked: true });
+    }
+
+    if (!ObjectId.isValid(rawOrderId)) {
+      return res.status(400).json({ success: false, message: "Bad order id" });
     }
     const order = await db
       .collection(ORDERS)
-      .findOne(
-        { _id: new ObjectId(orderId) },
-        { projection: { lineItems: 1, invoiceNumber: 1, dispatchBatches: 1 } },
-      );
+      .findOne({ _id: new ObjectId(rawOrderId) }, { projection: { invoiceNumber: 1 } });
     if (!order) return res.status(404).json({ success: false, message: "Sales order not found" });
 
-    const orderLines = Array.isArray(order.lineItems) ? order.lineItems : [];
-    const used = new Set();
-    const set = { skuMappedAt: new Date(), updatedAt: new Date() };
-    let linesMatched = 0;
-    for (const li of upload.lineItems || []) {
-      if (!li) continue;
-      const idx = orderLines.findIndex(
-        (ol, i) => !used.has(i) && ol && ol.sku && li.sku && ol.sku === li.sku,
-      );
-      if (idx === -1) continue;
-      used.add(idx);
-      linesMatched++;
-      set[`lineItems.${idx}.imbSku`] = li.imbSku;
-      if (li.dispatchedQty != null) {
-        set[`lineItems.${idx}.dispatchedQty`] = li.dispatchedQty;
-        if (li.dispatchedAt) set[`lineItems.${idx}.dispatchedAt`] = li.dispatchedAt;
-      }
-    }
-
-    // Carry the upload's recorded batches over so packing lists stay
-    // reprintable from the order. Batch lines snapshot sku/description/qty,
-    // so the upload-relative lineIndex values don't matter post-transfer;
-    // batch numbers continue the order's own sequence.
-    const orderUpdate = { $set: set };
-    const maxBatchNo = Array.isArray(order.dispatchBatches)
-      ? order.dispatchBatches.reduce((m, b) => Math.max(m, Number(b && b.batchNo) || 0), 0)
-      : 0;
-    const transferredBatches = (upload.dispatchBatches || []).map((b, i) => ({
-      ...b,
-      batchNo: maxBatchNo + i + 1,
-    }));
-    if (transferredBatches.length) {
-      orderUpdate.$push = { dispatchBatches: { $each: transferredBatches } };
-    }
-
-    await db.collection(ORDERS).updateOne({ _id: order._id }, orderUpdate);
     await db.collection(DISPATCH_UPLOADS).updateOne(
-      { _id: upload._id },
+      { _id },
       {
         $set: {
           linkedOrderId: order._id,
           linkedInvoiceNumber: order.invoiceNumber || null,
-          linkedAt: new Date(),
+          linkedAt: now,
           linkedBy: (req.user && req.user.username) || null,
+          updatedAt: now,
         },
       },
     );
-
-    return res.json({
-      success: true,
-      linesMatched,
-      linesTotal: (upload.lineItems || []).length,
-      orderInvoiceNumber: order.invoiceNumber || "",
-    });
+    return res.json({ success: true, orderInvoiceNumber: order.invoiceNumber || "" });
   } catch (e) {
     console.error("InFlow dispatch link error:", e);
     return res.status(500).json({ success: false, message: "Failed to link dispatch record" });
@@ -1237,22 +1282,20 @@ router.post("/dispatch/manual/:id/link", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── DELETE /inflow/dispatch/manual/:id ──────────────────────────────
-// Remove an uploaded dispatch record that was created by mistake. Linked
-// records are kept for audit (their progress already lives on the order).
+// Remove an uploaded dispatch record. The link is just a relationship, so
+// linked records are deletable too — the confirm dialog is the guard.
 router.delete("/dispatch/manual/:id", VIEW_ORDERS, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Bad id" });
     }
     const db = await connectToDatabase();
-    const upload = await db
+    const r = await db
       .collection(DISPATCH_UPLOADS)
-      .findOne({ _id: new ObjectId(req.params.id) }, { projection: { linkedOrderId: 1 } });
-    if (!upload) return res.status(404).json({ success: false, message: "Not found" });
-    if (upload.linkedOrderId) {
-      return res.status(400).json({ success: false, message: "Already linked to an order — cannot delete" });
+      .deleteOne({ _id: new ObjectId(req.params.id) });
+    if (r.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Not found" });
     }
-    await db.collection(DISPATCH_UPLOADS).deleteOne({ _id: upload._id });
     return res.json({ success: true });
   } catch (e) {
     console.error("InFlow dispatch delete error:", e);
