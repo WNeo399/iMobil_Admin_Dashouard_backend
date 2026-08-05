@@ -1096,6 +1096,95 @@ router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── GET /inflow/dispatch/owing ──────────────────────────────────────
+// Outstanding stock across every dispatch source: line items whose
+// dispatched quantity is still short of the ordered quantity, grouped by
+// SKU with the owing amounts summed and the contributing orders listed.
+// Sources mirror the dispatch page: sales orders with mapped lines plus
+// every manual upload record.
+router.get("/dispatch/owing", VIEW_ORDERS, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const [orders, uploads] = await Promise.all([
+      db
+        .collection(ORDERS)
+        .find(
+          { lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } } },
+          { projection: { invoiceNumber: 1, lineItems: 1 } },
+        )
+        .toArray(),
+      db
+        .collection(DISPATCH_UPLOADS)
+        .find({}, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1 } })
+        .toArray(),
+    ]);
+
+    // Group by iMobile SKU; lines without one fall back to barcode +
+    // description so they still aggregate consistently.
+    const byKey = new Map();
+    const add = (rec, type, li) => {
+      const ordered = Number(li.quantity) || 0;
+      const dispatched = Number(li.dispatchedQty) || 0;
+      const owing = ordered - dispatched;
+      if (owing <= 0) return;
+      const imbSku = String(li.imbSku || "").trim();
+      const key = imbSku || `raw:${li.sku || ""}|${li.description || ""}`;
+      let row = byKey.get(key);
+      if (!row) {
+        row = {
+          imbSku,
+          sku: li.sku || "",
+          description: li.description || "",
+          owing: 0,
+          ordered: 0,
+          dispatched: 0,
+          orders: [],
+        };
+        byKey.set(key, row);
+      }
+      row.owing += owing;
+      row.ordered += ordered;
+      row.dispatched += dispatched;
+      if (!row.description && li.description) row.description = li.description;
+      // Duplicate lines within one order merge into a single orders entry.
+      const existing = row.orders.find((o) => String(o.id) === String(rec._id));
+      if (existing) existing.owing += owing;
+      else {
+        row.orders.push({
+          id: rec._id,
+          invoiceNumber: rec.invoiceNumber || "",
+          type,
+          owing,
+        });
+      }
+    };
+    for (const o of orders) for (const li of o.lineItems || []) if (li) add(o, "order", li);
+    for (const u of uploads) for (const li of u.lineItems || []) if (li) add(u, "manual", li);
+
+    let rows = [...byKey.values()];
+    const search = String(req.query.search || "").trim().toLowerCase();
+    if (search) {
+      rows = rows.filter(
+        (r) =>
+          r.imbSku.toLowerCase().includes(search) ||
+          String(r.sku).toLowerCase().includes(search) ||
+          String(r.description).toLowerCase().includes(search) ||
+          r.orders.some((o) => String(o.invoiceNumber).toLowerCase().includes(search)),
+      );
+    }
+    rows.sort((a, b) => b.owing - a.owing);
+    return res.json({
+      success: true,
+      total: rows.length,
+      totalOwing: rows.reduce((s, r) => s + r.owing, 0),
+      rows,
+    });
+  } catch (e) {
+    console.error("InFlow owing stocks error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load owing stocks" });
+  }
+});
+
 // ── GET /inflow/dispatch/manual ─────────────────────────────────────
 // Unlinked manual dispatch records, for the Sales Orders page's "Link
 // Dispatch" picker (the reverse direction of the dispatch page's Link
