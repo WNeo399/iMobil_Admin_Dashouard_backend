@@ -160,8 +160,11 @@ Answering — ALWAYS finish by calling the present_answer tool exactly once. Nev
 - view "table": a list or comparison of several items (e.g. cheapest offers, offers per seller). Pick the most useful columns (Model, Grade, Price, Seller, …) — not every column — and only the rows that matter.
 - view "card": the details of ONE specific product, or ANY factual answer — lay the facts out as labelled fields (title, subtitle, fields like Price / Seller / Grade / Stock…). Prefer a card over plain text: even a single number reads better as a card with a label.
 - view "chart": a trend over time or a numeric comparison across categories — supply charts: 1–3 chart objects {type, title, xLabels, series}. ALSO supply a card with the key facts (model, period, net change, units sold, …) — it is shown above the chart. Metrics with different scales (e.g. stock vs price) go in SEPARATE charts, not one. Use 'line' for time series, 'bar' for category comparisons.
-- view "text": ONLY for out-of-scope declines, refusals, or when the data can't answer — never for a factual answer that could be a card.
+- view "text": ONLY for out-of-scope declines, refusals, when the data can't answer, or when you need more information from the user — never for a factual answer that could be a card.
 - Always set a one-sentence \`summary\`. If the data can't answer the question, use view "text" and say so briefly.
+- NEED MORE INFO? Never stop at "I need a few more details" — that alone tells the user nothing. Use view "text", put the one-line ask in \`summary\`, and supply \`questions\`: 1–3 questions, each with 2–4 CLICKABLE options the user can tap (they can still type a free answer). Offer real, likely values — e.g. question "Which HKD→AUD rate should I use?" options "0.19 (current)", "0.20", or question "Which battery?" options "Original (80%)", "New (100%)". Where sensible, make the first option the one you'd assume by default.
+- Better still: if a sensible assumption exists, ANSWER with it and state the assumption in \`details\` rather than asking at all.
+- \`details\` is for short caveats or the assumptions behind a normal answer. Keep prose out of your reply text — anything you want the user to read goes in \`summary\`, \`details\` or \`questions\`.
 - Size limit: keep any table to at most ~40 rows. If the full result is larger, present the most relevant rows and state in the summary how many were omitted — the user can narrow the question or ask for the rest.
 
 Database: jb_marketplace (MySQL 8).
@@ -211,6 +214,35 @@ const TOOLS = [
       properties: {
         view: { type: "string", enum: ["table", "card", "text", "chart"], description: "How to display the answer." },
         summary: { type: "string", description: "One short sentence summarising the answer." },
+        details: {
+          type: "string",
+          description:
+            "Optional extra lines shown under the summary — short caveats or the assumptions behind the answer. Plain text only — no SQL, no tables. When you're asking for missing info, put the choices in `questions` instead and keep this to one line of context (or leave it out).",
+        },
+        questions: {
+          type: "array",
+          description:
+            "Ask the user for missing information as CLICKABLE choices (use with view 'text'). 1–3 questions, each with 2–4 short options; the user can also type a free answer. Always prefer this over asking in prose — it's one tap instead of typing. Give real, likely values as options (e.g. an exchange rate you can use, 'Original battery (80%)' / 'New battery (100%)'), and where sensible make one of them the option you'd assume by default.",
+          items: {
+            type: "object",
+            properties: {
+              question: { type: "string", description: "The question, one short sentence." },
+              options: {
+                type: "array",
+                description: "2–4 choices.",
+                items: {
+                  type: "object",
+                  properties: {
+                    label: { type: "string", description: "Short button text (a few words)." },
+                    hint: { type: "string", description: "Optional one-line explanation shown under the label." },
+                  },
+                  required: ["label"],
+                },
+              },
+            },
+            required: ["question", "options"],
+          },
+        },
         columns: {
           type: "array",
           items: { type: "string" },
@@ -275,7 +307,27 @@ function sanitizeResult(input) {
   const inp = input && typeof input === "object" ? input : {};
   const view = ["table", "card", "text", "chart"].includes(inp.view) ? inp.view : "text";
   const str = (v, n) => (v == null ? "" : String(v).slice(0, n));
-  const out = { view, summary: str(inp.summary, 2000) };
+  const out = { view, summary: str(inp.summary, 2000), details: str(inp.details, 4000) };
+  // Clarifying questions rendered as clickable choices in the chat.
+  if (Array.isArray(inp.questions) && inp.questions.length) {
+    out.questions = inp.questions
+      .slice(0, 3)
+      .filter((q) => q && typeof q === "object" && q.question)
+      .map((q) => ({
+        question: str(q.question, 200),
+        options: (Array.isArray(q.options) ? q.options : [])
+          .slice(0, 4)
+          .filter((o) => o && (typeof o === "object" ? o.label : o))
+          .map((o) =>
+            typeof o === "object"
+              ? { label: str(o.label, 60), hint: str(o.hint, 120) }
+              : { label: str(o, 60), hint: "" },
+          )
+          .filter((o) => o.label),
+      }))
+      .filter((q) => q.options.length >= 2);
+    if (!out.questions.length) delete out.questions;
+  }
   const sanitizeCard = (card) => ({
     title: str(card.title, 200),
     subtitle: str(card.subtitle, 200),
@@ -484,6 +536,19 @@ router.post("/ask", VIEW, async function (req, res) {
       );
       if (present) {
         const result = sanitizeResult(present.input);
+        // Any prose the model wrote alongside present_answer used to be
+        // dropped on the floor — which is how "Need a couple more details
+        // before I can calculate the margin." reached the user with the
+        // actual questions missing. Keep it as the details body instead.
+        if (!result.details) {
+          const prose = resp.content
+            .filter((b) => b.type === "text" && typeof b.text === "string")
+            .map((b) => b.text.trim())
+            .filter(Boolean)
+            .join("\n")
+            .trim();
+          if (prose && prose !== result.summary) result.details = prose.slice(0, 4000);
+        }
         send({ type: "result", success: true, answer: result.summary || "", result, steps, model: resp.model });
         return res.end();
       }
