@@ -108,9 +108,10 @@ router.get("/skuLookup", requireAnyPermission("sqt:case:sendParts", "zoho:collec
   }
 });
 
-// Barcode-label data for one SKU: product name + Selling Price (the item's
-// Sales Price) + Platinum-pricebook rate — everything the Tools → Barcode
-// Generator needs to print a product label. Same Analytics views as /skuLookup.
+// Barcode-label data for one SKU: product name + Retail Price (the item's
+// cf_retail_price custom field in Zoho Inventory — the Sales Price used
+// previously was often stale) + Platinum-pricebook rate — everything the
+// Tools → Barcode Generator needs to print a product label.
 router.get(
   "/labelData",
   requireAnyPermission("zoho:salesOrder:create", "zoho:collection:view"),
@@ -125,6 +126,7 @@ router.get(
       const ITEMS_VIEW_ID = "1404913000003936100";
       const PRICES_VIEW_ID = "1404913000003936194";
       const PLATINUM_PRICEBOOK_ID = "2591985000001439015";
+      const ORGANIZATION_ID = "746138234";
 
       const buildUrl = (viewId, config) =>
         `https://analyticsapi.zoho.com/restapi/v2/workspaces/${WORKSPACE_ID}/views/${viewId}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
@@ -138,7 +140,7 @@ router.get(
       const itemRows = await getViewData(
         buildUrl(ITEMS_VIEW_ID, {
           responseFormat: "json",
-          selectedColumns: ["Item ID", "Item Name", "SKU", "Sales Price"],
+          selectedColumns: ["Item ID", "Item Name", "SKU"],
           criteria: `"SKU" = '${esc(skuRaw)}'`,
         }),
       );
@@ -151,17 +153,37 @@ router.get(
       const itemId = item["Item ID"];
 
       let platinumPrice = null;
+      let retailPrice = null;
       if (itemId) {
-        const priceRows = await getViewData(
-          buildUrl(PRICES_VIEW_ID, {
-            responseFormat: "json",
-            selectedColumns: ["PriceList Rate"],
-            criteria: `"Product ID" = '${esc(itemId)}' AND "PriceList ID" = '${PLATINUM_PRICEBOOK_ID}'`,
-          }),
-        );
+        const [priceRows, detail] = await Promise.all([
+          getViewData(
+            buildUrl(PRICES_VIEW_ID, {
+              responseFormat: "json",
+              selectedColumns: ["PriceList Rate"],
+              criteria: `"Product ID" = '${esc(itemId)}' AND "PriceList ID" = '${PLATINUM_PRICEBOOK_ID}'`,
+            }),
+          ),
+          handleZohoInventoryRequest(
+            `https://www.zohoapis.com/inventory/v1/items/${itemId}?organization_id=${ORGANIZATION_ID}`,
+          ),
+        ]);
         if (Array.isArray(priceRows) && priceRows.length > 0) {
           platinumPrice = money(priceRows[0]["PriceList Rate"]);
         }
+        // cf_retail_price lives in the item's custom_fields (the flattened
+        // cf_* convenience props aren't returned by this endpoint). null
+        // when the product doesn't have it filled in — the UI lets the
+        // user type it manually in that case.
+        const it = detail && detail.item;
+        let raw =
+          it && it.cf_retail_price_unformatted != null
+            ? it.cf_retail_price_unformatted
+            : it && it.cf_retail_price;
+        if (raw == null && it && Array.isArray(it.custom_fields)) {
+          const cf = it.custom_fields.find((c) => c && c.api_name === "cf_retail_price");
+          if (cf) raw = cf.value != null && cf.value !== "" ? cf.value : cf.value_formatted;
+        }
+        retailPrice = money(raw);
       }
 
       return res.json({
@@ -170,7 +192,7 @@ router.get(
           itemId: itemId ? String(itemId) : null,
           sku: skuRaw,
           name: item["Item Name"] || "",
-          sellingPrice: money(item["Sales Price"]),
+          retailPrice,
           platinumPrice,
         },
       });
