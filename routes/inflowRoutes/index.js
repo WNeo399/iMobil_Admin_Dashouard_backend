@@ -970,6 +970,9 @@ router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
           : 0) + 1,
       at: now,
       by: (req.user && req.user.username) || null,
+      // Courier tracking number for this consignment — optional at record
+      // time (often only known once the label is printed) and editable later.
+      tracking: String((req.body && req.body.tracking) || "").trim().slice(0, 100),
       units: batchLines.reduce((s, l) => s + l.qty, 0),
       lines: batchLines,
     };
@@ -1001,11 +1004,13 @@ router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── PUT /inflow/dispatch/:id/batch/:batchNo ─────────────────────────
-// Update a recorded batch's quantities. Body: { lines: [{ lineIndex,
-// qty }], type? } covering the batch's lines — qty 0 removes a line, and
-// a batch whose every line hits 0 is deleted. The difference against the
-// old quantities is applied to the affected lineItems' dispatchedQty, so
-// the order's totals stay truthful. Same over-dispatch guard as recording.
+// Update a recorded batch. Body: { lines?: [{ lineIndex, qty }],
+// tracking?, type? }. Lines cover the batch's quantities — qty 0 removes
+// a line, and a batch whose every line hits 0 is deleted; the difference
+// against the old quantities is applied to the affected lineItems'
+// dispatchedQty so totals stay truthful (same over-dispatch guard as
+// recording). Send `tracking` alone to attach/correct the tracking number
+// without touching quantities.
 router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -1080,6 +1085,12 @@ router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
       set[`dispatchBatches.${bIdx}.units`] = newLines.reduce((s, l) => s + l.qty, 0);
       set[`dispatchBatches.${bIdx}.editedAt`] = now;
       set[`dispatchBatches.${bIdx}.editedBy`] = (req.user && req.user.username) || null;
+      // Tracking is independent of quantities — only written when supplied,
+      // so a quantity edit never wipes an existing number.
+      if (req.body && req.body.tracking !== undefined) {
+        set[`dispatchBatches.${bIdx}.tracking`] =
+          String(req.body.tracking || "").trim().slice(0, 100);
+      }
       await db.collection(coll).updateOne({ _id }, { $set: set });
     } else {
       // Every line zeroed — the batch itself goes away. Two steps because
