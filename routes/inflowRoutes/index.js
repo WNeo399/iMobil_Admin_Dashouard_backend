@@ -789,30 +789,21 @@ router.post("/salesorders/:id/skumap", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── GET /inflow/dispatch ────────────────────────────────────────────
-// Orders that have at least one line item mapped to an iMobile SKU, plus
-// unlinked manual dispatch uploads, with full line items so the warehouse
-// can record dispatched quantities. Manual records sort by their upload
-// time (surfaced as invoiceDate) and carry recordType: "manual".
+// Dispatch records are created ONLY by manual upload — sales orders never
+// appear here on their own (linking is a reference; mapping stamps on
+// orders are metadata). Records sort by upload time (surfaced as
+// invoiceDate) and carry recordType: "manual".
 router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
   try {
     const db = await connectToDatabase();
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
 
-    const match = { lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } } };
-    // Manual records stay listed whether linked or not — the link is just a
-    // relationship to a sales order, not a hand-off.
-    const manualMatch = {};
+    const match = {};
     const search = String(req.query.search || "").trim();
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
       match.$or = [
-        { invoiceNumber: rx },
-        { customerName: rx },
-        { "lineItems.imbSku": rx },
-        { "lineItems.sku": rx },
-      ];
-      manualMatch.$or = [
         { invoiceNumber: rx },
         { linkedInvoiceNumber: rx },
         { customerName: rx },
@@ -823,19 +814,10 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
     }
 
     const [agg] = await db
-      .collection(ORDERS)
+      .collection(DISPATCH_UPLOADS)
       .aggregate([
         { $match: match },
-        { $addFields: { recordType: "order" } },
-        {
-          $unionWith: {
-            coll: DISPATCH_UPLOADS,
-            pipeline: [
-              { $match: manualMatch },
-              { $addFields: { recordType: "manual", invoiceDate: "$createdAt" } },
-            ],
-          },
-        },
+        { $addFields: { recordType: "manual", invoiceDate: "$createdAt" } },
         { $sort: { invoiceDate: -1, _id: -1 } },
         {
           $facet: {
@@ -1121,14 +1103,14 @@ router.put("/dispatch/:id/batch/:batchNo", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── SKU Mapping (customer barcode → iMobile SKU) ────────────────────
-// Stamp `imbSku` onto existing orders' line items for the given mappings.
-// Used after every mapping save/import so orders already in the system
-// pick the mapping up immediately (future orders get it at webhook ingest).
-// Pending mappings (barcode imported without a SKU yet) are skipped.
-async function applySkuMappingsToOrders(db, allMappings) {
+// Mappings are NEVER applied retroactively to existing sales orders —
+// they feed lookups going forward only (webhook ingest of new payloads).
+// Manual DISPATCH RECORDS are different: they're the operational objects,
+// so completing a mapping stamps their matching lines immediately.
+async function applySkuMappingsToUploads(db, allMappings) {
   const mappings = allMappings.filter((m) => m && m.sku);
   if (!mappings.length) return { modified: 0 };
-  const r = await db.collection(ORDERS).bulkWrite(
+  const r = await db.collection(DISPATCH_UPLOADS).bulkWrite(
     mappings.map((m) => ({
       updateMany: {
         filter: { "lineItems.sku": m.barcode },
@@ -1179,9 +1161,9 @@ router.get("/skumap", VIEW_ORDERS, async (req, res) => {
   }
 });
 
-// POST /inflow/skumap — create or update ONE mapping (upsert by barcode),
-// then retro-apply it to existing orders. SKU may be empty — the mapping
-// is saved as pending until staff fill the SKU in.
+// POST /inflow/skumap — create or update ONE mapping (upsert by barcode).
+// SKU may be empty — the mapping is saved as pending until staff fill the
+// SKU in. No retroactive application to existing orders.
 router.post("/skumap", VIEW_ORDERS, async (req, res) => {
   try {
     const barcode = String((req.body && req.body.barcode) || "").trim();
@@ -1200,8 +1182,10 @@ router.post("/skumap", VIEW_ORDERS, async (req, res) => {
       },
       { upsert: true },
     );
-    const applied = await applySkuMappingsToOrders(db, [{ barcode, sku }]);
-    return res.json({ success: true, pending: !sku, ordersUpdated: applied.modified });
+    // Completing a mapping stamps matching lines on manual dispatch
+    // records (never on sales orders).
+    const applied = await applySkuMappingsToUploads(db, [{ barcode, sku }]);
+    return res.json({ success: true, pending: !sku, recordsUpdated: applied.modified });
   } catch (e) {
     console.error("InFlow skumap save error:", e);
     return res.status(500).json({ success: false, message: "Failed to save SKU mapping" });
@@ -1211,8 +1195,8 @@ router.post("/skumap", VIEW_ORDERS, async (req, res) => {
 // POST /inflow/skumap/import — bulk rows from an Excel upload:
 // { rows: [{ barcode, sku?, description? }] }. Only the barcode is
 // required — rows without a SKU import as PENDING mappings for staff to
-// fill in on the dashboard. Last occurrence of a barcode wins; mapped
-// rows retro-apply to existing orders.
+// fill in on the dashboard. Last occurrence of a barcode wins. Existing
+// orders are never touched.
 router.post("/skumap/import", VIEW_ORDERS, async (req, res) => {
   try {
     const rows = Array.isArray(req.body && req.body.rows) ? req.body.rows : null;
@@ -1250,13 +1234,14 @@ router.post("/skumap/import", VIEW_ORDERS, async (req, res) => {
       })),
       { ordered: false },
     );
-    const applied = await applySkuMappingsToOrders(db, mappings);
+    // Completed mappings stamp matching lines on manual dispatch records
+    // (never on sales orders).
+    await applySkuMappingsToUploads(db, mappings);
     return res.json({
       success: true,
       mappings: mappings.length,
       pending: mappings.filter((m) => !m.sku).length,
       skipped,
-      ordersUpdated: applied.modified,
     });
   } catch (e) {
     console.error("InFlow skumap import error:", e);
@@ -1283,27 +1268,17 @@ router.delete("/skumap/:id", VIEW_ORDERS, async (req, res) => {
 });
 
 // ── GET /inflow/dispatch/owing ──────────────────────────────────────
-// Outstanding stock across every dispatch source: line items whose
-// dispatched quantity is still short of the ordered quantity, grouped by
-// SKU with the owing amounts summed and the contributing orders listed.
-// Sources mirror the dispatch page: sales orders with mapped lines plus
-// every manual upload record.
+// Outstanding stock: line items whose dispatched quantity is still short
+// of the ordered quantity, grouped by SKU with the owing amounts summed
+// and the contributing records listed. Mirrors the dispatch page — manual
+// upload records only.
 router.get("/dispatch/owing", VIEW_ORDERS, async (req, res) => {
   try {
     const db = await connectToDatabase();
-    const [orders, uploads] = await Promise.all([
-      db
-        .collection(ORDERS)
-        .find(
-          { lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } } },
-          { projection: { invoiceNumber: 1, lineItems: 1 } },
-        )
-        .toArray(),
-      db
-        .collection(DISPATCH_UPLOADS)
-        .find({}, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1 } })
-        .toArray(),
-    ]);
+    const uploads = await db
+      .collection(DISPATCH_UPLOADS)
+      .find({}, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1 } })
+      .toArray();
 
     // Group by iMobile SKU; lines without one fall back to barcode +
     // description so they still aggregate consistently.
@@ -1344,7 +1319,6 @@ router.get("/dispatch/owing", VIEW_ORDERS, async (req, res) => {
         });
       }
     };
-    for (const o of orders) for (const li of o.lineItems || []) if (li) add(o, "order", li);
     for (const u of uploads) for (const li of u.lineItems || []) if (li) add(u, "manual", li);
 
     let rows = [...byKey.values()];
@@ -1410,9 +1384,12 @@ router.get("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
 
 // ── POST /inflow/dispatch/manual ────────────────────────────────────
 // Create a dispatch record from an uploaded Excel list. The invoice number
-// is typed by the user; rows come pre-mapped ({ barcode, sku, description,
-// quantity } where sku is the real iMobile warehouse SKU). The record can
-// be linked to a real sales order later.
+// is typed by the user; rows are { barcode?, sku?, description, quantity }
+// where sku is the real iMobile warehouse SKU. SKU is OPTIONAL — a row
+// with only a barcode creates an unmapped line (auto-filled from an
+// existing mapping when one is known) plus a PENDING SKU Mapping entry;
+// staff map it later on the SKU Mapping page or in the dispatch dialog.
+// The record can be linked to a real sales order later.
 router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
   try {
     const invoiceNumber = String((req.body && req.body.invoiceNumber) || "").trim();
@@ -1431,24 +1408,41 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
     const lineItems = [];
     for (const r of rows) {
       const imbSku = String((r && r.sku) || "").trim();
+      const barcode = String((r && r.barcode) || "").trim();
       const quantity = Number(r && r.quantity);
-      if (!imbSku || !Number.isFinite(quantity) || quantity <= 0) { skipped++; continue; }
+      if ((!imbSku && !barcode) || !Number.isFinite(quantity) || quantity <= 0) { skipped++; continue; }
       lineItems.push({
         // Same line shape as a sales order: sku = the barcode, imbSku = the
         // warehouse SKU — so the dispatch page (and the link step) treat
         // manual lines exactly like mapped order lines.
-        sku: String((r && r.barcode) || "").trim(),
+        sku: barcode,
         imbSku,
         description: String((r && r.description) || "").trim(),
         quantity,
       });
     }
     if (!lineItems.length) {
-      return res.status(400).json({ success: false, message: "No usable rows — every row needs a SKU and a positive Quantity" });
+      return res.status(400).json({ success: false, message: "No usable rows — every row needs a positive Quantity and a SKU or Barcode" });
     }
 
     const db = await connectToDatabase();
     const now = new Date();
+
+    // Rows uploaded without a SKU borrow it from an existing mapping when
+    // the barcode is already known.
+    const lookupBarcodes = [
+      ...new Set(lineItems.filter((li) => !li.imbSku && li.sku).map((li) => li.sku)),
+    ];
+    if (lookupBarcodes.length) {
+      const known = await db
+        .collection(SKU_MAP)
+        .find({ barcode: { $in: lookupBarcodes }, sku: { $nin: ["", null] } })
+        .toArray();
+      const skuByBarcode = new Map(known.map((m) => [m.barcode, m.sku]));
+      for (const li of lineItems) {
+        if (!li.imbSku && skuByBarcode.has(li.sku)) li.imbSku = skuByBarcode.get(li.sku);
+      }
+    }
 
     // Optional: link the record to a sales order right at upload time.
     let linked = { linkedOrderId: null, linkedInvoiceNumber: null };
@@ -1505,11 +1499,70 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
       updatedAt: now,
     };
     const r = await db.collection(DISPATCH_UPLOADS).insertOne(doc);
+
+    // Every uploaded row that carries a barcode also feeds the global SKU
+    // Mapping list. Rows WITH a SKU upsert a matched mapping (last upload
+    // wins); rows WITHOUT one create a PENDING entry only if the barcode
+    // is new — an existing matched mapping is never downgraded. Existing
+    // sales orders are NEVER retro-applied.
+    const mapByBarcode = new Map();
+    for (const li of lineItems) {
+      if (li.sku) mapByBarcode.set(li.sku, { sku: li.imbSku, description: li.description });
+    }
+    const by = (req.user && req.user.username) || null;
+    const matched = [...mapByBarcode].filter(([, m]) => m.sku);
+    const pendingRows = [...mapByBarcode].filter(([, m]) => !m.sku);
+    let mappingsSaved = 0;
+    let pendingSaved = 0;
+    if (matched.length) {
+      await db.collection(SKU_MAP).bulkWrite(
+        matched.map(([barcode, m]) => ({
+          updateOne: {
+            filter: { barcode },
+            update: {
+              $set: { sku: m.sku, description: m.description, updatedAt: now, updatedBy: by },
+              $setOnInsert: { barcode, createdAt: now },
+            },
+            upsert: true,
+          },
+        })),
+        { ordered: false },
+      );
+      mappingsSaved = matched.length;
+      // Other dispatch records with the same barcodes pick the SKUs up too.
+      await applySkuMappingsToUploads(db, matched.map(([barcode, m]) => ({ barcode, sku: m.sku })));
+    }
+    if (pendingRows.length) {
+      const pr = await db.collection(SKU_MAP).bulkWrite(
+        pendingRows.map(([barcode, m]) => ({
+          updateOne: {
+            filter: { barcode },
+            update: {
+              $setOnInsert: {
+                barcode,
+                sku: "",
+                description: m.description,
+                createdAt: now,
+                updatedAt: now,
+                updatedBy: by,
+              },
+            },
+            upsert: true,
+          },
+        })),
+        { ordered: false },
+      );
+      pendingSaved = pr.upsertedCount || 0;
+    }
+
     return res.json({
       success: true,
       id: r.insertedId,
       lines: lineItems.length,
+      unmappedLines: lineItems.filter((li) => !li.imbSku).length,
       skipped,
+      mappingsSaved,
+      pendingSaved,
       linkedInvoiceNumber: linked.linkedInvoiceNumber,
       customerName: customer.customerName,
     });
