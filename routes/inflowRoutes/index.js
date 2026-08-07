@@ -17,6 +17,10 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { hashPassword } = require("../../utils/authToken");
+const {
+  getViewData,
+  handleZohoInventoryPostRequest,
+} = require("../../utils/zohoRequest");
 
 const VIEW_ORDERS = requirePermission("inflow:order:view");
 const VIEW_CUSTOMERS = requirePermission("inflow:customer:view");
@@ -531,6 +535,34 @@ router.get("/customers", VIEW_CUSTOMERS, async (req, res) => {
       ])
       .toArray();
 
+    // The aggregate above only knows customers that HAVE orders. Customers
+    // created up front (e.g. to link a dispatch record to, before any order
+    // exists) live in inflow_customers — fold them in with zeroed figures
+    // so they're visible and manageable here too.
+    const knownNames = new Set(rows.map((r) => r.name));
+    const custMatch = {};
+    if (search) custMatch.name = { $regex: escapeRegex(search), $options: "i" };
+    const custDocs = await db
+      .collection(CUSTOMERS)
+      .find(custMatch, { projection: { name: 1 } })
+      .limit(1000)
+      .toArray();
+    for (const c of custDocs) {
+      if (!c.name || knownNames.has(c.name)) continue;
+      rows.push({
+        _id: c.name,
+        name: c.name,
+        orderCount: 0,
+        totalAmount: 0,
+        invoiced: 0,
+        credits: 0,
+        paid: 0,
+        outstanding: 0,
+        lastInvoiceDate: null,
+      });
+    }
+    rows.sort((a, b) => (b.outstanding - a.outstanding) || String(a.name).localeCompare(String(b.name)));
+
     // Annotate each customer with portal status + login count.
     const names = rows.map((r) => r.name).filter(Boolean);
     if (names.length) {
@@ -578,7 +610,17 @@ router.get("/filters", VIEW_ORDERS, async (req, res) => {
           .toArray()
       ).map((r) => r._id);
     const [customers, vendors] = await Promise.all([distinct("customerName"), distinct("vendor")]);
-    return res.json({ success: true, customers, vendors });
+    // Customers created up front (no orders yet) also belong in the picker —
+    // a dispatch record often exists before any InFlow sales order does.
+    const custDocs = await db
+      .collection(CUSTOMERS)
+      .find({ name: { $nin: [null, ""] } }, { projection: { name: 1 } })
+      .limit(2000)
+      .toArray();
+    const allCustomers = [...new Set(customers.concat(custDocs.map((c) => c.name)))].sort((a, b) =>
+      String(a).localeCompare(String(b)),
+    );
+    return res.json({ success: true, customers: allCustomers, vendors });
   } catch (e) {
     console.error("InFlow filters error:", e);
     return res.status(500).json({ success: false, message: "Failed to load filters" });
@@ -1022,6 +1064,97 @@ router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── Zoho stock deduction for a dispatch batch ───────────────────────
+// Recording a batch means the goods physically left, so the same units are
+// written off in Zoho Inventory as a negative quantity adjustment. The
+// adjustment id is stored on the batch for traceability.
+const ZOHO_ORG_ID = "746138234";
+const ZOHO_ITEMS_VIEW_ID = "1404913000003936100";
+const ZOHO_WORKSPACE_ID = "1404913000003936002";
+// Its own reason so dispatch write-offs stay separable from stocktakes,
+// repairs and the other adjustment types in reporting.
+const DISPATCH_ADJUSTMENT_REASON = "Dispatch on Dashboard";
+
+// iMobile SKU → Zoho item_id for a set of SKUs, in ONE Analytics query
+// (per-SKU lookups would burn through Zoho's rate limit on a big batch).
+async function resolveZohoItemIds(skus) {
+  const list = [...new Set((skus || []).map((s) => String(s || "").trim()).filter(Boolean))];
+  if (!list.length) return new Map();
+  const inClause = list.map((s) => `'${s.replace(/'/g, "''")}'`).join(",");
+  const config = {
+    responseFormat: "json",
+    selectedColumns: ["Item ID", "SKU"],
+    criteria: `"SKU" IN (${inClause})`,
+  };
+  const url = `https://analyticsapi.zoho.com/restapi/v2/workspaces/${ZOHO_WORKSPACE_ID}/views/${ZOHO_ITEMS_VIEW_ID}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
+  const rows = await getViewData(url);
+  const map = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const sku = r && r.SKU;
+    const id = r && r["Item ID"];
+    if (sku && id && !map.has(sku)) map.set(String(sku), String(id));
+  }
+  return map;
+}
+
+// Build + post the negative adjustment for one recorded batch. Never
+// throws: a Zoho outage must not cost the warehouse its batch, so failures
+// come back as { error } and are stored on the batch for a later retry.
+async function createDispatchAdjustment(record, batch) {
+  try {
+    const bySku = new Map();
+    for (const l of batch.lines || []) {
+      const sku = String((l && l.imbSku) || "").trim();
+      const qty = num(l && l.qty);
+      if (!sku || qty <= 0) continue;
+      bySku.set(sku, (bySku.get(sku) || 0) + qty);
+    }
+    const unmapped = (batch.lines || []).filter((l) => l && !String(l.imbSku || "").trim()).length;
+    if (!bySku.size) {
+      return { skipped: true, unmapped, message: "No mapped SKUs in this batch — nothing to deduct." };
+    }
+
+    const idBySku = await resolveZohoItemIds([...bySku.keys()]);
+    const lineItems = [];
+    const notFound = [];
+    for (const [sku, qty] of bySku) {
+      const itemId = idBySku.get(sku);
+      if (!itemId) { notFound.push(sku); continue; }
+      lineItems.push({ item_id: itemId, quantity_adjusted: -Math.abs(qty) });
+    }
+    if (!lineItems.length) {
+      return { skipped: true, unmapped, notFound, message: `No Zoho items found for: ${notFound.join(", ")}` };
+    }
+
+    const payload = {
+      date: new Date().toISOString().slice(0, 10),
+      reason: DISPATCH_ADJUSTMENT_REASON,
+      description: `Order Dispatch ${record.invoiceNumber || ""} — batch #${batch.batchNo} (${batch.units} units)`.trim(),
+      adjustment_type: "quantity",
+      line_items: lineItems,
+    };
+    const resp = await handleZohoInventoryPostRequest(
+      `https://www.zohoapis.com/inventory/v1/inventoryadjustments?organization_id=${ZOHO_ORG_ID}`,
+      payload,
+    );
+    const adj = resp && resp.inventory_adjustment;
+    if (!adj || !adj.inventory_adjustment_id) {
+      const msg = (resp && (resp.message || resp.error)) || "Zoho did not return an adjustment id";
+      return { error: String(msg).slice(0, 300), unmapped, notFound };
+    }
+    return {
+      id: String(adj.inventory_adjustment_id),
+      reference: adj.reference_number || "",
+      lines: lineItems.length,
+      unmapped,
+      notFound,
+    };
+  } catch (e) {
+    console.error("Dispatch stock adjustment failed:", e && e.message ? e.message : e);
+    return { error: String((e && e.message) || e).slice(0, 300) };
+  }
+}
+
 // ── POST /inflow/dispatch/:id/batch ─────────────────────────────────
 // Record one warehouse dispatch batch (scanned picks). Body: { lines:
 // [{ lineIndex, qty }], type? } — type "manual" targets an uploaded
@@ -1101,6 +1234,28 @@ router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
 
     await db.collection(coll).updateOne({ _id }, { $set: set, $push: { dispatchBatches: batch } });
 
+    // Deduct the dispatched units from Zoho Inventory. Done AFTER the batch
+    // is safely stored so a Zoho failure can't lose the warehouse's work —
+    // the outcome is written back onto the batch either way.
+    const adj = await createDispatchAdjustment(doc, batch);
+    const adjSet = {};
+    if (adj.id) {
+      adjSet[`dispatchBatches.$[b].inventoryAdjustmentId`] = adj.id;
+      adjSet[`dispatchBatches.$[b].inventoryAdjustedAt`] = new Date();
+      if (adj.reference) adjSet[`dispatchBatches.$[b].inventoryAdjustmentRef`] = adj.reference;
+    } else if (adj.error) {
+      adjSet[`dispatchBatches.$[b].inventoryAdjustmentError`] = adj.error;
+    }
+    if (Object.keys(adjSet).length) {
+      await db
+        .collection(coll)
+        .updateOne({ _id }, { $set: adjSet }, { arrayFilters: [{ "b.batchNo": batch.batchNo }] });
+      Object.assign(batch, {
+        inventoryAdjustmentId: adj.id || undefined,
+        inventoryAdjustmentError: adj.error || undefined,
+      });
+    }
+
     // Auto Fulfill closed the record without those barcodes ever needing a
     // mapping — drop their PENDING entries (sku still empty) so the SKU
     // Mapping list doesn't accumulate noise. Mapped entries are untouched.
@@ -1118,7 +1273,7 @@ router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
     }
 
     const updated = await db.collection(coll).findOne({ _id }, { projection: { payments: 0 } });
-    return res.json({ success: true, batch, record: updated, mappingsRemoved });
+    return res.json({ success: true, batch, record: updated, mappingsRemoved, adjustment: adj });
   } catch (e) {
     console.error("InFlow dispatch batch error:", e);
     return res.status(500).json({ success: false, message: "Failed to record dispatch batch" });
