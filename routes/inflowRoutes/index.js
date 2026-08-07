@@ -85,6 +85,71 @@ const DERIVED = {
   },
 };
 
+// Attach dispatch state to sales-order rows: whether a dispatch record is
+// linked and, if so, its progress. Drives the Sales Orders page — a linked
+// order gets the "Dispatch Status" action, an unlinked one is offered
+// create/link inside its detail dialog instead.
+async function attachDispatchState(db, orders) {
+  const list = (orders || []).filter(Boolean);
+  if (!list.length) return orders;
+  const ids = list.map((o) => o._id).filter(Boolean);
+  if (!ids.length) return orders;
+  const recs = await db
+    .collection(DISPATCH_UPLOADS)
+    .find(
+      { linkedOrderId: { $in: ids } },
+      { projection: { linkedOrderId: 1, invoiceNumber: 1, lineItems: 1 } },
+    )
+    .toArray();
+  const byOrder = new Map();
+  const recByOrder = new Map();
+  for (const r of recs) {
+    const items = Array.isArray(r.lineItems) ? r.lineItems : [];
+    const ordered = items.reduce((s, li) => s + num(li && li.quantity), 0);
+    const dispatched = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+    recByOrder.set(String(r.linkedOrderId), r);
+    byOrder.set(String(r.linkedOrderId), {
+      dispatchLinked: true,
+      dispatchRecordId: r._id,
+      dispatchInvoiceNumber: r.invoiceNumber || "",
+      dispatchOrderedQty: ordered,
+      dispatchDispatchedQty: dispatched,
+      dispatchStatus:
+        dispatched <= 0 ? "pending" : dispatched < ordered ? "partial" : "dispatched",
+    });
+  }
+  for (const o of list) {
+    Object.assign(o, byOrder.get(String(o._id)) || { dispatchLinked: false });
+
+    // Per-line dispatch progress, for the order detail dialog. The dispatch
+    // record is a separate document (its lines are never written back onto
+    // the order), so match them up by barcode — pooling per barcode and
+    // filling the order's lines in turn, so duplicate lines of the same
+    // product each get their share.
+    const rec = recByOrder.get(String(o._id));
+    if (rec && Array.isArray(o.lineItems) && o.lineItems.length) {
+      const pool = new Map();
+      for (const li of rec.lineItems || []) {
+        if (!li) continue;
+        const bc = String(li.sku || "");
+        pool.set(bc, (pool.get(bc) || 0) + num(li.dispatchedQty));
+      }
+      for (const li of o.lineItems) {
+        if (!li) continue;
+        const bc = String(li.sku || "");
+        const want = num(li.quantity);
+        const avail = pool.get(bc) || 0;
+        const take = Math.max(0, Math.min(avail, want));
+        pool.set(bc, avail - take);
+        li.dispatchedQty = take;
+        li.dispatchStatus =
+          take <= 0 ? "pending" : take < want ? "partial" : "dispatched";
+      }
+    }
+  }
+  return orders;
+}
+
 function statusOf(total, paid) {
   if (total < 0) return "credit";
   if (paid <= 0) return "unpaid";
@@ -148,12 +213,14 @@ router.get("/salesorders", VIEW_ORDERS, async (req, res) => {
       ])
       .toArray();
 
+    const rows = ((agg && agg.rows) || []).map(withPdf);
+    await attachDispatchState(db, rows);
     return res.json({
       success: true,
       page,
       pageSize,
       total: agg && agg.total && agg.total[0] ? agg.total[0].n : 0,
-      rows: ((agg && agg.rows) || []).map(withPdf),
+      rows,
     });
   } catch (e) {
     console.error("InFlow orders list error:", e);
@@ -173,6 +240,7 @@ router.get("/salesorders/:id", VIEW_ORDERS, async (req, res) => {
       .aggregate([{ $match: { _id: new ObjectId(req.params.id) } }, { $addFields: DERIVED }])
       .toArray();
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    await attachDispatchState(db, [order]);
     return res.json({ success: true, order: withPdf(order) });
   } catch (e) {
     console.error("InFlow order detail error:", e);
@@ -655,6 +723,9 @@ async function buildStatement(db, name) {
     ])
     .toArray();
   orders.forEach(withPdf);
+  // Dispatch progress per order, so Order History can show it alongside
+  // the payment status.
+  await attachDispatchState(db, orders);
   let invoiced = 0, credits = 0, paid = 0, totalAmount = 0;
   orders.forEach((o) => {
     const t = num(o.totalAmount);
@@ -696,6 +767,55 @@ router.get("/customers/:name/statement", VIEW_CUSTOMERS, async (req, res) => {
   }
 });
 
+// GET /inflow/statement/order/:id/dispatch → the dispatch record linked to
+// one of the customer's OWN orders (scoped by their customer name), for the
+// portal's Dispatch Status dialog. Internal fields (who packed it, mapping
+// state, line indexes) are deliberately not exposed.
+router.get("/statement/order/:id/dispatch", STATEMENT, async (req, res) => {
+  try {
+    const name = req.user && req.user.inflowCustomerName;
+    if (!name || !ObjectId.isValid(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Not found" });
+    }
+    const db = await connectToDatabase();
+    const order = await db
+      .collection(ORDERS)
+      .findOne({ _id: new ObjectId(req.params.id), customerName: name }, { projection: { _id: 1 } });
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+
+    const rec = await db.collection(DISPATCH_UPLOADS).findOne({ linkedOrderId: order._id });
+    if (!rec) return res.json({ success: true, dispatch: null });
+
+    const items = Array.isArray(rec.lineItems) ? rec.lineItems : [];
+    const orderedQty = items.reduce((s, li) => s + num(li && li.quantity), 0);
+    const dispatchedQty = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+    return res.json({
+      success: true,
+      dispatch: {
+        invoiceNumber: rec.invoiceNumber || "",
+        orderedQty,
+        dispatchedQty,
+        dispatchStatus:
+          dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched",
+        batches: (rec.dispatchBatches || []).map((b) => ({
+          batchNo: b.batchNo,
+          at: b.at,
+          units: b.units,
+          tracking: b.tracking || "",
+          lines: (b.lines || []).map((l) => ({
+            sku: l.imbSku || l.sku || "",
+            description: l.description || "",
+            qty: num(l.qty),
+          })),
+        })),
+      },
+    });
+  } catch (e) {
+    console.error("InFlow statement order dispatch error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load dispatch status" });
+  }
+});
+
 // GET /inflow/statement/order/:id → one of the customer's own orders (scoped)
 router.get("/statement/order/:id", STATEMENT, async (req, res) => {
   try {
@@ -713,6 +833,8 @@ router.get("/statement/order/:id", STATEMENT, async (req, res) => {
       ])
       .toArray();
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    // Per-line dispatch progress for the expanded line-items table.
+    await attachDispatchState(db, [order]);
     return res.json({ success: true, order: withPdf(order) });
   } catch (e) {
     console.error("InFlow statement order error:", e);
@@ -1260,6 +1382,32 @@ router.post("/skumap/import", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// POST /inflow/skumap/resolve — bulk barcode → iMobile SKU lookup.
+// Body: { barcodes: [...] } → { map: { barcode: sku } } for the barcodes
+// that have a COMPLETED mapping (pending entries are omitted). Used when
+// building a dispatch record from a sales order, so the UI can prefill the
+// SKUs it knows and ask the user only about the rest.
+router.post("/skumap/resolve", VIEW_ORDERS, async (req, res) => {
+  try {
+    const list = Array.isArray(req.body && req.body.barcodes) ? req.body.barcodes : [];
+    const barcodes = [
+      ...new Set(list.map((b) => String(b == null ? "" : b).trim()).filter(Boolean)),
+    ].slice(0, 2000);
+    if (!barcodes.length) return res.json({ success: true, map: {} });
+    const db = await connectToDatabase();
+    const rows = await db
+      .collection(SKU_MAP)
+      .find({ barcode: { $in: barcodes }, sku: { $nin: ["", null] } })
+      .toArray();
+    const map = {};
+    rows.forEach((r) => { map[r.barcode] = r.sku; });
+    return res.json({ success: true, map });
+  } catch (e) {
+    console.error("InFlow skumap resolve error:", e);
+    return res.status(500).json({ success: false, message: "Failed to resolve SKU mappings" });
+  }
+});
+
 // DELETE /inflow/skumap/:id — remove a mapping. Lines already stamped on
 // orders keep their imbSku (dispatch progress may depend on it); only
 // future lookups stop.
@@ -1275,6 +1423,36 @@ router.delete("/skumap/:id", VIEW_ORDERS, async (req, res) => {
   } catch (e) {
     console.error("InFlow skumap delete error:", e);
     return res.status(500).json({ success: false, message: "Failed to delete SKU mapping" });
+  }
+});
+
+// ── GET /inflow/salesorders/:id/dispatch ────────────────────────────
+// The dispatch record linked to this sales order (or null). Powers the
+// Sales Orders page's "Dispatch Status" action: linked → show progress,
+// not linked → offer to link an existing record or create one.
+router.get("/salesorders/:id/dispatch", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const rec = await db
+      .collection(DISPATCH_UPLOADS)
+      .findOne({ linkedOrderId: new ObjectId(req.params.id) });
+    if (!rec) return res.json({ success: true, dispatch: null });
+
+    const items = Array.isArray(rec.lineItems) ? rec.lineItems : [];
+    const orderedQty = items.reduce((s, li) => s + num(li && li.quantity), 0);
+    const dispatchedQty = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+    rec.orderedQty = orderedQty;
+    rec.dispatchedQty = dispatchedQty;
+    rec.dispatchStatus =
+      dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched";
+    rec.recordType = "manual";
+    return res.json({ success: true, dispatch: rec });
+  } catch (e) {
+    console.error("InFlow order dispatch lookup error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load dispatch status" });
   }
 });
 
@@ -1706,20 +1884,17 @@ router.get("/dispatch/mine", STATEMENT, async (req, res) => {
     const name = req.user && req.user.inflowCustomerName;
     if (!name) return res.json({ success: true, customerName: null, rows: [] });
     const db = await connectToDatabase();
-    const [uploads, orders] = await Promise.all([
-      db.collection(DISPATCH_UPLOADS).find({ customerName: name }).sort({ createdAt: -1 }).toArray(),
-      db
-        .collection(ORDERS)
-        .find(
-          {
-            customerName: name,
-            lineItems: { $elemMatch: { imbSku: { $type: "string", $ne: "" } } },
-          },
-          { projection: { invoiceNumber: 1, invoiceDate: 1, invoiceDateRaw: 1, lineItems: 1 } },
-        )
-        .sort({ invoiceDate: -1 })
-        .toArray(),
-    ]);
+    // Dispatch records only — same source as the admin Order Dispatch page.
+    // This used to ALSO list the customer's sales orders that had any
+    // SKU-mapped line, which showed every linked order twice: once as its
+    // dispatch record and once as the order itself (the webhook stamps
+    // imbSku from the mapping list at ingest, so linked orders always
+    // qualified).
+    const uploads = await db
+      .collection(DISPATCH_UPLOADS)
+      .find({ customerName: name })
+      .sort({ createdAt: -1 })
+      .toArray();
 
     const shape = (rec, recordType) => {
       const items = Array.isArray(rec.lineItems) ? rec.lineItems : [];
@@ -1747,7 +1922,6 @@ router.get("/dispatch/mine", STATEMENT, async (req, res) => {
 
     const rows = uploads
       .map((u) => shape(u, "manual"))
-      .concat(orders.map((o) => shape(o, "order")))
       .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
     return res.json({ success: true, customerName: name, rows });
   } catch (e) {
