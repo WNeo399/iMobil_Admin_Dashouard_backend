@@ -399,32 +399,41 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
         ? STATUS_ASSIGNED_EXYON
         : STATUS_IN_STOCK;
 
-    // Codes that aren't on the supplier's list become unlisted lines.
+    // Codes that aren't on the supplier's list become unlisted lines. Their
+    // Blackbelt lookups missed the upload sweep, so they run here — a few
+    // at a time, like the sweep, so a pile of extras doesn't serialize.
     const extras = [];
-    for (const code of codes) {
-      if (byCode.has(code)) continue;
-      const bb = await askBlackbelt(code);
-      const extra = {
-        no: null,
-        code,
-        model: "",
-        color: "",
-        capacity: "",
-        battery: null,
-        price: null,
-        grade: "",
-        ...bb,
-        received: false,
-        receivedAt: null,
-        receivedBy: null,
-        unlisted: true,
-        alreadyInStock: false,
-        deviceId: null,
-        committedAt: null,
-      };
-      extras.push(extra);
-      byCode.set(code, extra);
-    }
+    const extraQueue = codes.filter((c) => !byCode.has(c));
+    const lookupWorker = async () => {
+      for (;;) {
+        const code = extraQueue.shift();
+        if (!code) return;
+        const bb = await askBlackbelt(code);
+        const extra = {
+          no: null,
+          code,
+          model: "",
+          color: "",
+          capacity: "",
+          battery: null,
+          price: null,
+          grade: "",
+          ...bb,
+          received: false,
+          receivedAt: null,
+          receivedBy: null,
+          unlisted: true,
+          alreadyInStock: false,
+          deviceId: null,
+          committedAt: null,
+        };
+        extras.push(extra);
+        byCode.set(code, extra);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BLACKBELT_CONCURRENCY, extraQueue.length) }, lookupWorker),
+    );
     if (extras.length) {
       await db.collection(BATCHES).updateOne(
         { _id: batch._id },
@@ -444,11 +453,18 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
     let created = 0;
     const skipped = [];
 
-    for (const code of codes) {
+    // A bulk receive is two Mongo round-trips per device; done one at a
+    // time that outlives the client's request timeout, so a small pool runs
+    // several devices at once. Per-device semantics are unchanged — each
+    // code still gets its own insert + line update and its own error.
+    const COMMIT_CONCURRENCY = 8;
+    const commitQueue = codes.slice();
+
+    const commitOne = async (code) => {
       const l = byCode.get(code);
       if (l.deviceId) {
         skipped.push({ code, reason: "Already added from this batch" });
-        continue;
+        return;
       }
       // The unit was physically scanned, so it's received either way — a
       // clash with the stock register only blocks the device creation.
@@ -465,7 +481,7 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
           { arrayFilters: [{ "l.code": code }] },
         );
         skipped.push({ code, reason: "Already in stock" });
-        continue;
+        return;
       }
       const bb = l.bbDevice || {};
       const doc = {
@@ -511,7 +527,18 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
       } catch (e) {
         skipped.push({ code, reason: (e && e.message) || "Insert failed" });
       }
-    }
+    };
+
+    const commitWorker = async () => {
+      for (;;) {
+        const code = commitQueue.shift();
+        if (!code) return;
+        await commitOne(code);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(COMMIT_CONCURRENCY, commitQueue.length) }, commitWorker),
+    );
 
     await db.collection(BATCHES).updateOne({ _id: batch._id }, { $set: { updatedAt: now } });
     return res.json({ success: true, created, skipped });
