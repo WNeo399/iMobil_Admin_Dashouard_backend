@@ -4,6 +4,7 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../utils/mongodb");
 const { hashPassword } = require("../utils/authToken");
 const { requirePermission } = require("../middleware/auth");
+const { normalizeStockSource } = require("./refurbishedRoutes/stockSource");
 const {
   ROLES,
   ROLE_LABELS,
@@ -199,6 +200,12 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
       doc.inflowCustomerId = cust ? cust._id : null;
     }
 
+    // Stock source — a phone supplier's stock comes from somewhere, and
+    // that's the source stamped on the refurbished devices they add.
+    if (role === "phone-supplier") {
+      doc.stockSource = normalizeStockSource(req.body.stockSource) || null;
+    }
+
     const result = await collection.insertOne(doc);
     delete doc.passwordHash;
     return res
@@ -253,6 +260,16 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     if (req.body.shopIds !== undefined || req.body.role !== undefined) {
       const sourceIds = req.body.shopIds !== undefined ? req.body.shopIds : existing.shopIds;
       update.shopIds = normalizeShopIdsForRole(sourceIds, effectiveRole);
+    }
+
+    // Stock source — only meaningful for the phone-supplier role. Cleared on
+    // a move off that role so a stale source can't be stamped later.
+    if (effectiveRole === "phone-supplier") {
+      if (req.body.stockSource !== undefined) {
+        update.stockSource = normalizeStockSource(req.body.stockSource) || null;
+      }
+    } else if (req.body.role !== undefined && existing.stockSource) {
+      update.stockSource = null;
     }
 
     // InFlow customer link — only meaningful for the inflow-customer role.

@@ -67,6 +67,8 @@ async function authenticate(req, res, next) {
       inflowCustomerName: user.inflowCustomerName || null,
       // Consignment-shop link — scopes the Consignment pages to one shop.
       consignShopId: user.consignShopId ? String(user.consignShopId) : null,
+      // Phone-supplier stock source — stamped onto records they create.
+      stockSource: user.stockSource || null,
     };
 
     next();

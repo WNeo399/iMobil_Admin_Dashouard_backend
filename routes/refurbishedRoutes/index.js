@@ -13,6 +13,12 @@ var router = express.Router();
 const { requirePermission } = require("../../middleware/auth");
 const { query } = require("../../utils/scraperDb");
 
+// Our own refurbished-device stock register (Mongo) — separate concern from
+// the scraped market data below, so each lives in its own module.
+router.use("/devices", require("./devices"));
+// Supplier shipments waiting to be counted in and turned into stock.
+router.use("/incoming", require("./incoming"));
+
 const VIEW = requirePermission("refurb:offer:view");
 const TABLE = "stg_reebelo_offers";
 
