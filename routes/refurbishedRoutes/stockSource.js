@@ -23,17 +23,22 @@ function stockSourceForUser(user) {
   return DEFAULT_STOCK_SOURCE;
 }
 
-// Device status — where the unit stands, decided by who recorded it (same
-// rule as the source: never client-supplied). A device a supplier records
-// is still theirs ("Supplier Stock"); one recorded by our own staff, or
-// received through Incoming Stocks, is ours ("In Stock").
-const STATUS_IN_STOCK = "In Stock";
-const STATUS_SUPPLIER_STOCK = "Supplier Stock";
-// Received on Exyon's behalf — never sat in our stock.
-const STATUS_ASSIGNED_EXYON = "Assigned To Exyon";
+// Device location — where the unit physically sits. Set by who recorded it
+// (a supplier's device stays at the supplier), or picked from a whitelist
+// when receiving through Incoming Stocks. Never free text from the client.
+const LOCATION_IMOBILE = "iMobile";
+const LOCATION_SUPPLIER = "Supplier Stock";
+const LOCATION_EXYON = "Assigned To Exyon";
+// What the receive dialog may choose from.
+const RECEIVE_LOCATIONS = [LOCATION_IMOBILE, LOCATION_EXYON];
 
-function statusForUser(user) {
-  return user && user.role === "phone-supplier" ? STATUS_SUPPLIER_STOCK : STATUS_IN_STOCK;
+function locationForUser(user) {
+  return user && user.role === "phone-supplier" ? LOCATION_SUPPLIER : LOCATION_IMOBILE;
+}
+
+function normalizeReceiveLocation(v) {
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  return RECEIVE_LOCATIONS.find((x) => x.toLowerCase() === s) || LOCATION_IMOBILE;
 }
 
 module.exports = {
@@ -41,8 +46,10 @@ module.exports = {
   DEFAULT_STOCK_SOURCE,
   normalizeStockSource,
   stockSourceForUser,
-  STATUS_IN_STOCK,
-  STATUS_SUPPLIER_STOCK,
-  STATUS_ASSIGNED_EXYON,
-  statusForUser,
+  LOCATION_IMOBILE,
+  LOCATION_SUPPLIER,
+  LOCATION_EXYON,
+  RECEIVE_LOCATIONS,
+  locationForUser,
+  normalizeReceiveLocation,
 };

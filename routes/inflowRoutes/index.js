@@ -1064,6 +1064,43 @@ router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── POST /inflow/dispatch/:id/line-sku ──────────────────────────────
+// Set the warehouse SKU on ONE line of a dispatch record — for lines
+// uploaded without a barcode, where there is nothing to hang a SKU Mapping
+// on. Deliberately does NOT touch the global mapping list.
+router.post("/dispatch/:id/line-sku", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const lineIndex = Number(req.body && req.body.lineIndex);
+    const sku = String((req.body && req.body.sku) || "").trim();
+    if (!Number.isInteger(lineIndex) || lineIndex < 0) {
+      return res.status(400).json({ success: false, message: "Bad line index" });
+    }
+    if (!sku) return res.status(400).json({ success: false, message: "SKU is required" });
+
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const doc = await db
+      .collection(DISPATCH_UPLOADS)
+      .findOne({ _id }, { projection: { lineItems: 1 } });
+    if (!doc) return res.status(404).json({ success: false, message: "Not found" });
+    if (!Array.isArray(doc.lineItems) || lineIndex >= doc.lineItems.length) {
+      return res.status(400).json({ success: false, message: "Line item not found" });
+    }
+
+    await db.collection(DISPATCH_UPLOADS).updateOne(
+      { _id },
+      { $set: { [`lineItems.${lineIndex}.imbSku`]: sku, updatedAt: new Date() } },
+    );
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("InFlow dispatch line-sku error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the SKU" });
+  }
+});
+
 // ── Zoho stock deduction for a dispatch batch ───────────────────────
 // Recording a batch means the goods physically left, so the same units are
 // written off in Zoho Inventory as a negative quantity adjustment. The
@@ -1753,20 +1790,31 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
     for (const r of rows) {
       const imbSku = String((r && r.sku) || "").trim();
       const barcode = String((r && r.barcode) || "").trim();
+      const description = String((r && r.description) || "").trim();
       const quantity = Number(r && r.quantity);
-      if ((!imbSku && !barcode) || !Number.isFinite(quantity) || quantity <= 0) { skipped++; continue; }
+      // SKU and barcode are both optional — a row only needs a positive
+      // quantity and SOMETHING identifying it. Description-only lines can't
+      // be scanned or auto-deducted in Zoho, but they can be batch-recorded
+      // by hand, which is all some supplier lists allow.
+      if ((!imbSku && !barcode && !description) || !Number.isFinite(quantity) || quantity <= 0) {
+        skipped++;
+        continue;
+      }
       lineItems.push({
         // Same line shape as a sales order: sku = the barcode, imbSku = the
         // warehouse SKU — so the dispatch page (and the link step) treat
         // manual lines exactly like mapped order lines.
         sku: barcode,
         imbSku,
-        description: String((r && r.description) || "").trim(),
+        description,
         quantity,
       });
     }
     if (!lineItems.length) {
-      return res.status(400).json({ success: false, message: "No usable rows — every row needs a positive Quantity and a SKU or Barcode" });
+      return res.status(400).json({
+        success: false,
+        message: "No usable rows — every row needs a positive Quantity and a SKU, Barcode or Description",
+      });
     }
 
     const db = await connectToDatabase();

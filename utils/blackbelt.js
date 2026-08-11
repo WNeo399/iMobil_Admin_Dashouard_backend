@@ -91,7 +91,14 @@ async function login(force = false) {
 }
 
 // ── XML → object ────────────────────────────────────────────────────
-const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@", trimValues: true });
+// parseTagValue off: long numerics (EID is 32 digits) must stay strings —
+// the default number coercion turns them into floats like 8.9e+31.
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@",
+  trimValues: true,
+  parseTagValue: false,
+});
 
 // Report XML nests differently depending on device type, so pull fields by
 // name from anywhere in the tree rather than guessing a fixed path.
@@ -148,6 +155,9 @@ function parseReport(xml) {
     batteryCycleCount: toInt(findField(tree, "BatteryCycleCount")),
     batteryCapacity: str(findField(tree, "BatteryDesignCapacity")),
     aNumber: str(findField(tree, "ANumber")),
+    // The analyst verdict ("All Tests Passed", or the operator profile's
+    // failure text) — worth keeping on the register.
+    reportStatus: str(findField(tree, "Status")),
   };
   // A report with nothing identifying in it is no use to the caller.
   if (!data.modelName && !data.brandName && !data.imei && !data.serialNumber) return null;
@@ -240,6 +250,157 @@ async function downloadReport(token, reportID) {
   return (resp.data && resp.data.response && resp.data.response.report) || null;
 }
 
+// ── Full report detail ──────────────────────────────────────────────
+// The register only stores a summary; the Report tab shows the whole
+// picture — identity, the battery block, every test verdict and the
+// genuine-parts check — parsed fresh from the report XML.
+
+const TEST_VALUES = new Set(["PASS", "FAIL", "WARNING", "NOT TESTED", "NOT SUPPORTED ON DEVICE"]);
+
+// Like findField, but for a subtree rather than a scalar.
+function findNode(node, name, depth = 0) {
+  if (node == null || typeof node !== "object" || depth > 12) return undefined;
+  for (const key of Object.keys(node)) {
+    if (key.toLowerCase() === name.toLowerCase() && node[key] && typeof node[key] === "object") {
+      return node[key];
+    }
+  }
+  for (const key of Object.keys(node)) {
+    const hit = findNode(node[key], name, depth + 1);
+    if (hit !== undefined) return hit;
+  }
+  return undefined;
+}
+
+function parseReportDetail(xml) {
+  const tree = parser.parse(xml);
+  const f = (name) => str(findField(tree, name));
+
+  // Sectioned to mirror Blackbelt's own Analyst Report PDF.
+  const device = {
+    manufacturer: f("Manufacturer"),
+    model: f("Model"),
+    modelNumber: f("ModelNumber"),
+    os: f("OperatingSystem"),
+    osVersion: [f("ProductVersion"), f("BuildVersion") && `(${f("BuildVersion")})`]
+      .filter(Boolean)
+      .join(" "),
+    serialNumber: f("SerialNumber"),
+    imei: f("IMEI"),
+    imei2: f("IMEI2"),
+    aNumber: f("ANumber"),
+    storage: f("HandsetMemorySize"),
+    ram: f("RAM"),
+    color: f("DeviceColor"),
+    mlbSerial: f("MLBSerialNumber"),
+    region: f("RegionInfo"),
+    fmip: f("FMIP"),
+    mdmStatus: f("MDMStatus"),
+    cpuName: f("CpuName"),
+    cpuSpeed: f("CpuSpeed"),
+    countryOrigin: f("CountryOrigin"),
+    eid: f("EID"),
+    manufactureDate: f("ManufactureDate"),
+    deviceId: f("DeviceId"),
+    productType: f("ProductType"),
+  };
+  const battery = {
+    serial: f("BatterySerial"),
+    manufacturerDate: f("BatteryManufacturerDate"),
+    temperature: f("BatteryTemp"),
+    designCapacity: f("BatteryDesignCapacity"),
+    actualDesignCapacity: f("BatteryActualDesignCapacity"),
+    fullChargeCapacity: f("BatteryFullChargeCapacity"),
+    cycleCount: f("BatteryCycleCount"),
+    health: f("BatteryHealth") || (f("BatteryOverallPercentage") && `${f("BatteryOverallPercentage")}%`) || "",
+  };
+  const analyst = {
+    startDate: f("StartDate"),
+    startTime: f("StartTime"),
+    finishDate: f("FinishDate"),
+    finishTime: f("FinishTime"),
+    deviceAnalystVersion: f("DeviceAnalystVersion"),
+    appVersion: f("AnalystApplicationVersion"),
+    operator: f("UserName"),
+    licenseId: f("LicenseId"),
+    reportId: f("WipeId"),
+    profileName: f("ProfileName"),
+  };
+
+  // Anything in the tree whose value reads like a verdict is a test row —
+  // the field set varies by device type, so collect rather than enumerate.
+  const tests = new Map();
+  (function walk(node, depth) {
+    if (node == null || typeof node !== "object" || depth > 12) return;
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === "string" && TEST_VALUES.has(value.trim().toUpperCase())) {
+        if (!tests.has(key)) tests.set(key, value.trim());
+      } else if (value && typeof value === "object") {
+        walk(value, depth + 1);
+      }
+    }
+  })(tree, 0);
+
+  // Genuine-parts check: PartsReplaced.<platform>.<Part>
+  const parts = [];
+  const partsNode = findNode(tree, "PartsReplaced");
+  if (partsNode) {
+    for (const platform of Object.values(partsNode)) {
+      if (!platform || typeof platform !== "object") continue;
+      for (const [name, p] of Object.entries(platform)) {
+        if (!p || typeof p !== "object") continue;
+        const oem = p.oem_part_status;
+        parts.push({
+          name,
+          result: str(p.result),
+          status: str(oem && typeof oem === "object" ? oem["#text"] : oem),
+        });
+      }
+    }
+  }
+
+  return {
+    status: f("Status"),
+    testCaseFails: toInt(findField(tree, "TestCaseFails")),
+    device,
+    battery,
+    tests: [...tests].map(([name, result]) => ({ name, result })),
+    parts,
+    analyst,
+  };
+}
+
+// Download one report by id and return its parsed detail. Never throws.
+async function fetchReportDetail(reportID) {
+  const id = String(reportID || "").trim();
+  if (!id) return { error: "No report id" };
+  if (!isConfigured()) return { notConfigured: true };
+
+  const attempt = async (force) => {
+    const token = await login(force);
+    if (!token) return { error: "Blackbelt authentication failed" };
+    const xml = await downloadReport(token, id);
+    if (!xml) return { found: false };
+    return { found: true, report: parseReportDetail(xml) };
+  };
+
+  try {
+    return await attempt(false);
+  } catch (e) {
+    const status = e && e.response && e.response.status;
+    if (status === 401 || status === 403) {
+      try {
+        return await attempt(true);
+      } catch (e2) {
+        console.warn("Blackbelt report fetch failed after re-auth:", (e2 && e2.message) || e2);
+        return { error: "Blackbelt report fetch failed" };
+      }
+    }
+    console.warn("Blackbelt report fetch failed:", (e && e.message) || e);
+    return { error: e && e.code === "ECONNABORTED" ? "Blackbelt timed out" : "Blackbelt report fetch failed" };
+  }
+}
+
 // Search Blackbelt for `code` (IMEI or serial) and return the parsed
 // device data, or null when there's no report / anything goes wrong.
 // Returns { notConfigured: true } when credentials aren't set.
@@ -277,4 +438,4 @@ async function lookupDevice(code) {
   }
 }
 
-module.exports = { lookupDevice, isImei, isConfigured };
+module.exports = { lookupDevice, fetchReportDetail, isImei, isConfigured };

@@ -19,7 +19,7 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const blackbelt = require("../../utils/blackbelt");
-const { stockSourceForUser, statusForUser } = require("./stockSource");
+const { stockSourceForUser, locationForUser } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:stock:view");
 const MANAGE = requirePermission("refurb:stock:manage");
@@ -115,6 +115,7 @@ function buildDevice(body, { partial = false } = {}) {
   if (!partial || body.batteryCapacity !== undefined) set("batteryCapacity", str(body.batteryCapacity, 40));
   if (!partial || body.aNumber !== undefined) set("aNumber", str(body.aNumber, 40));
   if (!partial || body.blackbeltReportId !== undefined) set("blackbeltReportId", str(body.blackbeltReportId, 120));
+  if (!partial || body.blackbeltStatus !== undefined) set("blackbeltStatus", str(body.blackbeltStatus, 200));
   return doc;
 }
 
@@ -140,6 +141,7 @@ router.get("/", VIEW, async (req, res) => {
     }
     if (req.query.grade) match.grade = String(req.query.grade);
     if (req.query.stockSource) match.stockSource = String(req.query.stockSource);
+    if (req.query.location) match.location = String(req.query.location);
     if (req.query.model) match.model = String(req.query.model);
     const checked = String(req.query.blackbeltChecked || "");
     if (checked === "true") match.blackbeltChecked = true;
@@ -211,14 +213,15 @@ router.get("/filters", VIEW, async (req, res) => {
           ])
           .toArray()
       ).map((r) => r._id);
-    const [models, grades, stockSources, storages, colors] = await Promise.all([
+    const [models, grades, stockSources, storages, colors, locations] = await Promise.all([
       distinct("model"),
       distinct("grade"),
       distinct("stockSource"),
       distinct("storage"),
       distinct("color"),
+      distinct("location"),
     ]);
-    return res.json({ success: true, models, grades, stockSources, storages, colors });
+    return res.json({ success: true, models, grades, stockSources, storages, colors, locations });
   } catch (e) {
     console.error("Refurb devices filters error:", e);
     return res.status(500).json({ success: false, message: "Failed to load filters" });
@@ -294,6 +297,7 @@ router.get("/lookup", VIEW, async (req, res) => {
       // A Blackbelt report exists → the device is Blackbelt checked.
       blackbeltChecked: true,
       blackbeltReportId: r.reportID || "",
+      blackbeltStatus: d.reportStatus || "",
       device: {
         // Keep the scanned code as the register's key — the report's own
         // IMEI field is blank for serial-number lookups.
@@ -316,6 +320,107 @@ router.get("/lookup", VIEW, async (req, res) => {
   }
 });
 
+// ── GET /refurbished/devices/:id/report ─────────────────────────────
+// Full Blackbelt report detail for the dialog's Report tab, fetched fresh
+// by the report id stored on the device.
+router.get("/:id/report", VIEW, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const device = await db
+      .collection(DEVICES)
+      .findOne({ _id: new ObjectId(req.params.id) }, { projection: { blackbeltReportId: 1 } });
+    if (!device) return res.status(404).json({ success: false, message: "Device not found" });
+    if (!device.blackbeltReportId) {
+      return res.json({ success: true, hasReport: false, message: "No Blackbelt report recorded for this device." });
+    }
+
+    const r = await blackbelt.fetchReportDetail(device.blackbeltReportId);
+    if (r.notConfigured) {
+      return res.json({ success: true, hasReport: false, message: "Blackbelt credentials aren't set on the server." });
+    }
+    if (r.error) return res.json({ success: true, hasReport: false, message: r.error });
+    if (!r.found) {
+      return res.json({ success: true, hasReport: false, message: "Blackbelt no longer returns this report." });
+    }
+    return res.json({
+      success: true,
+      hasReport: true,
+      reportId: String(device.blackbeltReportId),
+      report: r.report,
+    });
+  } catch (e) {
+    console.error("Refurb device report error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load the report" });
+  }
+});
+
+// ── POST /refurbished/devices/:id/blackbelt-check ───────────────────
+// Re-asks Blackbelt about a device already in the register — for units
+// added before their report existed. On a hit it stamps the blackbelt
+// fields, fills identity/battery fields the register had blank (never
+// overwriting a value someone entered), and logs the change.
+router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const existing = await db.collection(DEVICES).findOne({ _id });
+    if (!existing) return res.status(404).json({ success: false, message: "Device not found" });
+
+    const r = await blackbelt.lookupDevice(existing.imei);
+    if (r && r.notConfigured) {
+      return res.json({ success: true, found: false, message: "Blackbelt credentials aren't set on the server." });
+    }
+    if (r && r.error) return res.json({ success: true, found: false, message: r.error });
+    if (!r || !r.found) {
+      return res.json({ success: true, found: false, message: "Blackbelt still has no report for this device." });
+    }
+
+    const d = r.device;
+    const set = {
+      blackbeltChecked: true,
+      blackbeltReportId: r.reportID || "",
+      blackbeltStatus: d.reportStatus || "",
+      updatedAt: new Date(),
+      updatedBy: (req.user && req.user.username) || null,
+    };
+    const empty = (v) => v === null || v === undefined || v === "";
+    const fillable = {
+      brand: d.brandName,
+      model: d.modelName,
+      color: d.color,
+      storage: d.storage,
+      serialNumber: d.serialNumber,
+      batteryHealth: d.batteryHealth,
+      batteryCycleCount: d.batteryCycleCount,
+      batteryCapacity: d.batteryCapacity,
+      aNumber: d.aNumber,
+    };
+    for (const [k, v] of Object.entries(fillable)) {
+      if (!empty(v) && empty(existing[k])) set[k] = v;
+    }
+
+    const changes = diffDevice(existing, set);
+    const update = { $set: set };
+    if (changes.length) {
+      update.$push = {
+        history: { $each: [historyEntry(req.user, "updated", { changes })], $slice: -HISTORY_CAP },
+      };
+    }
+    const u = await db.collection(DEVICES).findOneAndUpdate({ _id }, update, { returnDocument: "after" });
+    const updated = u ? u.value || u : null;
+    return res.json({ success: true, found: true, device: updated });
+  } catch (e) {
+    console.error("Refurb device blackbelt-check error:", e);
+    return res.status(500).json({ success: false, message: "Blackbelt check failed" });
+  }
+});
+
 // ── POST /refurbished/devices ───────────────────────────────────────
 router.post("/", MANAGE, async (req, res) => {
   try {
@@ -334,7 +439,7 @@ router.post("/", MANAGE, async (req, res) => {
       imei,
       ...buildDevice(req.body || {}),
       stockSource: stockSourceForUser(req.user),
-      status: statusForUser(req.user),
+      location: locationForUser(req.user),
       history: [historyEntry(req.user, "created")],
       createdAt: now,
       updatedAt: now,
@@ -363,20 +468,17 @@ router.put("/:id", MANAGE, async (req, res) => {
 
     const set = buildDevice(req.body || {}, { partial: true });
 
-    // IMEI can be corrected, but never onto another device's.
+    // The IMEI / serial is the register's key — once a device is recorded
+    // it can't be edited from the dashboard. Echoing the stored value back
+    // is fine (the edit form always sends it); anything else is rejected.
     if (req.body && req.body.imei !== undefined) {
       const imei = normalizeImei(req.body.imei);
-      if (!imei) return res.status(400).json({ success: false, message: "IMEI is required" });
-      if (!CODE_RE.test(imei)) {
-        return res.status(400).json({ success: false, message: CODE_HINT });
+      if (imei && imei !== existing.imei) {
+        return res.status(400).json({
+          success: false,
+          message: "The IMEI / serial can't be changed once a device is recorded",
+        });
       }
-      const clash = await db
-        .collection(DEVICES)
-        .findOne({ imei, _id: { $ne: _id } }, { projection: { _id: 1 } });
-      if (clash) {
-        return res.status(409).json({ success: false, message: `IMEI ${imei} is already in stock` });
-      }
-      set.imei = imei;
     }
 
     set.updatedAt = new Date();

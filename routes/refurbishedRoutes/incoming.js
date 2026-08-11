@@ -25,8 +25,7 @@ const blackbelt = require("../../utils/blackbelt");
 const {
   DEFAULT_STOCK_SOURCE,
   normalizeStockSource,
-  STATUS_IN_STOCK,
-  STATUS_ASSIGNED_EXYON,
+  normalizeReceiveLocation,
 } = require("./stockSource");
 
 const MANAGE = requirePermission("refurb:incoming:manage");
@@ -105,6 +104,7 @@ async function askBlackbelt(code) {
           batteryCycleCount: d.batteryCycleCount == null ? null : d.batteryCycleCount,
           batteryCapacity: d.batteryCapacity || "",
           aNumber: d.aNumber || "",
+          reportStatus: d.reportStatus || "",
         },
       };
     }
@@ -298,22 +298,15 @@ router.post("/", MANAGE, async (req, res) => {
       stockSource: normalizeStockSource(body.stockSource, DEFAULT_STOCK_SOURCE),
       note: str(body.note, 500),
       lines,
-      blackbelt: { total: lines.length, done: 0, running: blackbelt.isConfigured() },
+      blackbelt: { total: lines.length, done: 0, running: false },
       createdAt: now,
       updatedAt: now,
       createdBy: (req.user && req.user.username) || null,
     };
     const r = await db.collection(BATCHES).insertOne(doc);
 
-    // Fire and forget — the page polls the batch for progress.
-    if (blackbelt.isConfigured()) {
-      sweepBlackbelt(r.insertedId, lines.map((l) => l.code));
-    } else {
-      await db
-        .collection(BATCHES)
-        .updateOne({ _id: r.insertedId }, { $set: { "lines.$[].bbStatus": "skipped" } });
-    }
-
+    // Deliberately no Blackbelt sweep here — lines stay "pending" until the
+    // Check Blackbelt button fires the recheck endpoint.
     return res.json({ success: true, id: r.insertedId, accepted: lines.length, rejected });
   } catch (e) {
     console.error("Incoming create error:", e);
@@ -348,11 +341,10 @@ router.get("/:id", MANAGE, async (req, res) => {
 });
 
 // ── POST /refurbished/incoming/:id/commit ───────────────────────────
-// Body: { codes: [...], grades: { code: grade }, assign: "exyon"? } —
-// every code the warehouse scanned this session, plus grades picked in the
-// dialog for lines the sheet left ungraded (a sheet grade always wins).
-// `assign` is a whitelisted destination: "exyon" files the devices as
-// Assigned To Exyon instead of In Stock; anything else is ignored.
+// Body: { codes: [...], grades: { code: grade }, location } — every code
+// the warehouse scanned this session, grades picked in the dialog for lines
+// the sheet left ungraded (a sheet grade always wins), and the location the
+// received devices are filed under (whitelisted; defaults to iMobile).
 // Scanning itself is client-side; this one call does the whole thing:
 // listed codes are marked received, codes not on the supplier's list are
 // appended as unlisted lines (Blackbelt answered inline — they missed the
@@ -394,10 +386,7 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
     // A sheet grade always wins over a dialog pick.
     const gradeFor = (l) => l.grade || picks[l.code] || "";
 
-    const status =
-      String((req.body && req.body.assign) || "").toLowerCase() === "exyon"
-        ? STATUS_ASSIGNED_EXYON
-        : STATUS_IN_STOCK;
+    const location = normalizeReceiveLocation(req.body && req.body.location);
 
     // Codes that aren't on the supplier's list become unlisted lines. Their
     // Blackbelt lookups missed the upload sweep, so they run here — a few
@@ -494,7 +483,7 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
         costPrice: l.price == null ? null : Number(l.price),
         currency: batch.currency || "AUD",
         stockSource: normalizeStockSource(batch.stockSource, DEFAULT_STOCK_SOURCE),
-        status,
+        location,
         serialNumber: bb.serialNumber || "",
         batteryHealth: bb.batteryHealth != null ? bb.batteryHealth : l.battery,
         batteryCycleCount: bb.batteryCycleCount == null ? null : bb.batteryCycleCount,
@@ -502,6 +491,7 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
         aNumber: bb.aNumber || "",
         blackbeltChecked: l.bbStatus === "found",
         blackbeltReportId: l.bbReportId || "",
+        blackbeltStatus: bb.reportStatus || "",
         note: "",
         incomingBatchId: batch._id,
         history: [
@@ -549,8 +539,11 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
 });
 
 // ── POST /refurbished/incoming/:id/recheck ──────────────────────────
-// Re-runs Blackbelt for lines that never resolved — a restart mid-sweep, or
-// a transient error on their side.
+// Runs Blackbelt for lines without a found report. This is the Check
+// Blackbelt button's trigger (uploads don't sweep automatically). Body may
+// carry { codes: [...] } — the dialog sends the selected rows so lookups
+// are only spent on the devices actually being received; without it every
+// line still waiting on an answer is swept.
 router.post("/:id/recheck", MANAGE, async (req, res) => {
   try {
     const ctx = await loadBatch(req, res);
@@ -559,8 +552,12 @@ router.post("/:id/recheck", MANAGE, async (req, res) => {
     if (!blackbelt.isConfigured()) {
       return res.json({ success: true, queued: 0, message: "Blackbelt is not configured" });
     }
+    const wanted = Array.isArray(req.body && req.body.codes)
+      ? new Set(req.body.codes.map(normalizeCode).filter((c) => CODE_RE.test(c)))
+      : null;
     const codes = (batch.lines || [])
-      .filter((l) => !l.bbStatus || l.bbStatus === "pending" || l.bbStatus === "error" || l.bbStatus === "skipped")
+      .filter((l) => l.bbStatus !== "found")
+      .filter((l) => !wanted || wanted.has(l.code))
       .map((l) => l.code);
     if (!codes.length) return res.json({ success: true, queued: 0 });
 
