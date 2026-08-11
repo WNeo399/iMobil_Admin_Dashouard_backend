@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Interactive Exploded Diagram</title>
+<style>
+:root {
+  --panel: rgba(18,21,27,.94);
+  --border: rgba(255,255,255,.12);
+  --text:#eef2f7;
+  --muted:#98a3b2;
+  --accent:#7ec8ff;
+  --select:#ffcc6b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#0d1015;color:var(--text);font-family:Inter,system-ui,Arial,sans-serif}
+#app{position:relative;width:100%;height:100%}
+#viewport{position:absolute;inset:0;overflow:hidden;cursor:grab;background:#0d1015}
+#viewport.dragging{cursor:grabbing}
+#stage{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
+#diagram{display:block;width:808px;height:1625px;user-select:none;-webkit-user-drag:none}
+.hotspot {
+  position:absolute;
+  border:1px solid transparent;
+  background:transparent;
+  cursor:pointer;
+  border-radius:4px;
+}
+.hotspot:hover {
+  border-color:rgba(126,200,255,.8);
+  background:rgba(126,200,255,.08);
+  box-shadow:0 0 0 2px rgba(126,200,255,.12);
+}
+.hotspot.selected {
+  border-color:var(--select);
+  background:rgba(255,204,107,.12);
+  box-shadow:0 0 0 3px rgba(255,204,107,.16);
+}
+#toolbar {
+  position:absolute;left:14px;top:14px;z-index:20;
+  display:flex;gap:8px;align-items:center;padding:8px;
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,.28)
+}
+button,input{font:inherit}
+button {
+  border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--text);
+  border-radius:8px;padding:8px 11px;cursor:pointer
+}
+button:hover{background:rgba(255,255,255,.11)}
+#zoomLabel{font-size:12px;color:var(--muted);min-width:48px;text-align:center}
+#parts {
+  position:absolute;left:14px;top:70px;bottom:14px;width:250px;z-index:20;
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,.28);
+  padding:10px;overflow:auto
+}
+#parts h3{font-size:15px;margin:3px 4px 7px}
+#search{width:100%;margin-bottom:8px;border-radius:8px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:white;padding:8px 9px;outline:none}
+#search:focus{border-color:rgba(126,200,255,.55)}
+.row{display:flex;justify-content:space-between;gap:8px;padding:7px 8px;border-radius:7px;border:1px solid transparent;cursor:pointer;font-size:12px}
+.row:hover{background:rgba(255,255,255,.06)}
+.row.selected{background:rgba(255,204,107,.1);border-color:rgba(255,204,107,.45)}
+.row .name{font-size:10px;color:var(--muted);text-align:right}
+#info {
+  position:absolute;right:14px;bottom:14px;width:290px;z-index:20;
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,.28);padding:13px
+}
+#info .id{font-size:23px;font-weight:800}
+#info .name{color:var(--muted);margin-top:2px}
+#info .hint{font-size:11px;line-height:1.5;color:#c7ced8;margin-top:8px}
+#minimap {
+  position:absolute;right:14px;top:14px;width:160px;height:160px;z-index:20;
+  background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:7px
+}
+#miniWrap{position:relative;width:100%;height:100%;overflow:hidden;border-radius:7px;background:white}
+#miniImg{width:100%;height:100%;object-fit:contain;display:block}
+#miniView{position:absolute;border:1px solid var(--accent);background:rgba(126,200,255,.10);pointer-events:none}
+#tip{position:absolute;z-index:30;display:none;pointer-events:none;background:#111820;color:white;border:1px solid rgba(255,255,255,.15);border-radius:7px;padding:6px 8px;font-size:11px;box-shadow:0 8px 24px rgba(0,0,0,.3)}
+@media(max-width:850px){#parts{display:none}#minimap{width:120px;height:120px}#info{width:230px}}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="viewport">
+    <div id="stage">
+      <img id="diagram" src="./diagram.png" alt="Exploded device diagram" draggable="false">
+    </div>
+  </div>
+
+  <div id="toolbar">
+    <button id="fitBtn">Fit</button>
+    <button id="resetBtn">100%</button>
+    <button id="zoomOut">−</button>
+    <span id="zoomLabel">100%</span>
+    <button id="zoomIn">+</button>
+  </div>
+
+  <aside id="parts">
+    <h3>Parts</h3>
+    <input id="search" placeholder="Search part number…">
+    <div id="partList"></div>
+  </aside>
+
+  <div id="minimap">
+    <div id="miniWrap">
+      <img id="miniImg" src="./diagram.png" alt="">
+      <div id="miniView"></div>
+    </div>
+  </div>
+
+  <section id="info">
+    <div class="id">Select a part</div>
+    <div class="name">Interactive exploded diagram</div>
+    <div class="hint">Click a component on the image or select its part number from the left. The viewer will smoothly zoom to that component. Mouse wheel zooms; drag pans.</div>
+  </section>
+
+  <div id="tip"></div>
+</div>
+
+<script>
+const IMG_W=808, IMG_H=1625;
+const parts=[{"id": "QFR01", "name": "Top display / frame assembly", "box": [240, 30, 575, 176]}, {"id": "QVO01", "name": "Top button", "box": [382, 34, 417, 58]}, {"id": "QCK01", "name": "Top key / cap", "box": [422, 57, 452, 78]}, {"id": "QSM01", "name": "Side module / tray", "box": [612, 170, 665, 205]}, {"id": "QME07", "name": "Small upper module", "box": [309, 228, 339, 250]}, {"id": "QAN02-A", "display": "QAN02", "name": "Upper antenna strip", "box": [282, 252, 359, 284]}, {"id": "QBR01", "name": "Upper bracket", "box": [350, 296, 433, 330]}, {"id": "QME03", "name": "Upper support / flex", "box": [350, 331, 430, 363]}, {"id": "QME02", "name": "Upper flex cable", "box": [324, 360, 403, 396]}, {"id": "QBR07", "name": "Upper-right bracket", "box": [435, 301, 515, 338]}, {"id": "QCR255", "name": "Upper fastener", "box": [449, 335, 482, 365]}, {"id": "QAN02-B", "display": "QAN02", "name": "Right antenna strip", "box": [466, 366, 532, 393]}, {"id": "QME08", "name": "Right upper flex", "box": [395, 397, 510, 432]}, {"id": "QCA05", "name": "Camera / logic sub-board", "box": [311, 420, 394, 469]}, {"id": "QCA03", "name": "Internal module", "box": [306, 472, 366, 514]}, {"id": "QCA01", "name": "Internal sub-board", "box": [315, 512, 374, 550]}, {"id": "QCA02", "name": "Internal support module", "box": [333, 539, 414, 596]}, {"id": "QCR257", "name": "Central fastener", "box": [337, 579, 362, 610]}, {"id": "QCA04", "name": "Small side module", "box": [277, 697, 325, 731]}, {"id": "QIF01", "name": "Interface board", "box": [486, 659, 551, 723]}, {"id": "QCR252-A", "display": "QCR252", "name": "Upper fastener set", "box": [521, 704, 551, 772]}, {"id": "QME04", "name": "Ribbon cable A", "box": [390, 788, 537, 835]}, {"id": "QME06", "name": "Ribbon cable B", "box": [366, 835, 535, 884]}, {"id": "QME05", "name": "Ribbon cable C", "box": [358, 877, 520, 929]}, {"id": "QME01", "name": "Lower-left flex", "box": [262, 893, 309, 932]}, {"id": "QSP01", "name": "Left speaker", "box": [268, 938, 331, 1016]}, {"id": "QSP02", "name": "Right speaker", "box": [492, 973, 568, 1067]}, {"id": "QAN01", "name": "Main internal plate / antenna", "box": [273, 1087, 570, 1193]}, {"id": "QCR252-B", "display": "QCR252", "name": "Left lower fasteners", "box": [262, 1197, 335, 1277]}, {"id": "QCR252-C", "display": "QCR252", "name": "Right lower fasteners", "box": [490, 1196, 558, 1280]}, {"id": "QBC01", "name": "Bottom cover", "box": [246, 1281, 575, 1486]}, {"id": "QST01", "name": "Stylus", "box": [334, 1513, 482, 1588]}];
+
+const viewport=document.getElementById('viewport');
+const stage=document.getElementById('stage');
+const zoomLabel=document.getElementById('zoomLabel');
+const info=document.getElementById('info');
+const tip=document.getElementById('tip');
+
+let scale=1, tx=0, ty=0;
+let targetScale=1,targetTx=0,targetTy=0;
+let animating=false,selectedId=null;
+
+function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
+function applyTransform(){
+  stage.style.transform=`translate(${tx}px,${ty}px) scale(${scale})`;
+  zoomLabel.textContent=Math.round(scale*100)+'%';
+  updateMiniMap();
+}
+function setTransform(s,x,y,animate=true){
+  targetScale=clamp(s,.15,8);
+  targetTx=x;targetTy=y;
+  if(!animate){scale=targetScale;tx=targetTx;ty=targetTy;applyTransform();return}
+  if(!animating){animating=true;requestAnimationFrame(stepAnim)}
+}
+function stepAnim(){
+  scale += (targetScale-scale)*.18;
+  tx += (targetTx-tx)*.18;
+  ty += (targetTy-ty)*.18;
+  applyTransform();
+  if(Math.abs(scale-targetScale)>.001 || Math.abs(tx-targetTx)>.25 || Math.abs(ty-targetTy)>.25){
+    requestAnimationFrame(stepAnim);
+  } else {
+    scale=targetScale;tx=targetTx;ty=targetTy;applyTransform();animating=false;
+  }
+}
+function fitImage(){
+  const r=viewport.getBoundingClientRect();
+  const s=Math.min(r.width/IMG_W,r.height/IMG_H)*.94;
+  const x=(r.width-IMG_W*s)/2;
+  const y=(r.height-IMG_H*s)/2;
+  setTransform(s,x,y,true);
+}
+function reset100(){
+  const r=viewport.getBoundingClientRect();
+  setTransform(1,(r.width-IMG_W)/2,(r.height-IMG_H)/2,true);
+}
+function zoomAt(clientX,clientY,factor){
+  const rect=viewport.getBoundingClientRect();
+  const px=clientX-rect.left, py=clientY-rect.top;
+  const imageX=(px-tx)/scale, imageY=(py-ty)/scale;
+  const ns=clamp(scale*factor,.15,8);
+  const nx=px-imageX*ns, ny=py-imageY*ns;
+  setTransform(ns,nx,ny,false);
+}
+function zoomToPart(p){
+  const [l,t,r,b]=p.box;
+  const pad=55;
+  const bw=(r-l)+pad*2, bh=(b-t)+pad*2;
+  const vr=viewport.getBoundingClientRect();
+  const usableW=Math.max(320,vr.width-(window.innerWidth>850?300:20));
+  const usableH=vr.height-80;
+  const ns=clamp(Math.min(usableW/bw,usableH/bh),.55,5.5);
+  const cx=(l+r)/2, cy=(t+b)/2;
+  const centerX=(window.innerWidth>850 ? 285+(vr.width-285)/2 : vr.width/2);
+  const centerY=vr.height/2;
+  setTransform(ns,centerX-cx*ns,centerY-cy*ns,true);
+}
+function selectPart(id,zoom=true){
+  selectedId=id;
+  const p=parts.find(x=>x.id===id);
+  document.querySelectorAll('.hotspot').forEach(el=>el.classList.toggle('selected',el.dataset.id===id));
+  document.querySelectorAll('.row').forEach(el=>el.classList.toggle('selected',el.dataset.id===id));
+  info.querySelector('.id').textContent=p.display||p.id;
+  info.querySelector('.name').textContent=p.name;
+  info.querySelector('.hint').textContent='Selected component. Click another part to move focus, or use the mouse wheel and drag to inspect the diagram manually.';
+  if(zoom) zoomToPart(p);
+}
+
+// Build hotspots
+for(const p of parts){
+  const [l,t,r,b]=p.box;
+  const el=document.createElement('div');
+  el.className='hotspot';
+  el.dataset.id=p.id;
+  el.style.left=l+'px';el.style.top=t+'px';el.style.width=(r-l)+'px';el.style.height=(b-t)+'px';
+  el.addEventListener('click',e=>{e.stopPropagation();selectPart(p.id,true)});
+  el.addEventListener('mouseenter',e=>{tip.style.display='block';tip.textContent=(p.display||p.id)+' — '+p.name});
+  el.addEventListener('mousemove',e=>{tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px'});
+  el.addEventListener('mouseleave',()=>tip.style.display='none');
+  stage.appendChild(el);
+}
+
+// Part list
+const partList=document.getElementById('partList');
+function renderList(filter=''){
+  partList.innerHTML='';
+  const q=filter.trim().toLowerCase();
+  for(const p of parts.filter(p=>!q || p.id.toLowerCase().includes(q) || (p.display||'').toLowerCase().includes(q) || p.name.toLowerCase().includes(q))){
+    const row=document.createElement('div');row.className='row'+(p.id===selectedId?' selected':'');row.dataset.id=p.id;
+    row.innerHTML=`<span>${p.display||p.id}</span><span class="name">${p.name}</span>`;
+    row.onclick=()=>selectPart(p.id,true);
+    partList.appendChild(row);
+  }
+}
+renderList();
+document.getElementById('search').addEventListener('input',e=>renderList(e.target.value));
+
+// Pan
+let dragging=false,lastX=0,lastY=0;
+viewport.addEventListener('pointerdown',e=>{
+  if(e.button!==0 || e.target.classList.contains('hotspot')) return;
+  dragging=true;lastX=e.clientX;lastY=e.clientY;viewport.classList.add('dragging');viewport.setPointerCapture(e.pointerId);
+});
+viewport.addEventListener('pointermove',e=>{
+  if(!dragging)return;
+  tx+=e.clientX-lastX;ty+=e.clientY-lastY;targetTx=tx;targetTy=ty;lastX=e.clientX;lastY=e.clientY;applyTransform();
+});
+viewport.addEventListener('pointerup',e=>{dragging=false;viewport.classList.remove('dragging')});
+
+// Wheel zoom
+viewport.addEventListener('wheel',e=>{
+  e.preventDefault();
+  zoomAt(e.clientX,e.clientY,e.deltaY<0?1.14:1/1.14);
+},{passive:false});
+
+document.getElementById('fitBtn').onclick=fitImage;
+document.getElementById('resetBtn').onclick=reset100;
+document.getElementById('zoomIn').onclick=()=>zoomAt(innerWidth/2,innerHeight/2,1.2);
+document.getElementById('zoomOut').onclick=()=>zoomAt(innerWidth/2,innerHeight/2,1/1.2);
+
+// Double click anywhere to fit
+viewport.addEventListener('dblclick',e=>{if(!e.target.classList.contains('hotspot'))fitImage()});
+
+// Mini map
+function updateMiniMap(){
+  const mini=document.getElementById('miniWrap').getBoundingClientRect();
+  const vr=viewport.getBoundingClientRect();
+  const sx=mini.width/IMG_W, sy=mini.height/IMG_H;
+  const left=(-tx/scale)*sx;
+  const top=(-ty/scale)*sy;
+  const w=(vr.width/scale)*sx;
+  const h=(vr.height/scale)*sy;
+  const mv=document.getElementById('miniView');
+  mv.style.left=clamp(left,0,mini.width)+'px';
+  mv.style.top=clamp(top,0,mini.height)+'px';
+  mv.style.width=clamp(w,4,mini.width)+'px';
+  mv.style.height=clamp(h,4,mini.height)+'px';
+}
+
+window.addEventListener('resize',fitImage);
+window.addEventListener('load',fitImage);
+</script>
+</body>
+</html>
