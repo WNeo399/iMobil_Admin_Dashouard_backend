@@ -35,6 +35,13 @@ var router = express.Router();
 
 const specialOrderRouter = require("./specialOrder");
 const svpEnquiryRouter = require("./svpEnquiry");
+const explodedDiagramRouter = require("./explodedDiagram");
+
+// Read-only widget data (exploded-diagram browsing). Mounted BEFORE the
+// shared submission limiter below — 10 requests/hour would break a picker
+// that fires a GET per click; this sub-router carries its own gentler
+// limit instead.
+router.use("/explodedDiagram", explodedDiagramRouter);
 
 // ── Rate limit ─────────────────────────────────────────────────────
 // 10 submissions per IP per hour. Generous enough for a real user

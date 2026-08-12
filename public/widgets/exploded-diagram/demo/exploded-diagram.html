@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Exploded Diagram Widget — Embed Demo</title>
+    <!--
+      Mimics a third-party embedder: one div + one script tag. Unlike the
+      form widgets this bundle is hand-written vanilla JS (no build step) —
+      edit public/widgets/exploded-diagram/v1.js directly.
+
+      For local testing, point data-api-base at the local backend and open
+      this page from the same backend:
+        http://localhost:3000/widget-assets/exploded-diagram/demo/exploded-diagram.html
+    -->
+    <style>
+      body { margin: 0; padding: 40px 20px; background: #f3f4f6; font: 14px/1.5 system-ui, sans-serif; color: #1f2937; }
+      .demo { max-width: 960px; margin: 0 auto; }
+      .demo > h1 { margin: 0 0 4px; font-size: 22px; }
+      .demo > p { margin: 0 0 24px; color: #6b7280; }
+    </style>
+  </head>
+  <body>
+    <div class="demo">
+      <h1>Exploded Diagram — Embed Demo</h1>
+      <p>The widget below is loaded exactly as a third-party embedder would integrate it.</p>
+      <div id="imobile-exploded-diagram"></div>
+    </div>
+    <!-- The demo is served by the backend itself, so point the widget at
+         whichever origin served this page (works locally and on Railway).
+         A real embedder hardcodes their data-api-base instead. -->
+    <script>
+      document.getElementById('imobile-exploded-diagram')
+        .setAttribute('data-api-base', location.origin);
+    </script>
+    <script src="/widget-assets/exploded-diagram/v1.js" defer></script>
+  </body>
+</html>
