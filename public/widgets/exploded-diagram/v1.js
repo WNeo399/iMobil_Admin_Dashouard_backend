@@ -93,9 +93,7 @@
     "  max-height:400px;overflow:auto}",
     ".prods-head{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#98a3b2;margin-bottom:7px}",
     ".prod{display:flex;gap:9px;align-items:center;padding:6px;border-radius:9px;border:1px solid rgba(255,255,255,.1);",
-    "  background:rgba(255,255,255,.04);margin-bottom:6px;text-decoration:none;color:inherit}",
-    "a.prod{cursor:pointer}",
-    "a.prod:hover{background:rgba(255,255,255,.09);border-color:rgba(126,200,255,.5)}",
+    "  background:rgba(255,255,255,.04);margin-bottom:6px;color:inherit}",
     ".prod-thumb{width:42px;height:42px;border-radius:7px;background:#fff;object-fit:contain;flex:none}",
     ".prod-thumb-ph{display:grid;place-items:center;background:rgba(255,255,255,.08);font-size:16px}",
     ".prod-info{min-width:0}",
@@ -163,8 +161,7 @@
     ".sheetProds{display:none}",
     ".sheetProds.has{display:flex;gap:8px;overflow-x:auto;padding:2px 2px 10px;-webkit-overflow-scrolling:touch}",
     ".mprod{flex:0 0 112px;display:block;border:1px solid #edf0f3;border-radius:12px;background:#fff;padding:8px;",
-    "  text-decoration:none;color:inherit;-webkit-tap-highlight-color:transparent}",
-    "a.mprod:active{background:#f3f6f9}",
+    "  color:inherit;-webkit-tap-highlight-color:transparent}",
     ".mprod-thumb{width:100%;height:62px;border-radius:8px;object-fit:contain;background:#f6f7f9;display:block}",
     ".mprod-thumb-ph{display:grid;place-items:center;font-size:18px}",
     ".mprod-title{font-size:11px;line-height:1.3;color:#111827;margin-top:6px;min-height:28px;display:-webkit-box;",
@@ -386,22 +383,33 @@
       return el("div", cls + " " + cls + "-ph", "📦");
     }
     function buildProdCard(pr, cls) {
-      var href = shopUrl(pr.url);
-      var card = document.createElement(href ? "a" : "div");
-      card.className = cls;
-      if (href) {
-        card.href = href;
-        card.target = "_blank";
-        card.rel = "noopener";
-      }
+      // Deliberately NOT a link: the widget may be embedded on other
+      // businesses' sites, and product cards must not funnel their visitors
+      // to the iMobile shop. (The stored product url stays in the data.)
+      var card = el("div", cls);
       card.appendChild(buildProdThumb(pr, cls + "-thumb"));
       var box = card;
       if (cls === "prod") { // desktop rows keep text beside the thumb
         box = el("div", "prod-info");
         card.appendChild(box);
       }
-      box.appendChild(el("div", cls + "-title", pr.title || pr.sku || "Product"));
+      var titleEl = el("div", cls + "-title", pr.title || pr.sku || "Product");
+      box.appendChild(titleEl);
       if (pr.sku) box.appendChild(el("div", cls + "-sku", "SKU: " + pr.sku));
+      if (cls === "prod") {
+        // full product title in a tooltip when the 2-line clamp cut it off
+        card.addEventListener("mouseenter", function () {
+          if (isMobile() || titleEl.scrollHeight <= titleEl.clientHeight + 1) return;
+          tip.style.display = "block";
+          tip.textContent = pr.title || "";
+        });
+        card.addEventListener("mousemove", function (e) {
+          if (tip.style.display !== "block") return;
+          tip.style.left = (e.clientX + 12) + "px";
+          tip.style.top = (e.clientY + 12) + "px";
+        });
+        card.addEventListener("mouseleave", function () { tip.style.display = "none"; });
+      }
       return card;
     }
     function renderProducts(p) {
@@ -419,7 +427,11 @@
           sheetProds.appendChild(buildProdCard(pr, "mprod"));
         });
       }
-      // keep the strip visible below the summary while the sheet is collapsed
+      updateSheetReveal();
+    }
+    // Collapsed-sheet height: keeps the product strip visible below the summary.
+    function updateSheetReveal() {
+      var has = sheetProds.classList.contains("has");
       sheetRevealPx = 76 + (has ? Math.min(170, sheetProds.offsetHeight || 132) : 0);
       mobileSheet.style.setProperty("--reveal", sheetRevealPx + "px");
     }
