@@ -79,7 +79,8 @@
     "  border:1px solid transparent;cursor:pointer;font-size:12px}",
     ".row:hover{background:rgba(255,255,255,.06)}",
     ".row.selected{background:rgba(255,204,107,.1);border-color:rgba(255,204,107,.45)}",
-    ".row .name{font-size:10px;color:#98a3b2;text-align:right}",
+    ".row .name{font-size:10px;color:#98a3b2;text-align:right;display:-webkit-box;-webkit-line-clamp:3;",
+    "  -webkit-box-orient:vertical;overflow:hidden}",
     /* ── info card ── */
     ".info{position:absolute;right:14px;bottom:14px;width:290px;z-index:20;",
     "  background:rgba(18,21,27,.94);border:1px solid rgba(255,255,255,.12);border-radius:12px;",
@@ -587,8 +588,21 @@
         var row = el("div", "row" + (p.id === selectedId ? " selected" : ""));
         row.setAttribute("data-id", p.id);
         row.appendChild(el("span", null, partLabel(p)));
-        row.appendChild(el("span", "name", p.title || ""));
+        var nameEl = el("span", "name", p.title || "");
+        row.appendChild(nameEl);
         row.onclick = function () { selectPart(p.id, true); };
+        // full title in a tooltip when the 3-line clamp actually cut it off
+        row.addEventListener("mouseenter", function () {
+          if (isMobile() || nameEl.scrollHeight <= nameEl.clientHeight + 1) return;
+          tip.style.display = "block";
+          tip.textContent = p.title;
+        });
+        row.addEventListener("mousemove", function (e) {
+          if (tip.style.display !== "block") return;
+          tip.style.left = (e.clientX + 12) + "px";
+          tip.style.top = (e.clientY + 12) + "px";
+        });
+        row.addEventListener("mouseleave", function () { tip.style.display = "none"; });
         partList.appendChild(row);
       });
     }
