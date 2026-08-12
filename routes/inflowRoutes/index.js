@@ -976,6 +976,7 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
         { "lineItems.description": rx },
       ];
     }
+    if (req.query.customer) match.customerName = String(req.query.customer);
 
     const [agg] = await db
       .collection(DISPATCH_UPLOADS)
