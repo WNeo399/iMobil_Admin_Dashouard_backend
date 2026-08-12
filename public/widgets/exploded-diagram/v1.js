@@ -195,7 +195,9 @@
       return;
     }
     var fixedDiagram = host.getAttribute("data-diagram") || "";
-    var height = Math.max(420, parseInt(host.getAttribute("data-height"), 10) || 640);
+    // Viewer height: 90vh with a 760px floor by default; a data-height
+    // attribute (px) overrides both when an embedder wants a fixed size.
+    var heightAttr = parseInt(host.getAttribute("data-height"), 10);
 
     var shadow = host.attachShadow ? host.attachShadow({ mode: "open" }) : null;
     var rootHost = shadow || host;
@@ -211,7 +213,12 @@
 
     // ── viewer scaffold (v7 layout) ─────────────────────────────────
     var viewer = el("div", "viewer");
-    viewer.style.height = height + "px";
+    if (heightAttr) {
+      viewer.style.height = Math.max(420, heightAttr) + "px";
+    } else {
+      viewer.style.height = "90vh";
+      viewer.style.minHeight = "760px";
+    }
     root.appendChild(viewer);
 
     var viewport = el("div", "viewport");
@@ -320,7 +327,10 @@
       var was = root.classList.contains("mobile");
       var now = w > 0 && w <= MOBILE_BREAK;
       root.classList.toggle("mobile", now);
-      sheetBody.style.height = Math.round(height * 0.72 - 82) + "px";
+      // Measure the live viewer height (vh-based by default, so it changes
+      // with the window); 0 while the picker is showing → fall back.
+      var vh = viewer.getBoundingClientRect().height || 760;
+      sheetBody.style.height = Math.round(vh * 0.72 - 82) + "px";
       // strip height is only measurable in mobile layout — recompute the
       // collapsed-sheet reveal when the layout flips
       if (was !== now && selectedId) renderProducts(findPart(selectedId));
@@ -690,6 +700,7 @@
     function loadDiagram(id) {
       picker.style.display = "none";
       viewer.style.display = "block";
+      checkMobile(); // viewer just became measurable — size the sheet body
       infoId.textContent = "Loading…";
       infoName.textContent = "";
       fetchJson(joinUrl(apiBase, "/widget/explodedDiagram/diagram/" + encodeURIComponent(id)))
