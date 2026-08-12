@@ -89,7 +89,7 @@
     ".info .hint{font-size:11px;line-height:1.5;color:#c7ced8;margin-top:8px}",
     /* linked products (desktop info card) */
     ".prods{display:none;margin-top:10px;border-top:1px solid rgba(255,255,255,.1);padding-top:9px;",
-    "  max-height:212px;overflow:auto}",
+    "  max-height:400px;overflow:auto}",
     ".prods-head{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#98a3b2;margin-bottom:7px}",
     ".prod{display:flex;gap:9px;align-items:center;padding:6px;border-radius:9px;border:1px solid rgba(255,255,255,.1);",
     "  background:rgba(255,255,255,.04);margin-bottom:6px;text-decoration:none;color:inherit}",
@@ -101,6 +101,14 @@
     ".prod-title{font-size:11px;line-height:1.35;color:#eef2f7;display:-webkit-box;-webkit-line-clamp:2;",
     "  -webkit-box-orient:vertical;overflow:hidden}",
     ".prod-sku{font-size:10px;color:#98a3b2;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    /* ── fullscreen ── */
+    ".fsBtn{position:absolute;top:14px;right:184px;z-index:20;width:40px;height:40px;display:grid;place-items:center;",
+    "  border-radius:12px;border:1px solid rgba(255,255,255,.12);background:rgba(18,21,27,.94);color:#eef2f7;",
+    "  cursor:pointer;backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,.28);font-size:15px}",
+    ".fsBtn:hover{background:rgba(255,255,255,.11)}",
+    ".root.fs{border-radius:0}",
+    /* fallback when the Fullscreen API is unavailable (e.g. iPhone Safari) */
+    ".root.fakefs{position:fixed;inset:0;z-index:2147483000;border-radius:0}",
     /* ── minimap ── */
     ".minimap{position:absolute;right:14px;top:14px;width:160px;height:160px;z-index:20;",
     "  background:rgba(18,21,27,.94);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:7px}",
@@ -109,13 +117,13 @@
     ".miniView{position:absolute;border:1px solid #7ec8ff;background:rgba(126,200,255,.10);pointer-events:none}",
     /* ── mobile layout (root gets .mobile from a width check) ── */
     ".mobileTopbar,.mobileSheet{display:none}",
-    ".mobile .toolbar,.mobile .parts,.mobile .info,.mobile .minimap{display:none!important}",
+    ".mobile .toolbar,.mobile .parts,.mobile .info,.mobile .minimap,.mobile .fsBtn{display:none!important}",
     ".mobile .viewport{background:#f6f7f9}",
     ".mobile .hs:hover{fill:transparent;stroke:transparent}",
     ".mobile .hs.selected{fill:rgba(245,158,11,.13);stroke:#f59e0b;stroke-width:2}",
     ".mobile .mobileTopbar{display:flex;position:absolute;top:8px;left:10px;right:10px;z-index:40;",
     "  align-items:center;justify-content:space-between;gap:8px;pointer-events:none}",
-    ".mobile-group{display:flex;gap:8px;pointer-events:auto}",
+    ".mobile-group{display:flex;gap:6px;pointer-events:auto}",
     ".mobileFab{width:44px;height:44px;border-radius:12px;border:1px solid rgba(0,0,0,.08);",
     "  background:rgba(255,255,255,.96);color:#111827;display:grid;place-items:center;font-size:20px;",
     "  box-shadow:0 8px 24px rgba(0,0,0,.12);-webkit-tap-highlight-color:transparent;cursor:pointer}",
@@ -123,6 +131,8 @@
     ".mobileZoom{pointer-events:auto;min-width:58px;height:44px;display:flex;align-items:center;justify-content:center;",
     "  padding:0 12px;border-radius:12px;background:rgba(255,255,255,.96);color:#374151;",
     "  border:1px solid rgba(0,0,0,.08);box-shadow:0 8px 24px rgba(0,0,0,.12);font-size:12px;font-weight:700}",
+    /* very narrow embeds: drop the informational zoom pill so all buttons fit */
+    ".narrow .mobileZoom{display:none}",
     ".mobile .mobileSheet{display:block;position:absolute;left:0;right:0;bottom:0;z-index:50;",
     "  background:rgba(255,255,255,.98);color:#111827;border-radius:20px 20px 0 0;",
     "  box-shadow:0 -12px 32px rgba(0,0,0,.16);padding:8px 14px 14px;",
@@ -264,6 +274,11 @@
     minimap.appendChild(miniWrap);
     viewer.appendChild(minimap);
 
+    // fullscreen toggle (desktop; the mobile FAB is added below)
+    var fsBtn = el("button", "fsBtn", "⛶");
+    fsBtn.title = "Full screen";
+    viewer.appendChild(fsBtn);
+
     // info card
     var info = el("section", "info");
     var infoId = el("div", "id", "Select a part");
@@ -284,7 +299,8 @@
     var mBack = el("button", "mobileFab", "‹");
     var mFit = el("button", "mobileFab", "⌂");
     var mSearchBtn = el("button", "mobileFab", "⌕");
-    mgLeft.appendChild(mBack); mgLeft.appendChild(mFit); mgLeft.appendChild(mSearchBtn);
+    var mFs = el("button", "mobileFab", "⛶");
+    mgLeft.appendChild(mBack); mgLeft.appendChild(mFit); mgLeft.appendChild(mSearchBtn); mgLeft.appendChild(mFs);
     var mgRight = el("div", "mobile-group");
     var mZoom = el("div", "mobileZoom", "100%");
     var mMinus = el("button", "mobileFab", "−");
@@ -327,6 +343,7 @@
       var was = root.classList.contains("mobile");
       var now = w > 0 && w <= MOBILE_BREAK;
       root.classList.toggle("mobile", now);
+      root.classList.toggle("narrow", now && w < 370);
       // Measure the live viewer height (vh-based by default, so it changes
       // with the window); 0 while the picker is showing → fall back.
       var vh = viewer.getBoundingClientRect().height || 760;
@@ -470,9 +487,13 @@
       var pad = 55;
       var bw = (box[2] - box[0]) + pad * 2, bh = (box[3] - box[1]) + pad * 2;
       var vr = viewport.getBoundingClientRect();
-      // keep clear of the parts panel on desktop, the sheet on mobile
-      var usableW = isMobile() ? vr.width : Math.max(320, vr.width - 285);
-      var usableH = isMobile() ? Math.max(200, vr.height - sheetRevealPx - 70) : vr.height - 80;
+      // Desktop: center the part in the region clear of the parts panel
+      // (left), toolbar (top) and info card (bottom-right) — this nudges the
+      // zoomed part toward the top-left so the info card doesn't cover it.
+      // Mobile: unchanged — only the bottom sheet is reserved.
+      var padL = 285, padR = 150, padT = 62, padB = 170;
+      var usableW = isMobile() ? vr.width : Math.max(320, vr.width - padL - padR);
+      var usableH = isMobile() ? Math.max(200, vr.height - sheetRevealPx - 70) : Math.max(240, vr.height - padT - padB);
       // Cap the part zoom at ~90% of the image's natural resolution so small
       // parts don't blow up into a pixelated close-up. For low-res images
       // (where even Fit exceeds that), still allow a step past the fit scale.
@@ -480,8 +501,8 @@
       var maxZoom = Math.max(0.9, fitS * 1.4);
       var ns = clamp(Math.min(usableW / bw, usableH / bh), Math.min(0.55, maxZoom), maxZoom);
       var cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
-      var centerX = isMobile() ? vr.width / 2 : 285 + (vr.width - 285) / 2;
-      var centerY = isMobile() ? 52 + (vr.height - sheetRevealPx - 52) / 2 : vr.height / 2;
+      var centerX = isMobile() ? vr.width / 2 : padL + usableW / 2;
+      var centerY = isMobile() ? 52 + (vr.height - sheetRevealPx - 52) / 2 : padT + usableH / 2;
       setTransform(ns, centerX - cx * ns, centerY - cy * ns, true);
     }
     function findPart(id) {
@@ -678,6 +699,69 @@
       if (e.target && e.target.classList && e.target.classList.contains("hs")) return;
       fitImage();
     });
+
+    // ── fullscreen ──────────────────────────────────────────────────
+    // Native Fullscreen API on the host div; a fixed-overlay fallback covers
+    // browsers without it (iPhone Safari). Esc exits either mode.
+    var fakeFs = false, fsPrevH = "", fsPrevMinH = "";
+    function nativeFsEl() {
+      return document.fullscreenElement || document.webkitFullscreenElement || null;
+    }
+    function applyFsLayout(on) {
+      if (on) {
+        fsPrevH = viewer.style.height;
+        fsPrevMinH = viewer.style.minHeight;
+        viewer.style.height = "100vh";
+        viewer.style.minHeight = "0";
+      } else {
+        viewer.style.height = fsPrevH;
+        viewer.style.minHeight = fsPrevMinH;
+      }
+      root.classList.toggle("fs", on);
+      root.classList.toggle("fakefs", on && fakeFs);
+      fsBtn.textContent = on ? "✕" : "⛶";
+      fsBtn.title = on ? "Exit full screen" : "Full screen";
+      mFs.textContent = on ? "✕" : "⛶";
+      checkMobile();
+      setTimeout(fitImage, 60); // re-fit once the new size has settled
+    }
+    function enterFs() {
+      var req = host.requestFullscreen || host.webkitRequestFullscreen;
+      if (req) {
+        try {
+          Promise.resolve(req.call(host)).catch(function () {
+            fakeFs = true;
+            applyFsLayout(true);
+          });
+          return;
+        } catch (e) { /* fall through to the overlay */ }
+      }
+      fakeFs = true;
+      applyFsLayout(true);
+    }
+    function exitFs() {
+      if (fakeFs) {
+        fakeFs = false;
+        applyFsLayout(false);
+        return;
+      }
+      var ex = document.exitFullscreen || document.webkitExitFullscreen;
+      if (ex && nativeFsEl() === host) ex.call(document);
+    }
+    function toggleFs() {
+      if (fakeFs || nativeFsEl() === host) exitFs();
+      else enterFs();
+    }
+    function onFsChange() {
+      if (!fakeFs) applyFsLayout(nativeFsEl() === host);
+    }
+    document.addEventListener("fullscreenchange", onFsChange);
+    document.addEventListener("webkitfullscreenchange", onFsChange);
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && fakeFs) exitFs();
+    });
+    fsBtn.onclick = toggleFs;
+    mFs.onclick = toggleFs;
 
     fitBtn.onclick = fitImage;
     resetBtn.onclick = reset100;
