@@ -774,6 +774,7 @@
     // ── flow ────────────────────────────────────────────────────────
     var resetPicker = null; // assigned by buildPicker
     function showPicker() {
+      exitFs(); // leaving the viewer also leaves full screen (no-op otherwise)
       viewer.style.display = "none";
       picker.style.display = "block";
       if (resetPicker) resetPicker();
