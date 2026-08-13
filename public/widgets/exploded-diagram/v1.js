@@ -170,9 +170,9 @@
   ].join("\n");
 
   var TIP_CSS =
-    "position:fixed;z-index:2147483000;display:none;pointer-events:none;background:#111820;color:#fff;" +
+    ".tip{position:fixed;z-index:2147483001;display:none;pointer-events:none;background:#111820;color:#fff;" +
     "border:1px solid rgba(255,255,255,.15);border-radius:7px;padding:6px 8px;font-size:11px;" +
-    "box-shadow:0 8px 24px rgba(0,0,0,.3);font-family:Inter,system-ui,Arial,sans-serif;max-width:280px";
+    "box-shadow:0 8px 24px rgba(0,0,0,.3);font-family:Inter,system-ui,Arial,sans-serif;max-width:280px}";
 
   function el(tag, cls, text) {
     var n = document.createElement(tag);
@@ -210,7 +210,7 @@
     var shadow = host.attachShadow ? host.attachShadow({ mode: "open" }) : null;
     var rootHost = shadow || host;
     var style = document.createElement("style");
-    style.textContent = CSS;
+    style.textContent = CSS + "\n" + TIP_CSS;
     rootHost.appendChild(style);
 
     var root = el("div", "root");
@@ -329,10 +329,12 @@
     mobileSheet.appendChild(sheetProds); mobileSheet.appendChild(sheetBody);
     viewer.appendChild(mobileSheet);
 
-    // tooltip lives in the page body so it can escape the widget's overflow
-    var tip = document.createElement("div");
-    tip.style.cssText = TIP_CSS;
-    document.body.appendChild(tip);
+    // Tooltip lives INSIDE the shadow root: position:fixed escapes the
+    // root's overflow clipping anyway (no transform on .root), host-page CSS
+    // can't reach it, and — critically — it still renders in native
+    // fullscreen, where only the fullscreened element's subtree is shown.
+    var tip = el("div", "tip");
+    root.appendChild(tip);
 
     // ── responsive: container width decides the layout ──────────────
     function isMobile() { return root.classList.contains("mobile"); }

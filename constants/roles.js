@@ -98,9 +98,9 @@ const ROLE_PERMISSIONS = {
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
   [ROLES.IMOBILE_REPAIR_ADMIN]: ["repair:*:*"],
-  // TechElite Admin owns the SQT domain and also manages users (read/create/
-  // edit/delete + password reset) via the System → Users page.
-  [ROLES.TECHELITE_ADMIN]: ["sqt:*:*", "system:user:manage"],
+  // TechElite Admin owns the SQT domain. User management (System tab) was
+  // revoked 2026-08 — system:user:manage is Admin-only now.
+  [ROLES.TECHELITE_ADMIN]: ["sqt:*:*"],
   [ROLES.SHOP_OWNER]: [...SHOP_CASE_PERMISSIONS],
   [ROLES.REPAIR_SHOP]: [...SHOP_CASE_PERMISSIONS],
   // InFlow Customer — a portal login for a customer; sees only their statement.
