@@ -80,6 +80,8 @@ const SHOP_CASE_PERMISSIONS = [
   "sqt:case:requireExtraParts",
   "sqt:case:note",
   "sqt:case:editDevice",
+  // Upload photo attachments to a case (compressed server-side → S3).
+  "sqt:case:attachment",
 ];
 
 const ROLE_PERMISSIONS = {

@@ -33,7 +33,7 @@ const BATCHES = "refurb_incoming_batches";
 const DEVICES = "refurb_devices";
 
 const CURRENCIES = ["AUD", "CNY", "HKD"];
-const GRADES = ["A+", "A", "B+", "B", "C+", "C"];
+const GRADES = ["A++", "A+", "A", "B+", "B", "C+", "C"];
 // Blackbelt is a third party — a handful of lookups at a time, not 69.
 const BLACKBELT_CONCURRENCY = 3;
 

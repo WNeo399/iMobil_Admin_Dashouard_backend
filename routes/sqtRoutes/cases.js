@@ -1,6 +1,9 @@
 var express = require("express");
 var router = express.Router();
 const { ObjectId } = require("mongodb");
+const multer = require("multer");
+const sharp = require("sharp");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
 const { syncCaseStatus } = require("../../utils/repairDesk");
@@ -1308,6 +1311,218 @@ router.post(
       return res
         .status(500)
         .json({ success: false, message: "Failed to add note" });
+    }
+  },
+);
+
+// ── Image attachments ─────────────────────────────────────────────────────
+// Photos uploaded against a case (device condition, damage, repair result).
+// Every upload is compressed server-side (EXIF-rotated, long edge capped at
+// 1600px, JPEG q80) before landing on S3; the case doc keeps the descriptors.
+// Like notes, attachments stay allowed while a case is On Hold — they are
+// documentation, not a state change. Shop-scoped users can delete only their
+// own uploads; unscoped roles (Admin / TechElite) can delete any.
+
+const ATTACHMENT_CAP = 30;
+
+// Lazy S3 singleton — same pattern as the other upload routes.
+let s3Client = null;
+function getS3Client() {
+  if (s3Client) return s3Client;
+  const { S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION } = process.env;
+  if (!S3_ACCESS_KEY_ID || !S3_SECRET_ACCESS_KEY || !S3_REGION) return null;
+  s3Client = new S3Client({
+    region: S3_REGION,
+    credentials: { accessKeyId: S3_ACCESS_KEY_ID, secretAccessKey: S3_SECRET_ACCESS_KEY },
+  });
+  return s3Client;
+}
+function getBucketName() {
+  return process.env.S3_WIDGET_BUCKET_NAME || process.env.S3_CREDIT_BUCKET_NAME || null;
+}
+
+const attachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    // Accept any image/* — sharp re-encodes to JPEG, so HEIC/webp/etc. are
+    // fine as long as sharp can decode them (it throws a clean error if not).
+    if (/^image\//i.test(file.mimetype)) return cb(null, true);
+    cb(new Error("Only image files are accepted"));
+  },
+});
+
+// Run multer ourselves so its errors (size cap, wrong type) come back as a
+// clean 400 instead of falling through to the generic error handler.
+function acceptAttachmentFile(req, res, next) {
+  attachmentUpload.single("image")(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    next();
+  });
+}
+
+router.post(
+  "/:id/attachments",
+  requirePermission("sqt:case:attachment"),
+  authorizeCaseAccess,
+  acceptAttachmentFile,
+  async function (req, res) {
+    try {
+      const { id } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      if (!req.file) {
+        return res
+          .status(400)
+          .json({ success: false, message: "An image file is required" });
+      }
+      const s3 = getS3Client();
+      const bucket = getBucketName();
+      if (!s3 || !bucket) {
+        return res
+          .status(500)
+          .json({ success: false, message: "S3 is not configured on the server" });
+      }
+
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+      const theCase = await collection.findOne(
+        { _id: new ObjectId(id) },
+        { projection: { attachments: 1 } },
+      );
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      if ((theCase.attachments || []).length >= ATTACHMENT_CAP) {
+        return res.status(400).json({
+          success: false,
+          message: `This case already has the maximum of ${ATTACHMENT_CAP} photos`,
+        });
+      }
+
+      let jpeg;
+      try {
+        jpeg = await sharp(req.file.buffer)
+          .rotate() // honour EXIF orientation from phone cameras
+          .resize(1600, 1600, { fit: "inside", withoutEnlargement: true })
+          .flatten({ background: "#ffffff" })
+          .jpeg({ quality: 80 })
+          .toBuffer();
+      } catch (e) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Could not read that image file" });
+      }
+      const meta = await sharp(jpeg).metadata();
+
+      const attId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const key = `sqt-cases/${id}/${attId}.jpg`;
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: jpeg,
+          ContentType: "image/jpeg",
+          CacheControl: "public, max-age=86400",
+        }),
+      );
+
+      const attachment = {
+        id: attId,
+        key,
+        url: `https://${bucket}.s3.${process.env.S3_REGION}.amazonaws.com/${key}`,
+        name: String(req.file.originalname || "").slice(0, 140),
+        width: meta.width || null,
+        height: meta.height || null,
+        size: jpeg.length,
+        originalSize: req.file.size,
+        contentType: "image/jpeg",
+        uploadedBy: actor(req),
+        at: new Date(),
+      };
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $push: { attachments: attachment }, $set: { updatedAt: attachment.at } },
+        { returnDocument: "after" },
+      );
+      const updated = result ? result.value || result : null;
+      return res.json({ success: true, message: "Photo uploaded", data: updated });
+    } catch (error) {
+      console.error("Upload case attachment error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to upload the photo" });
+    }
+  },
+);
+
+router.delete(
+  "/:id/attachments/:attachmentId",
+  requirePermission("sqt:case:attachment"),
+  authorizeCaseAccess,
+  async function (req, res) {
+    try {
+      const { id, attachmentId } = req.params;
+      if (!ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid case id" });
+      }
+      const db = await connectToDatabase();
+      const collection = db.collection(COLLECTION);
+      const theCase = await collection.findOne(
+        { _id: new ObjectId(id) },
+        { projection: { attachments: 1 } },
+      );
+      if (!theCase) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Case not found" });
+      }
+      const att = (theCase.attachments || []).find((a) => a.id === attachmentId);
+      if (!att) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Attachment not found" });
+      }
+      if (isShopScopedUser(req) && att.uploadedBy !== actor(req)) {
+        return res.status(403).json({
+          success: false,
+          message: "You can only remove photos you uploaded",
+        });
+      }
+
+      // S3 delete is best-effort — the doc is the source of truth.
+      try {
+        const s3 = getS3Client();
+        const bucket = getBucketName();
+        if (s3 && bucket && att.key) {
+          await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: att.key }));
+        }
+      } catch (e) {
+        console.warn("Case attachment S3 delete failed:", (e && e.message) || e);
+      }
+
+      const result = await collection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $pull: { attachments: { id: attachmentId } }, $set: { updatedAt: new Date() } },
+        { returnDocument: "after" },
+      );
+      const updated = result ? result.value || result : null;
+      return res.json({ success: true, message: "Photo removed", data: updated });
+    } catch (error) {
+      console.error("Delete case attachment error:", error);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to remove the photo" });
     }
   },
 );
