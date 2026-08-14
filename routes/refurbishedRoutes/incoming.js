@@ -11,6 +11,7 @@
 //   POST   /refurbished/incoming            create a batch from parsed rows
 //   GET    /refurbished/incoming/:id        one batch with all its lines
 //   POST   /refurbished/incoming/:id/commit scanned codes → received + stock
+//   POST   /refurbished/incoming/:id/sell   scanned codes → stock + a sales order
 //   POST   /refurbished/incoming/:id/recheck re-run Blackbelt on unresolved lines
 //   DELETE /refurbished/incoming/:id        remove a batch
 //
@@ -26,9 +27,21 @@ const {
   DEFAULT_STOCK_SOURCE,
   normalizeStockSource,
   normalizeReceiveLocation,
+  LOCATION_IMOBILE,
 } = require("./stockSource");
+const {
+  ORDERS,
+  normalizeCurrency,
+  nextOrderNumber,
+  deviceLine,
+  computeTotals,
+} = require("./salesOrderCore");
 
 const MANAGE = requirePermission("refurb:incoming:manage");
+// Selling off a shipment also writes a sales order, so that permission is
+// required on top of the incoming one.
+const SELL = requirePermission("refurb:sale:manage");
+const CUSTOMERS = "refurb_customers";
 const BATCHES = "refurb_incoming_batches";
 const DEVICES = "refurb_devices";
 
@@ -352,19 +365,213 @@ router.get("/:id", MANAGE, async (req, res) => {
 // device under the batch's stock source. Blackbelt's answer wins over the
 // supplier's spreadsheet where they disagree — it's the one that actually
 // looked at the handset.
+// Scanned codes from a dialog, normalized and de-duplicated.
+function parseCodes(body) {
+  return [
+    ...new Set(
+      (Array.isArray(body && body.codes) ? body.codes : [])
+        .map(normalizeCode)
+        .filter((c) => CODE_RE.test(c)),
+    ),
+  ];
+}
+
+// Shared by /commit and /sell: turn scanned codes into stock records against
+// this batch. Codes that aren't on the supplier's list become unlisted lines
+// (with a live Blackbelt lookup), every scanned line is marked received, and
+// each new device is inserted under the batch's stock source.
+//
+// `sale`, when given, is the order the devices are being sold on: they land
+// as Sold carrying its stamp instead of going into stock, and the created
+// device docs come back so the caller can build the order's lines.
+async function receiveScanned({ db, batch }, req, codes, { location, sale = null }) {
+  const now = new Date();
+  const who = (req.user && req.user.username) || null;
+  const byCode = new Map((batch.lines || []).map((l) => [l.code, l]));
+
+  // Grades picked in the dialog, validated and keyed by normalized code.
+  const picks = {};
+  const rawPicks = (req.body && req.body.grades) || {};
+  for (const k of Object.keys(rawPicks)) {
+    const g = grade(rawPicks[k]);
+    if (g) picks[normalizeCode(k)] = g;
+  }
+  // A sheet grade always wins over a dialog pick.
+  const gradeFor = (l) => l.grade || picks[l.code] || "";
+
+  // Codes that aren't on the supplier's list become unlisted lines. Their
+  // Blackbelt lookups missed the upload sweep, so they run here — a few
+  // at a time, like the sweep, so a pile of extras doesn't serialize.
+  const extras = [];
+  const extraQueue = codes.filter((c) => !byCode.has(c));
+  const lookupWorker = async () => {
+    for (;;) {
+      const code = extraQueue.shift();
+      if (!code) return;
+      const bb = await askBlackbelt(code);
+      const extra = {
+        no: null,
+        code,
+        model: "",
+        color: "",
+        capacity: "",
+        battery: null,
+        price: null,
+        grade: "",
+        ...bb,
+        received: false,
+        receivedAt: null,
+        receivedBy: null,
+        unlisted: true,
+        alreadyInStock: false,
+        deviceId: null,
+        committedAt: null,
+      };
+      extras.push(extra);
+      byCode.set(code, extra);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(BLACKBELT_CONCURRENCY, extraQueue.length) }, lookupWorker),
+  );
+  if (extras.length) {
+    await db.collection(BATCHES).updateOne(
+      { _id: batch._id },
+      {
+        $push: { lines: { $each: extras } },
+        $inc: { "blackbelt.total": extras.length, "blackbelt.done": extras.length },
+      },
+    );
+  }
+
+  const existing = await db
+    .collection(DEVICES)
+    .find({ imei: { $in: codes } }, { projection: { imei: 1 } })
+    .toArray();
+  const already = new Set(existing.map((d) => d.imei));
+
+  let created = 0;
+  const skipped = [];
+  const devices = [];
+
+  // A bulk receive is two Mongo round-trips per device; done one at a
+  // time that outlives the client's request timeout, so a small pool runs
+  // several devices at once. Per-device semantics are unchanged — each
+  // code still gets its own insert + line update and its own error.
+  const COMMIT_CONCURRENCY = 8;
+  const commitQueue = codes.slice();
+
+  const commitOne = async (code) => {
+    const l = byCode.get(code);
+    if (l.deviceId) {
+      skipped.push({ code, reason: "Already added from this batch" });
+      return;
+    }
+    // The unit was physically scanned, so it's received either way — a
+    // clash with the stock register only blocks the device creation.
+    const receive = {
+      "lines.$[l].received": true,
+      "lines.$[l].receivedAt": now,
+      "lines.$[l].receivedBy": who,
+      "lines.$[l].grade": gradeFor(l),
+    };
+    if (already.has(code)) {
+      await db.collection(BATCHES).updateOne(
+        { _id: batch._id },
+        { $set: { ...receive, "lines.$[l].alreadyInStock": true } },
+        { arrayFilters: [{ "l.code": code }] },
+      );
+      skipped.push({ code, reason: "Already in stock" });
+      return;
+    }
+    const bb = l.bbDevice || {};
+    const history = [
+      {
+        at: now,
+        by: who,
+        action: "created",
+        note: `Received via Incoming Stocks — ${batch.title}`,
+      },
+    ];
+    if (sale) {
+      history.push({
+        at: now,
+        by: who,
+        action: `Sold on ${sale.orderNo} to ${sale.customerName}`,
+      });
+    }
+    const doc = {
+      imei: code,
+      brand: bb.brand || "",
+      model: bb.model || l.model || "",
+      color: bb.color || l.color || "",
+      storage: bb.storage || l.capacity || "",
+      grade: gradeFor(l),
+      costPrice: l.price == null ? null : Number(l.price),
+      currency: batch.currency || "AUD",
+      stockSource: normalizeStockSource(batch.stockSource, DEFAULT_STOCK_SOURCE),
+      location,
+      // Sale status. Sold straight off the shipment when this receive is
+      // part of a sale; otherwise the unit goes into stock.
+      status: sale ? "Sold" : "In Stock",
+      salesOrder: sale
+        ? {
+            id: sale.orderId,
+            orderNo: sale.orderNo,
+            customerName: sale.customerName,
+            soldAt: now,
+          }
+        : null,
+      serialNumber: bb.serialNumber || "",
+      batteryHealth: bb.batteryHealth != null ? bb.batteryHealth : l.battery,
+      batteryCycleCount: bb.batteryCycleCount == null ? null : bb.batteryCycleCount,
+      batteryCapacity: bb.batteryCapacity || "",
+      aNumber: bb.aNumber || "",
+      blackbeltChecked: l.bbStatus === "found",
+      blackbeltReportId: l.bbReportId || "",
+      blackbeltStatus: bb.reportStatus || "",
+      note: "",
+      incomingBatchId: batch._id,
+      history,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: who,
+    };
+    try {
+      const r = await db.collection(DEVICES).insertOne(doc);
+      await db.collection(BATCHES).updateOne(
+        { _id: batch._id },
+        { $set: { ...receive, "lines.$[l].deviceId": r.insertedId, "lines.$[l].committedAt": now } },
+        { arrayFilters: [{ "l.code": code }] },
+      );
+      created += 1;
+      devices.push({ ...doc, _id: r.insertedId });
+    } catch (e) {
+      skipped.push({ code, reason: (e && e.message) || "Insert failed" });
+    }
+  };
+
+  const commitWorker = async () => {
+    for (;;) {
+      const code = commitQueue.shift();
+      if (!code) return;
+      await commitOne(code);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(COMMIT_CONCURRENCY, commitQueue.length) }, commitWorker),
+  );
+
+  await db.collection(BATCHES).updateOne({ _id: batch._id }, { $set: { updatedAt: now } });
+  return { created, skipped, devices, now };
+}
+
 router.post("/:id/commit", MANAGE, async (req, res) => {
   try {
     const ctx = await loadBatch(req, res);
     if (!ctx) return;
-    const { db, batch } = ctx;
 
-    const codes = [
-      ...new Set(
-        (Array.isArray(req.body && req.body.codes) ? req.body.codes : [])
-          .map(normalizeCode)
-          .filter((c) => CODE_RE.test(c)),
-      ),
-    ];
+    const codes = parseCodes(req.body);
     if (!codes.length) {
       return res.json({ success: true, created: 0, skipped: [], message: "Nothing scanned" });
     }
@@ -372,169 +579,105 @@ router.post("/:id/commit", MANAGE, async (req, res) => {
       return res.status(400).json({ success: false, message: "Too many codes in one commit" });
     }
 
-    const now = new Date();
-    const who = (req.user && req.user.username) || null;
-    const byCode = new Map((batch.lines || []).map((l) => [l.code, l]));
-
-    // Grades picked in the dialog, validated and keyed by normalized code.
-    const picks = {};
-    const rawPicks = (req.body && req.body.grades) || {};
-    for (const k of Object.keys(rawPicks)) {
-      const g = grade(rawPicks[k]);
-      if (g) picks[normalizeCode(k)] = g;
-    }
-    // A sheet grade always wins over a dialog pick.
-    const gradeFor = (l) => l.grade || picks[l.code] || "";
-
-    const location = normalizeReceiveLocation(req.body && req.body.location);
-
-    // Codes that aren't on the supplier's list become unlisted lines. Their
-    // Blackbelt lookups missed the upload sweep, so they run here — a few
-    // at a time, like the sweep, so a pile of extras doesn't serialize.
-    const extras = [];
-    const extraQueue = codes.filter((c) => !byCode.has(c));
-    const lookupWorker = async () => {
-      for (;;) {
-        const code = extraQueue.shift();
-        if (!code) return;
-        const bb = await askBlackbelt(code);
-        const extra = {
-          no: null,
-          code,
-          model: "",
-          color: "",
-          capacity: "",
-          battery: null,
-          price: null,
-          grade: "",
-          ...bb,
-          received: false,
-          receivedAt: null,
-          receivedBy: null,
-          unlisted: true,
-          alreadyInStock: false,
-          deviceId: null,
-          committedAt: null,
-        };
-        extras.push(extra);
-        byCode.set(code, extra);
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(BLACKBELT_CONCURRENCY, extraQueue.length) }, lookupWorker),
-    );
-    if (extras.length) {
-      await db.collection(BATCHES).updateOne(
-        { _id: batch._id },
-        {
-          $push: { lines: { $each: extras } },
-          $inc: { "blackbelt.total": extras.length, "blackbelt.done": extras.length },
-        },
-      );
-    }
-
-    const existing = await db
-      .collection(DEVICES)
-      .find({ imei: { $in: codes } }, { projection: { imei: 1 } })
-      .toArray();
-    const already = new Set(existing.map((d) => d.imei));
-
-    let created = 0;
-    const skipped = [];
-
-    // A bulk receive is two Mongo round-trips per device; done one at a
-    // time that outlives the client's request timeout, so a small pool runs
-    // several devices at once. Per-device semantics are unchanged — each
-    // code still gets its own insert + line update and its own error.
-    const COMMIT_CONCURRENCY = 8;
-    const commitQueue = codes.slice();
-
-    const commitOne = async (code) => {
-      const l = byCode.get(code);
-      if (l.deviceId) {
-        skipped.push({ code, reason: "Already added from this batch" });
-        return;
-      }
-      // The unit was physically scanned, so it's received either way — a
-      // clash with the stock register only blocks the device creation.
-      const receive = {
-        "lines.$[l].received": true,
-        "lines.$[l].receivedAt": now,
-        "lines.$[l].receivedBy": who,
-        "lines.$[l].grade": gradeFor(l),
-      };
-      if (already.has(code)) {
-        await db.collection(BATCHES).updateOne(
-          { _id: batch._id },
-          { $set: { ...receive, "lines.$[l].alreadyInStock": true } },
-          { arrayFilters: [{ "l.code": code }] },
-        );
-        skipped.push({ code, reason: "Already in stock" });
-        return;
-      }
-      const bb = l.bbDevice || {};
-      const doc = {
-        imei: code,
-        brand: bb.brand || "",
-        model: bb.model || l.model || "",
-        color: bb.color || l.color || "",
-        storage: bb.storage || l.capacity || "",
-        grade: gradeFor(l),
-        costPrice: l.price == null ? null : Number(l.price),
-        currency: batch.currency || "AUD",
-        stockSource: normalizeStockSource(batch.stockSource, DEFAULT_STOCK_SOURCE),
-        location,
-        serialNumber: bb.serialNumber || "",
-        batteryHealth: bb.batteryHealth != null ? bb.batteryHealth : l.battery,
-        batteryCycleCount: bb.batteryCycleCount == null ? null : bb.batteryCycleCount,
-        batteryCapacity: bb.batteryCapacity || "",
-        aNumber: bb.aNumber || "",
-        blackbeltChecked: l.bbStatus === "found",
-        blackbeltReportId: l.bbReportId || "",
-        blackbeltStatus: bb.reportStatus || "",
-        note: "",
-        incomingBatchId: batch._id,
-        history: [
-          {
-            at: now,
-            by: who,
-            action: "created",
-            note: `Received via Incoming Stocks — ${batch.title}`,
-          },
-        ],
-        createdAt: now,
-        updatedAt: now,
-        createdBy: who,
-      };
-      try {
-        const r = await db.collection(DEVICES).insertOne(doc);
-        await db.collection(BATCHES).updateOne(
-          { _id: batch._id },
-          { $set: { ...receive, "lines.$[l].deviceId": r.insertedId, "lines.$[l].committedAt": now } },
-          { arrayFilters: [{ "l.code": code }] },
-        );
-        created += 1;
-      } catch (e) {
-        skipped.push({ code, reason: (e && e.message) || "Insert failed" });
-      }
-    };
-
-    const commitWorker = async () => {
-      for (;;) {
-        const code = commitQueue.shift();
-        if (!code) return;
-        await commitOne(code);
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(COMMIT_CONCURRENCY, commitQueue.length) }, commitWorker),
-    );
-
-    await db.collection(BATCHES).updateOne({ _id: batch._id }, { $set: { updatedAt: now } });
+    const { created, skipped } = await receiveScanned(ctx, req, codes, {
+      location: normalizeReceiveLocation(req.body && req.body.location),
+    });
     return res.json({ success: true, created, skipped });
   } catch (e) {
     console.error("Incoming commit error:", e);
     return res.status(500).json({ success: false, message: "Failed to add to stock" });
+  }
+});
+
+// ── POST /refurbished/incoming/:id/sell ─────────────────────────────
+// Sell scanned units straight off the shipment: the stock records and the
+// sales order are created together, so the devices never sit in stock. They
+// are still filed at the iMobile location — location says where a unit
+// physically sits, and "sold" is carried by the status, not the location.
+//
+// Body: { codes, grades, customerId, currency, notes, prices: { code: price } }
+router.post("/:id/sell", MANAGE, SELL, async (req, res) => {
+  try {
+    const ctx = await loadBatch(req, res);
+    if (!ctx) return;
+    const { db, batch } = ctx;
+
+    const codes = parseCodes(req.body);
+    if (!codes.length) {
+      return res.status(400).json({ success: false, message: "Select at least one device" });
+    }
+    if (codes.length > 200) {
+      return res.status(400).json({ success: false, message: "Too many devices in one sale (max 200)" });
+    }
+
+    const customerId = ObjectId.isValid(req.body && req.body.customerId)
+      ? new ObjectId(req.body.customerId)
+      : null;
+    if (!customerId) {
+      return res.status(400).json({ success: false, message: "A customer is required" });
+    }
+    const customer = await db.collection(CUSTOMERS).findOne({ _id: customerId });
+    if (!customer) {
+      return res.status(404).json({ success: false, message: "Customer not found" });
+    }
+
+    // Sale prices keyed by normalized code (cost comes from the sheet).
+    const prices = {};
+    const rawPrices = (req.body && req.body.prices) || {};
+    for (const k of Object.keys(rawPrices)) prices[normalizeCode(k)] = rawPrices[k];
+
+    // The order id is minted up front so each device can carry its stamp as
+    // it's inserted; the order itself is written once the devices exist.
+    const orderId = new ObjectId();
+    const { seq, orderNo } = await nextOrderNumber(db);
+    const currency = normalizeCurrency(req.body && req.body.currency);
+
+    const { created, skipped, devices, now } = await receiveScanned(ctx, req, codes, {
+      location: LOCATION_IMOBILE,
+      sale: { orderId, orderNo, customerName: customer.name },
+    });
+
+    if (!created) {
+      return res.status(400).json({
+        success: false,
+        message: skipped.length
+          ? `Nothing could be sold — ${skipped[0].reason}`
+          : "No devices were created",
+        skipped,
+      });
+    }
+
+    const lines = devices.map((d) => deviceLine(d, prices[d.imei]));
+    const order = {
+      _id: orderId,
+      orderNo,
+      seq,
+      customerId,
+      customerName: customer.name,
+      currency,
+      notes: String((req.body && req.body.notes) || "").trim().slice(0, 1000),
+      lines,
+      ...computeTotals(lines, req.body && req.body.gstRate),
+      // Same lifecycle as an order raised from the register: starts Pending,
+      // locked once confirmed.
+      status: "Pending",
+      confirmedAt: null,
+      confirmedBy: null,
+      // Where these units came from — this order was raised off a shipment
+      // rather than from the stock register.
+      incomingBatchId: batch._id,
+      incomingBatchTitle: batch.title,
+      createdAt: now,
+      createdBy: (req.user && req.user.username) || null,
+      cancelledAt: null,
+      cancelledBy: null,
+    };
+    await db.collection(ORDERS).insertOne(order);
+
+    return res.json({ success: true, created, skipped, order });
+  } catch (e) {
+    console.error("Incoming sell error:", e);
+    return res.status(500).json({ success: false, message: "Failed to create the sale" });
   }
 });
 

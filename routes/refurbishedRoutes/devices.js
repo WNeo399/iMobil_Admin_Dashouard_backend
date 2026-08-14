@@ -143,6 +143,10 @@ router.get("/", VIEW, async (req, res) => {
     if (req.query.stockSource) match.stockSource = String(req.query.stockSource);
     if (req.query.location) match.location = String(req.query.location);
     if (req.query.model) match.model = String(req.query.model);
+    // Sale status. Devices recorded before the field existed are unsold, so
+    // "In Stock" also matches docs with no status at all.
+    if (req.query.status === "In Stock") match.status = { $in: ["In Stock", null] };
+    else if (req.query.status) match.status = String(req.query.status);
     const checked = String(req.query.blackbeltChecked || "");
     if (checked === "true") match.blackbeltChecked = true;
     else if (checked === "false") match.blackbeltChecked = { $ne: true };
@@ -221,7 +225,16 @@ router.get("/filters", VIEW, async (req, res) => {
       distinct("color"),
       distinct("location"),
     ]);
-    return res.json({ success: true, models, grades, stockSources, storages, colors, locations });
+    return res.json({
+      success: true,
+      models,
+      grades,
+      stockSources,
+      storages,
+      colors,
+      locations,
+      statuses: ["In Stock", "Sold"],
+    });
   } catch (e) {
     console.error("Refurb devices filters error:", e);
     return res.status(500).json({ success: false, message: "Failed to load filters" });
@@ -440,6 +453,8 @@ router.post("/", MANAGE, async (req, res) => {
       ...buildDevice(req.body || {}),
       stockSource: stockSourceForUser(req.user),
       location: locationForUser(req.user),
+      // Sale status — flips to "Sold" when the device lands on a sales order.
+      status: "In Stock",
       history: [historyEntry(req.user, "created")],
       createdAt: now,
       updatedAt: now,
@@ -514,7 +529,20 @@ router.delete("/:id", MANAGE, async (req, res) => {
       return res.status(400).json({ success: false, message: "Bad id" });
     }
     const db = await connectToDatabase();
-    const r = await db.collection(DEVICES).deleteOne({ _id: new ObjectId(req.params.id) });
+    const _id = new ObjectId(req.params.id);
+    // A sold device is referenced by its sales order — cancel that first.
+    const existing = await db
+      .collection(DEVICES)
+      .findOne({ _id }, { projection: { status: 1, salesOrder: 1 } });
+    if (!existing) return res.status(404).json({ success: false, message: "Device not found" });
+    if (existing.status === "Sold") {
+      const orderNo = (existing.salesOrder && existing.salesOrder.orderNo) || "a sales order";
+      return res.status(400).json({
+        success: false,
+        message: `This device is sold on ${orderNo} — cancel that order first`,
+      });
+    }
+    const r = await db.collection(DEVICES).deleteOne({ _id });
     if (!r.deletedCount) return res.status(404).json({ success: false, message: "Device not found" });
     return res.json({ success: true });
   } catch (e) {

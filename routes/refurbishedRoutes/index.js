@@ -18,6 +18,9 @@ const { query } = require("../../utils/scraperDb");
 router.use("/devices", require("./devices"));
 // Supplier shipments waiting to be counted in and turned into stock.
 router.use("/incoming", require("./incoming"));
+// Selling stock out of the register: buyers + RSO-numbered sales orders.
+router.use("/customers", require("./customers"));
+router.use("/sales-orders", require("./salesOrders"));
 
 const VIEW = requirePermission("refurb:offer:view");
 const TABLE = "stg_reebelo_offers";
