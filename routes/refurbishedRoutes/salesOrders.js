@@ -421,6 +421,51 @@ router.put("/:id", MANAGE, async (req, res) => {
   }
 });
 
+// ── PUT /refurbished/sales-orders/:id/notes ─────────────────────────
+// The remark stays editable after an order is confirmed — it's commentary,
+// not part of the sale. Everything else on a confirmed order is locked.
+router.put("/:id/notes", MANAGE, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const order = await db.collection(ORDERS).findOne({ _id: new ObjectId(id) });
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Sales order not found" });
+    }
+    if (order.status === STATUS_CANCELLED) {
+      return res.status(400).json({ success: false, message: "A cancelled order can't be edited" });
+    }
+
+    const notes = String((req.body && req.body.notes) || "").trim().slice(0, 1000);
+    if (notes === (order.notes || "")) {
+      return res.json({ success: true, message: "No change", order });
+    }
+
+    const now = new Date();
+    const result = await db.collection(ORDERS).findOneAndUpdate(
+      { _id: order._id },
+      {
+        $set: { notes, updatedAt: now, updatedBy: actor(req) },
+        $push: {
+          history: {
+            $each: [{ at: now, by: actor(req), action: notes ? "Remark updated" : "Remark cleared" }],
+            $slice: -100,
+          },
+        },
+      },
+      { returnDocument: "after" },
+    );
+    const updated = result ? result.value || result : null;
+    return res.json({ success: true, message: "Remark saved", order: updated });
+  } catch (e) {
+    console.error("Update refurb sales order notes error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the remark" });
+  }
+});
+
 // ── POST /refurbished/sales-orders/:id/confirm ──────────────────────
 // Locks the order: a confirmed order can no longer be edited. Cancelling
 // stays available as the escape hatch.
