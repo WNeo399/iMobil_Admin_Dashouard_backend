@@ -844,8 +844,10 @@ router.get("/statement/order/:id/dispatch", STATEMENT, async (req, res) => {
           at: b.at,
           units: b.units,
           tracking: b.tracking || "",
+          // Barcode only — imbSku is the internal warehouse code and has no
+          // business on a customer-facing screen.
           lines: (b.lines || []).map((l) => ({
-            sku: l.imbSku || l.sku || "",
+            sku: l.sku || "",
             description: l.description || "",
             qty: num(l.qty),
           })),
@@ -2081,8 +2083,9 @@ router.post("/dispatch/manual/:id/customer", VIEW_ORDERS, async (req, res) => {
 // ── GET /inflow/dispatch/mine ───────────────────────────────────────
 // The logged-in CUSTOMER's dispatch status (portal — inflow:statement:view).
 // Read-only: their linked upload records plus their mapped sales orders,
-// with per-line progress. Internal fields (warehouse SKU, uploader, batch
-// details) are deliberately not exposed.
+// with per-line progress and the consignments already shipped. Internal
+// fields (warehouse SKU, uploader / picker, inventory adjustment ids) are
+// deliberately not exposed.
 router.get("/dispatch/mine", STATEMENT, async (req, res) => {
   try {
     const name = req.user && req.user.inflowCustomerName;
@@ -2120,6 +2123,20 @@ router.get("/dispatch/mine", STATEMENT, async (req, res) => {
           description: (li && li.description) || "",
           quantity: num(li && li.quantity),
           dispatchedQty: num(li && li.dispatchedQty),
+        })),
+        // What has actually shipped, per consignment. Customer-facing
+        // fields only: no warehouse SKU, no picker name, no inventory
+        // adjustment ids. Tracking is included — it's theirs to use.
+        batches: (Array.isArray(rec.dispatchBatches) ? rec.dispatchBatches : []).map((b) => ({
+          batchNo: num(b && b.batchNo),
+          at: (b && b.at) || null,
+          units: num(b && b.units),
+          tracking: (b && b.tracking) || "",
+          lines: (Array.isArray(b && b.lines) ? b.lines : []).map((l) => ({
+            sku: (l && l.sku) || "",
+            description: (l && l.description) || "",
+            qty: num(l && l.qty),
+          })),
         })),
       };
     };

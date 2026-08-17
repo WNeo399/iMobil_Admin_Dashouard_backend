@@ -421,6 +421,87 @@ router.put("/:id", MANAGE, async (req, res) => {
   }
 });
 
+// ── POST /refurbished/sales-orders/:id/refresh-lines ────────────────
+// Re-read each line's device description from the register.
+//
+// Order lines are snapshots so the paperwork survives a device being edited
+// or deleted — but that also means correcting a device's model / colour /
+// storage in Stock afterwards doesn't reach an order already raised. This
+// pulls those corrections through. Descriptive fields only: prices, the
+// device set and the totals are untouched, so it's safe on a confirmed
+// order (a cancelled one is left alone).
+router.post("/:id/refresh-lines", MANAGE, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const order = await db.collection(ORDERS).findOne({ _id: new ObjectId(id) });
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Sales order not found" });
+    }
+    if (order.status === STATUS_CANCELLED) {
+      return res.status(400).json({ success: false, message: "A cancelled order can't be updated" });
+    }
+
+    const ids = (order.lines || []).map((l) => l.deviceId).filter(Boolean);
+    const devices = await db
+      .collection(DEVICES)
+      .find({ _id: { $in: ids } })
+      .toArray();
+    const byId = new Map(devices.map((d) => [String(d._id), d]));
+
+    const changed = [];
+    const lines = (order.lines || []).map((l) => {
+      const d = byId.get(String(l.deviceId));
+      if (!d) return l; // device gone — the snapshot is all we have
+      // Rebuild from the device, then put the line's own price back.
+      const fresh = { ...deviceLine(d, l.price) };
+      const differs = ["brand", "model", "color", "storage", "grade", "serialNumber", "batteryHealth"].some(
+        (k) => (fresh[k] || "") !== (l[k] || ""),
+      );
+      if (differs) changed.push(l.imei);
+      return fresh;
+    });
+
+    if (!changed.length) {
+      return res.json({ success: true, message: "Already up to date", updated: 0, order });
+    }
+
+    const now = new Date();
+    const result = await db.collection(ORDERS).findOneAndUpdate(
+      { _id: order._id },
+      {
+        $set: { lines, updatedAt: now, updatedBy: actor(req) },
+        $push: {
+          history: {
+            $each: [
+              {
+                at: now,
+                by: actor(req),
+                action: `Device details refreshed — ${changed.length} line(s) updated`,
+              },
+            ],
+            $slice: -100,
+          },
+        },
+      },
+      { returnDocument: "after" },
+    );
+    const updated = result ? result.value || result : null;
+    return res.json({
+      success: true,
+      message: `${changed.length} line(s) updated`,
+      updated: changed.length,
+      order: updated,
+    });
+  } catch (e) {
+    console.error("Refresh refurb sales order lines error:", e);
+    return res.status(500).json({ success: false, message: "Failed to refresh the device details" });
+  }
+});
+
 // ── PUT /refurbished/sales-orders/:id/notes ─────────────────────────
 // The remark stays editable after an order is confirmed — it's commentary,
 // not part of the sale. Everything else on a confirmed order is locked.

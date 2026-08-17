@@ -399,6 +399,20 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
   // A sheet grade always wins over a dialog pick.
   const gradeFor = (l) => l.grade || picks[l.code] || "";
 
+  // Model / colour / capacity corrected in the dialog for lines Blackbelt
+  // has no report on — the supplier's own wording is often a shorthand
+  // ("14-128 CH"). Blackbelt still wins wherever it has a value.
+  const details = {};
+  const rawDetails = (req.body && req.body.details) || {};
+  for (const k of Object.keys(rawDetails)) {
+    const d = rawDetails[k] || {};
+    details[normalizeCode(k)] = {
+      model: str(d.model, 120).toUpperCase(),
+      color: str(d.color, 60).toUpperCase(),
+      capacity: str(d.storage || d.capacity, 40).toUpperCase(),
+    };
+  }
+
   // Codes that aren't on the supplier's list become unlisted lines. Their
   // Blackbelt lookups missed the upload sweep, so they run here — a few
   // at a time, like the sweep, so a pile of extras doesn't serialize.
@@ -500,12 +514,13 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
         action: `Sold on ${sale.orderNo} to ${sale.customerName}`,
       });
     }
+    const fix = details[code] || {};
     const doc = {
       imei: code,
       brand: bb.brand || "",
-      model: bb.model || l.model || "",
-      color: bb.color || l.color || "",
-      storage: bb.storage || l.capacity || "",
+      model: bb.model || fix.model || l.model || "",
+      color: bb.color || fix.color || l.color || "",
+      storage: bb.storage || fix.capacity || l.capacity || "",
       grade: gradeFor(l),
       costPrice: l.price == null ? null : Number(l.price),
       currency: batch.currency || "AUD",
@@ -678,6 +693,66 @@ router.post("/:id/sell", MANAGE, SELL, async (req, res) => {
   } catch (e) {
     console.error("Incoming sell error:", e);
     return res.status(500).json({ success: false, message: "Failed to create the sale" });
+  }
+});
+
+// ── GET /refurbished/incoming/:id/received ──────────────────────────
+// Everything counted in against this batch, joined to where it ended up:
+// its location in the register and, if it has since been sold, the sales
+// order number and customer. Feeds the batch's "Download Received" export.
+router.get("/:id/received", MANAGE, async (req, res) => {
+  try {
+    const ctx = await loadBatch(req, res);
+    if (!ctx) return;
+    const { db, batch } = ctx;
+
+    const lines = (batch.lines || []).filter((l) => l.received || l.deviceId);
+    if (!lines.length) return res.json({ success: true, title: batch.title, rows: [] });
+
+    // Devices created by this batch, plus any line that was already in the
+    // register when it was scanned (matched on the code).
+    const ids = lines.map((l) => l.deviceId).filter(Boolean);
+    const codes = lines.map((l) => l.code);
+    const devices = await db
+      .collection(DEVICES)
+      .find({ $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] })
+      .toArray();
+    const byId = new Map(devices.map((d) => [String(d._id), d]));
+    const byCode = new Map(devices.map((d) => [d.imei, d]));
+
+    const rows = lines.map((l) => {
+      const d = (l.deviceId && byId.get(String(l.deviceId))) || byCode.get(l.code) || null;
+      const so = (d && d.salesOrder) || null;
+      const bb = l.bbDevice || {};
+      return {
+        code: l.code,
+        model: (d && d.model) || bb.model || l.model || "",
+        color: (d && d.color) || bb.color || l.color || "",
+        storage: (d && d.storage) || bb.storage || l.capacity || "",
+        grade: (d && d.grade) || l.grade || "",
+        batteryHealth: d && d.batteryHealth != null ? d.batteryHealth : l.battery,
+        costPrice: d && d.costPrice != null ? d.costPrice : l.price,
+        currency: (d && d.currency) || batch.currency || "",
+        stockSource: (d && d.stockSource) || batch.stockSource || "",
+        location: (d && d.location) || "",
+        status: (d && d.status) || "",
+        orderNo: (so && so.orderNo) || "",
+        customerName: (so && so.customerName) || "",
+        soldAt: (so && so.soldAt) || null,
+        receivedAt: l.receivedAt || null,
+        receivedBy: l.receivedBy || "",
+        unlisted: !!l.unlisted,
+        // Scanned here but the register already had it — the device row
+        // belongs to whichever batch first recorded it.
+        alreadyInStock: !!l.alreadyInStock,
+        inRegister: !!d,
+      };
+    });
+
+    return res.json({ success: true, title: batch.title, rows });
+  } catch (e) {
+    console.error("Incoming received export error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load the received list" });
   }
 });
 
