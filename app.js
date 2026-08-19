@@ -54,6 +54,7 @@ var exengineRouter = require('./routes/exengineRoutes/index');
 var consignmentRouter = require('./routes/consignmentRoutes/index');
 var blackbeltRouter = require('./routes/blackbeltRoutes/index');
 var explodedRouter = require('./routes/explodedRoutes/index');
+var posRouter = require('./routes/posRoutes/index');
 // Public daily-cron trigger for the Purchase Order UPDATE sync (Tencent → DB).
 var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
@@ -178,6 +179,7 @@ app.use('/exengine', authenticate, exengineRouter);
 app.use('/consignment', authenticate, consignmentRouter);
 app.use('/blackbelt', authenticate, blackbeltRouter);
 app.use('/exploded', authenticate, explodedRouter);
+app.use('/pos', authenticate, posRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

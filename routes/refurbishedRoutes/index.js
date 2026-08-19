@@ -20,6 +20,9 @@ router.use("/devices", require("./devices"));
 router.use("/incoming", require("./incoming"));
 // Selling stock out of the register: buyers + RSO-numbered sales orders.
 router.use("/customers", require("./customers"));
+// Devices sent out to a workshop and reconciled back in.
+router.use("/repairers", require("./repairers"));
+router.use("/repairs", require("./repairs"));
 router.use("/sales-orders", require("./salesOrders"));
 
 const VIEW = requirePermission("refurb:offer:view");

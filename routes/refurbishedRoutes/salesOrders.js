@@ -28,6 +28,7 @@ const {
   computeTotals,
   num,
 } = require("./salesOrderCore");
+const { LOCATION_IMOBILE } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:sale:view");
 const MANAGE = requirePermission("refurb:sale:manage");
@@ -54,6 +55,48 @@ function actor(req) {
 // Matches the device-history entries the Stock page timeline renders.
 function historyEntry(req, action) {
   return { at: new Date(), by: actor(req), action };
+}
+
+// Marks devices Sold against an order and files them at iMobile: a unit
+// sold out of the dashboard is picked, packed and shipped from here, so
+// wherever it sat before, that is where it is now.
+//
+// Split in two so the history explains the move on the devices that
+// actually moved, instead of a location silently changing under them.
+// `guard` narrows which devices may transition (create refuses anything
+// already Sold); returns how many actually did.
+async function markSold(db, req, { deviceIds, devices, orderNo, customerName, stamp, now, guard }) {
+  const byId = new Map((devices || []).map((d) => [String(d._id), d]));
+  const stayed = [];
+  const moved = [];
+  for (const id of deviceIds) {
+    const d = byId.get(String(id));
+    (d && d.location === LOCATION_IMOBILE ? stayed : moved).push(id);
+  }
+
+  let modified = 0;
+  for (const [ids, note] of [
+    [stayed, `Sold on ${orderNo} to ${customerName}`],
+    [moved, `Sold on ${orderNo} to ${customerName} — moved to ${LOCATION_IMOBILE}`],
+  ]) {
+    if (!ids.length) continue;
+    const r = await db.collection(DEVICES).updateMany(
+      { _id: { $in: ids }, ...(guard || {}) },
+      {
+        $set: {
+          status: "Sold",
+          location: LOCATION_IMOBILE,
+          salesOrder: stamp,
+          updatedAt: now,
+        },
+        $push: {
+          history: { $each: [historyEntry(req, note)], $slice: -100 },
+        },
+      },
+    );
+    modified += r.modifiedCount;
+  }
+  return modified;
 }
 
 // ── GET /refurbished/sales-orders ───────────────────────────────────
@@ -194,30 +237,23 @@ router.post("/", MANAGE, async (req, res) => {
     // Mark the devices Sold. The status guard means a concurrent order can't
     // double-sell — and the history entry only lands on devices that actually
     // transitioned.
-    const upd = await db.collection(DEVICES).updateMany(
-      { _id: { $in: deviceIds }, status: { $ne: "Sold" } },
-      {
-        $set: {
-          status: "Sold",
-          salesOrder: {
-            id: r.insertedId,
-            orderNo: order.orderNo,
-            customerName: customer.name,
-            soldAt: now,
-          },
-          updatedAt: now,
-        },
-        $push: {
-          history: {
-            $each: [historyEntry(req, `Sold on ${order.orderNo} to ${customer.name}`)],
-            $slice: -100,
-          },
-        },
+    const modified = await markSold(db, req, {
+      deviceIds,
+      devices,
+      orderNo: order.orderNo,
+      customerName: customer.name,
+      stamp: {
+        id: r.insertedId,
+        orderNo: order.orderNo,
+        customerName: customer.name,
+        soldAt: now,
       },
-    );
-    if (upd.modifiedCount !== deviceIds.length) {
+      now,
+      guard: { status: { $ne: "Sold" } },
+    });
+    if (modified !== deviceIds.length) {
       console.warn(
-        `Sales order ${order.orderNo}: expected ${deviceIds.length} devices marked Sold, got ${upd.modifiedCount}`,
+        `Sales order ${order.orderNo}: expected ${deviceIds.length} devices marked Sold, got ${modified}`,
       );
     }
 
@@ -335,18 +371,14 @@ router.put("/:id", MANAGE, async (req, res) => {
       soldAt: now,
     };
     if (addedIds.length) {
-      await db.collection(DEVICES).updateMany(
-        { _id: { $in: addedIds } },
-        {
-          $set: { status: "Sold", salesOrder: stamp, updatedAt: now },
-          $push: {
-            history: {
-              $each: [historyEntry(req, `Sold on ${order.orderNo} to ${customer.name}`)],
-              $slice: -100,
-            },
-          },
-        },
-      );
+      await markSold(db, req, {
+        deviceIds: addedIds,
+        devices,
+        orderNo: order.orderNo,
+        customerName: customer.name,
+        stamp,
+        now,
+      });
     }
     // Devices staying on the order only need their stamp refreshed, and
     // only when the buyer changed.

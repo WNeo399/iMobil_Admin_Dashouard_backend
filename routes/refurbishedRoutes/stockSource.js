@@ -36,12 +36,25 @@ function locationForUser(user) {
   return user && user.role === "phone-supplier" ? LOCATION_SUPPLIER : LOCATION_IMOBILE;
 }
 
+// Device sale status. A unit away at a repairer is neither sellable nor
+// on a shelf, so it gets its own status rather than a pretend location —
+// the sales-order device picker filters on IN_STOCK and therefore skips
+// it without needing to know repairs exist.
+const STATUS_IN_STOCK = "In Stock";
+const STATUS_SOLD = "Sold";
+const STATUS_OUT_FOR_REPAIR = "Out for Repair";
+const DEVICE_STATUSES = [STATUS_IN_STOCK, STATUS_SOLD, STATUS_OUT_FOR_REPAIR];
+
 function normalizeReceiveLocation(v) {
   const s = String(v == null ? "" : v).trim().toLowerCase();
   return RECEIVE_LOCATIONS.find((x) => x.toLowerCase() === s) || LOCATION_IMOBILE;
 }
 
 module.exports = {
+  STATUS_IN_STOCK,
+  STATUS_SOLD,
+  STATUS_OUT_FOR_REPAIR,
+  DEVICE_STATUSES,
   STOCK_SOURCES,
   DEFAULT_STOCK_SOURCE,
   normalizeStockSource,

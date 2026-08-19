@@ -372,9 +372,13 @@ router.get("/:id/report", VIEW, async (req, res) => {
 
 // ── POST /refurbished/devices/:id/blackbelt-check ───────────────────
 // Re-asks Blackbelt about a device already in the register — for units
-// added before their report existed. On a hit it stamps the blackbelt
-// fields, fills identity/battery fields the register had blank (never
-// overwriting a value someone entered), and logs the change.
+// added before their report existed, and to correct one whose details were
+// typed or imported wrong.
+//
+// Blackbelt is the source of truth: every field it reports a value for is
+// written, blank or not. A field it has nothing for is left alone, so a
+// thin report can never wipe details the register already holds. Every
+// change lands in the device's history.
 router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -414,9 +418,50 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
       batteryCapacity: d.batteryCapacity,
       aNumber: d.aNumber,
     };
+    // Case-only differences ("Silver" vs "SILVER") aren't worth a history
+    // entry, so they don't count as a change.
+    const same = (a, b) =>
+      String(a == null ? "" : a).trim().toLowerCase() ===
+      String(b == null ? "" : b).trim().toLowerCase();
     for (const [k, v] of Object.entries(fillable)) {
-      if (!empty(v) && empty(existing[k])) set[k] = v;
+      if (empty(v) || same(existing[k], v)) continue;
+      set[k] = v;
     }
+
+    // A report that carries no colour looks exactly like a broken check:
+    // "report found", nothing changes, no explanation. Report what was
+    // filled, what was corrected, and what the report simply doesn't carry.
+    const LABELS = {
+      brand: "Brand",
+      model: "Model",
+      color: "Colour",
+      storage: "Storage",
+      serialNumber: "Serial Number",
+      batteryHealth: "Battery Health",
+      batteryCycleCount: "Battery Cycles",
+      batteryCapacity: "Battery Capacity",
+      aNumber: "A Number",
+    };
+    // Only the identity fields are worth naming as missing — nobody needs
+    // to be told a report has no A Number.
+    const NAMED_WHEN_BLANK = ["model", "color", "storage"];
+    const filled = [];
+    const blank = [];
+    const corrected = [];
+    for (const [k, v] of Object.entries(fillable)) {
+      if (set[k] !== undefined) {
+        if (empty(existing[k])) filled.push(LABELS[k]);
+        else corrected.push({ field: k, label: LABELS[k], from: existing[k], to: v });
+      } else if (empty(v) && NAMED_WHEN_BLANK.includes(k) && empty(existing[k])) {
+        blank.push(LABELS[k]);
+      }
+    }
+    const parts = [
+      filled.length ? `filled ${filled.join(", ")}` : "",
+      corrected.length ? `corrected ${corrected.map((c) => c.label).join(", ")}` : "",
+      blank.length ? `this report has no ${blank.join(" or ")}` : "",
+    ].filter(Boolean);
+    const message = `Report found — ${parts.join(" · ") || "everything already matches"}`;
 
     const changes = diffDevice(existing, set);
     const update = { $set: set };
@@ -427,7 +472,7 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
     }
     const u = await db.collection(DEVICES).findOneAndUpdate({ _id }, update, { returnDocument: "after" });
     const updated = u ? u.value || u : null;
-    return res.json({ success: true, found: true, device: updated });
+    return res.json({ success: true, found: true, device: updated, message, filled, blank, corrected });
   } catch (e) {
     console.error("Refurb device blackbelt-check error:", e);
     return res.status(500).json({ success: false, message: "Blackbelt check failed" });

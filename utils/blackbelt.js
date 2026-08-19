@@ -150,7 +150,11 @@ function parseReport(xml) {
     serialNumber: str(findField(tree, "SerialNumber")),
     imei: str(findField(tree, "IMEI")),
     storage: str(findField(tree, "HandsetMemorySize")),
-    color: str(findField(tree, "DeviceColor")),
+    // Reports carry the colour twice and either can be blank — a unit whose
+    // <DeviceColor/> is empty may still name it under OriginalColour. (Some
+    // reports carry neither; DeviceEnclosureColor is a numeric code, not a
+    // name, so it is no use here.)
+    color: str(findField(tree, "DeviceColor")) || str(findField(tree, "OriginalColour")),
     batteryHealth: toInt(findField(tree, "BatteryOverallPercentage")),
     batteryCycleCount: toInt(findField(tree, "BatteryCycleCount")),
     batteryCapacity: str(findField(tree, "BatteryDesignCapacity")),
@@ -291,7 +295,7 @@ function parseReportDetail(xml) {
     aNumber: f("ANumber"),
     storage: f("HandsetMemorySize"),
     ram: f("RAM"),
-    color: f("DeviceColor"),
+    color: f("DeviceColor") || f("OriginalColour"),
     mlbSerial: f("MLBSerialNumber"),
     region: f("RegionInfo"),
     fmip: f("FMIP"),
