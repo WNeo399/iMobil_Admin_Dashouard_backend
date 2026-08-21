@@ -29,6 +29,9 @@ function stockSourceForUser(user) {
 const LOCATION_IMOBILE = "iMobile";
 const LOCATION_SUPPLIER = "Supplier Stock";
 const LOCATION_EXYON = "Assigned To Exyon";
+// A supplier shipment on the road to iMobile — set by Supply Batches, and
+// replaced by a real shelf when the warehouse receives the box.
+const LOCATION_IN_TRANSIT = "In Transit";
 // What the receive dialog may choose from.
 const RECEIVE_LOCATIONS = [LOCATION_IMOBILE, LOCATION_EXYON];
 
@@ -83,6 +86,7 @@ module.exports = {
   LOCATION_IMOBILE,
   LOCATION_SUPPLIER,
   LOCATION_EXYON,
+  LOCATION_IN_TRANSIT,
   RECEIVE_LOCATIONS,
   locationForUser,
   normalizeReceiveLocation,

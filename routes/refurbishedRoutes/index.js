@@ -22,6 +22,8 @@ router.use("/incoming", require("./incoming"));
 router.use("/customers", require("./customers"));
 // Devices sent out to a workshop and reconciled back in.
 router.use("/repairers", require("./repairers"));
+// Supplier shipments to iMobile — creates the matching incoming record.
+router.use("/supply", require("./supplyBatches"));
 router.use("/repairs", require("./repairs"));
 router.use("/sales-orders", require("./salesOrders"));
 

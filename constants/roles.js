@@ -118,6 +118,8 @@ const ROLE_PERMISSIONS = {
     "ai:query:use",
     "refurb:stock:view",
     "refurb:stock:manage",
+    "refurb:supply:view",
+    "refurb:supply:manage",
   ],
   // Consignment Shop — scoped to the shop on the user record (consignShopId).
   [ROLES.CONSIGNMENT_SHOP]: [
