@@ -23,6 +23,22 @@ const { stockSourceForUser, locationForUser } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:stock:view");
 const MANAGE = requirePermission("refurb:stock:manage");
+
+// A phone supplier only ever works their own shelf: reads are narrowed to
+// the stock source on their user record and writes must land on a device
+// that already belongs to it. null = unscoped (staff see everything). A
+// supplier with no source assigned scopes to a value no device carries, so
+// they see an empty register rather than someone else's.
+function supplierSource(user) {
+  if (!user || user.role !== "phone-supplier") return null;
+  return stockSourceForUser(user) || "\u0000unassigned";
+}
+// 404, not 403 — a device outside the supplier's scope should read as
+// nonexistent rather than confirm it exists.
+function outOfScope(user, device) {
+  const src = supplierSource(user);
+  return src !== null && (!device || device.stockSource !== src);
+}
 const DEVICES = "refurb_devices";
 
 function escapeRegex(s) {
@@ -127,6 +143,17 @@ router.get("/", VIEW, async (req, res) => {
     const pageSize = Math.min(Math.max(parseInt(req.query.pageSize, 10) || 25, 1), 200);
 
     const match = {};
+    // A comma-separated id list — the sales-order dialog re-reads the cost
+    // of the devices already on an order in one call.
+    if (req.query.ids) {
+      const ids = String(req.query.ids)
+        .split(",")
+        .map((v) => v.trim())
+        .filter((v) => ObjectId.isValid(v))
+        .slice(0, 200)
+        .map((v) => new ObjectId(v));
+      if (ids.length) match._id = { $in: ids };
+    }
     const search = String(req.query.search || "").trim();
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
@@ -141,6 +168,10 @@ router.get("/", VIEW, async (req, res) => {
     }
     if (req.query.grade) match.grade = String(req.query.grade);
     if (req.query.stockSource) match.stockSource = String(req.query.stockSource);
+    // Applied after the query params so a crafted stockSource= can't widen
+    // a supplier's view.
+    const scope = supplierSource(req.user);
+    if (scope !== null) match.stockSource = scope;
     if (req.query.location) match.location = String(req.query.location);
     if (req.query.model) match.model = String(req.query.model);
     // Sale status. Devices recorded before the field existed are unsold, so
@@ -205,12 +236,13 @@ router.get("/", VIEW, async (req, res) => {
 router.get("/filters", VIEW, async (req, res) => {
   try {
     const db = await connectToDatabase();
+    const scope = supplierSource(req.user);
     const distinct = async (field) =>
       (
         await db
           .collection(DEVICES)
           .aggregate([
-            { $match: { [field]: { $nin: [null, ""] } } },
+            { $match: { [field]: { $nin: [null, ""] }, ...(scope !== null ? { stockSource: scope } : {}) } },
             { $group: { _id: `$${field}` } },
             { $sort: { _id: 1 } },
             { $limit: 500 },
@@ -261,6 +293,17 @@ router.get("/lookup", VIEW, async (req, res) => {
     // upstream about a device we've already recorded.
     const db = await connectToDatabase();
     const known = await db.collection(DEVICES).findOne({ imei });
+    if (known && outOfScope(req.user, known)) {
+      // The create would 409 anyway, so say it's taken — but none of the
+      // other shelf's details go out with it.
+      return res.json({
+        success: true,
+        source: "register",
+        alreadyInStock: true,
+        message: "This IMEI is already recorded in the register.",
+        device: { imei },
+      });
+    }
     if (known) {
       return res.json({
         success: true,
@@ -341,6 +384,18 @@ router.get("/:id/report", VIEW, async (req, res) => {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: "Bad id" });
     }
+    {
+      const db = await connectToDatabase();
+      const d = await db
+        .collection(DEVICES)
+        .findOne({ _id: new ObjectId(req.params.id) }, { projection: { stockSource: 1 } });
+      if (!d || outOfScope(req.user, d)) {
+        return res.status(404).json({ success: false, message: "Device not found" });
+      }
+    }
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
     const db = await connectToDatabase();
     const device = await db
       .collection(DEVICES)
@@ -387,7 +442,9 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
     const db = await connectToDatabase();
     const _id = new ObjectId(req.params.id);
     const existing = await db.collection(DEVICES).findOne({ _id });
-    if (!existing) return res.status(404).json({ success: false, message: "Device not found" });
+    if (!existing || outOfScope(req.user, existing)) {
+      return res.status(404).json({ success: false, message: "Device not found" });
+    }
 
     const r = await blackbelt.lookupDevice(existing.imei);
     if (r && r.notConfigured) {
@@ -487,6 +544,12 @@ router.post("/", MANAGE, async (req, res) => {
     if (!CODE_RE.test(imei)) {
       return res.status(400).json({ success: false, message: CODE_HINT });
     }
+    if (req.user && req.user.role === "phone-supplier" && !stockSourceForUser(req.user)) {
+      return res.status(400).json({
+        success: false,
+        message: "Your account has no stock source assigned — ask an admin to set it first",
+      });
+    }
     const db = await connectToDatabase();
     const clash = await db.collection(DEVICES).findOne({ imei }, { projection: { _id: 1 } });
     if (clash) {
@@ -524,7 +587,9 @@ router.put("/:id", MANAGE, async (req, res) => {
 
     // The stored doc is needed to diff the edit for the history log.
     const existing = await db.collection(DEVICES).findOne({ _id });
-    if (!existing) return res.status(404).json({ success: false, message: "Device not found" });
+    if (!existing || outOfScope(req.user, existing)) {
+      return res.status(404).json({ success: false, message: "Device not found" });
+    }
 
     const set = buildDevice(req.body || {}, { partial: true });
 
@@ -578,8 +643,10 @@ router.delete("/:id", MANAGE, async (req, res) => {
     // A sold device is referenced by its sales order — cancel that first.
     const existing = await db
       .collection(DEVICES)
-      .findOne({ _id }, { projection: { status: 1, salesOrder: 1 } });
-    if (!existing) return res.status(404).json({ success: false, message: "Device not found" });
+      .findOne({ _id }, { projection: { status: 1, salesOrder: 1, stockSource: 1 } });
+    if (!existing || outOfScope(req.user, existing)) {
+      return res.status(404).json({ success: false, message: "Device not found" });
+    }
     if (existing.status === "Sold") {
       const orderNo = (existing.salesOrder && existing.salesOrder.orderNo) || "a sales order";
       return res.status(400).json({

@@ -33,6 +33,7 @@ const {
   STATUS_IN_STOCK,
   STATUS_SOLD,
   STATUS_OUT_FOR_REPAIR,
+  STATUS_REPAIRING,
 } = require("./stockSource");
 const {
   ORDERS,
@@ -127,6 +128,41 @@ async function askBlackbelt(code) {
   } catch (e) {
     return { bbStatus: "error", bbMessage: (e && e.message) || "Lookup failed", bbReportId: "", bbDevice: null };
   }
+}
+
+// A repair-list code that isn't in the register joins it on the spot:
+// status "Repairing", no location until it comes back. The return flow
+// then treats it like any register device — update, not create.
+function repairingGhost(line, { batchId, stockSource, currency, title, who, now }) {
+  const bb = line.bbDevice || {};
+  return {
+    imei: line.code,
+    brand: bb.brand || "",
+    model: bb.model || line.model || line.productName || "",
+    color: bb.color || line.color || "",
+    storage: bb.storage || line.storage || "",
+    grade: line.grade || "",
+    costPrice: line.deviceCost == null ? null : Number(line.deviceCost),
+    currency: currency || "AUD",
+    stockSource,
+    location: "",
+    status: STATUS_REPAIRING,
+    salesOrder: null,
+    serialNumber: bb.serialNumber || "",
+    batteryHealth: bb.batteryHealth == null ? null : bb.batteryHealth,
+    batteryCycleCount: bb.batteryCycleCount == null ? null : bb.batteryCycleCount,
+    batteryCapacity: bb.batteryCapacity || "",
+    aNumber: bb.aNumber || "",
+    blackbeltChecked: line.bbStatus === "found",
+    blackbeltReportId: line.bbReportId || "",
+    blackbeltStatus: bb.reportStatus || "",
+    note: "",
+    repairBatchId: batchId,
+    history: [{ at: now, by: who, action: "created", note: `Uploaded on repair batch ${title}` }],
+    createdAt: now,
+    updatedAt: now,
+    createdBy: who,
+  };
 }
 
 function summarize(batch) {
@@ -236,11 +272,28 @@ router.post("/", MANAGE, async (req, res) => {
         deviceCost: num(r.deviceCost),
         systemPrice: num(r.systemPrice),
         issues: str(r.issues, 300),
-        // Blackbelt is asked separately, via the button on the batch.
-        bbStatus: "",
+        // Normally Blackbelt is asked later, via the button on the batch —
+        // but a row scanned in the New Batch dialog arrives with its answer
+        // already looked up, and that shouldn't be thrown away. Sanitised
+        // field by field; only a "found" row may carry a device blob.
+        bbStatus: r.bbStatus === "found" ? "found" : "",
         bbMessage: "",
-        bbReportId: "",
-        bbDevice: null,
+        bbReportId: r.bbStatus === "found" ? str(r.bbReportId, 120) : "",
+        bbDevice:
+          r.bbStatus === "found" && r.bbDevice
+            ? {
+                brand: str(r.bbDevice.brand, 60),
+                model: str(r.bbDevice.model, 120),
+                color: str(r.bbDevice.color, 60),
+                storage: str(r.bbDevice.storage, 40),
+                serialNumber: str(r.bbDevice.serialNumber, 60),
+                batteryHealth: num(r.bbDevice.batteryHealth),
+                batteryCycleCount: num(r.bbDevice.batteryCycleCount),
+                batteryCapacity: str(r.bbDevice.batteryCapacity, 40),
+                aNumber: str(r.bbDevice.aNumber, 40),
+                reportStatus: str(r.bbDevice.reportStatus, 200),
+              }
+            : null,
         // Filled when the batch is matched against the register.
         deviceId: null,
         previousStatus: "",
@@ -297,10 +350,53 @@ router.post("/", MANAGE, async (req, res) => {
       createdBy: actor(req),
     };
     const r = await db.collection(BATCHES).insertOne(doc);
+
+    // Codes we don't hold join the register now, so the whole list is
+    // visible in Stock while it's away.
+    const ghosts = lines.filter((l) => !l.deviceId);
+    let onRegister = 0;
+    if (ghosts.length) {
+      const who = actor(req);
+      const docs = ghosts.map((l) =>
+        repairingGhost(l, {
+          batchId: r.insertedId,
+          stockSource: doc.stockSource,
+          currency: doc.currency,
+          title,
+          who,
+          now,
+        }),
+      );
+      try {
+        const ins = await db.collection(DEVICES).insertMany(docs, { ordered: false });
+        onRegister = ins.insertedCount;
+      } catch (e) {
+        onRegister = (e && e.result && e.result.insertedCount) || 0;
+      }
+      // Stamp the new ids onto the lines so the batch links like any other.
+      const createdDocs = await db
+        .collection(DEVICES)
+        .find({ imei: { $in: ghosts.map((l) => l.code) } }, { projection: { imei: 1 } })
+        .toArray();
+      const idByImei = new Map(createdDocs.map((d) => [d.imei, d._id]));
+      const sets = {};
+      const filters = [];
+      ghosts.forEach((l, i) => {
+        const id = idByImei.get(l.code);
+        if (!id) return;
+        sets[`lines.$[g${i}].deviceId`] = id;
+        filters.push({ [`g${i}.code`]: l.code });
+      });
+      if (filters.length) {
+        await db.collection(BATCHES).updateOne({ _id: r.insertedId }, { $set: sets }, { arrayFilters: filters });
+      }
+    }
+
     return res.json({
       success: true,
       message: `${lines.length} device(s) added`,
       id: r.insertedId,
+      onRegister,
       inRegister: lines.filter((l) => l.deviceId).length,
     });
   } catch (e) {
@@ -335,6 +431,7 @@ router.post("/:id/lines", MANAGE, async (req, res) => {
     const skipped = [];
 
     const removeCodes = [];
+    const removedDeviceIds = [];
     for (const raw of list(body.remove)) {
       const code = normalizeCode(raw);
       const i = lines.findIndex((l) => l.code === code);
@@ -343,6 +440,9 @@ router.post("/:id/lines", MANAGE, async (req, res) => {
         skipped.push({ code, reason: "Out for repair — return it first" });
         continue;
       }
+      // A ghost this batch created for the line goes with it — it never
+      // physically existed outside this list.
+      if (lines[i].deviceId) removedDeviceIds.push(lines[i].deviceId);
       lines.splice(i, 1);
       removeCodes.push(code);
     }
@@ -472,7 +572,41 @@ router.post("/:id/lines", MANAGE, async (req, res) => {
         .collection(BATCHES)
         .updateOne({ _id: batch._id }, { $set: set }, { arrayFilters: filters });
     }
+    if (removedDeviceIds.length) {
+      await db.collection(DEVICES).deleteMany({
+        _id: { $in: removedDeviceIds },
+        repairBatchId: batch._id,
+        status: STATUS_REPAIRING,
+      });
+    }
     if (added.length) {
+      // Scanned extras that aren't in the register join it as Repairing,
+      // exactly like an uploaded row.
+      const ghosts = added.filter((a) => !a.deviceId);
+      if (ghosts.length) {
+        const who = actor(req);
+        const docs = ghosts.map((a) =>
+          repairingGhost(a, {
+            batchId: batch._id,
+            stockSource: batch.stockSource || DEFAULT_STOCK_SOURCE,
+            currency: batch.currency,
+            title: batch.title,
+            who,
+            now,
+          }),
+        );
+        try {
+          const ins = await db.collection(DEVICES).insertMany(docs, { ordered: false });
+          const createdDocs = await db
+            .collection(DEVICES)
+            .find({ imei: { $in: ghosts.map((a) => a.code) } }, { projection: { imei: 1 } })
+            .toArray();
+          const idByImei = new Map(createdDocs.map((d) => [d.imei, d._id]));
+          for (const a of added) if (!a.deviceId) a.deviceId = idByImei.get(a.code) || null;
+        } catch (e) {
+          console.error("Repair line ghost create failed:", e);
+        }
+      }
       await db.collection(BATCHES).updateOne(
         { _id: batch._id },
         {
@@ -592,6 +726,23 @@ router.post("/:id/send", MANAGE, async (req, res) => {
         } else if (d.status === STATUS_SOLD) {
           skipped.push({ code, reason: "Sold — cancel the sales order first" });
           continue;
+        } else if (d.status === STATUS_REPAIRING) {
+          // Created by this repair list — already in the pipeline. The
+          // send is just the physical hand-over, worth a history line.
+          await db.collection(DEVICES).updateOne(
+            { _id: deviceId },
+            {
+              $set: { updatedAt: now },
+              $push: {
+                history: {
+                  $each: [
+                    { at: now, by: who, action: `Sent for repair — ${batch.title} (${batch.repairerName})` },
+                  ],
+                  $slice: -100,
+                },
+              },
+            },
+          );
         } else {
           prevStatus = d.status || STATUS_IN_STOCK;
           prevLocation = d.location || "";
@@ -900,6 +1051,12 @@ router.delete("/:id", MANAGE, async (req, res) => {
       });
     }
 
+    // Register entries this list created that never came back as real
+    // stock leave with the paperwork.
+    const ghosts = await db
+      .collection(DEVICES)
+      .deleteMany({ repairBatchId: batch._id, status: STATUS_REPAIRING });
+
     let restored = 0;
     if (away.length) {
       const now = new Date();
@@ -936,6 +1093,7 @@ router.delete("/:id", MANAGE, async (req, res) => {
     await db.collection(BATCHES).deleteOne({ _id: batch._id });
     return res.json({
       success: true,
+      removedDevices: ghosts.deletedCount,
       restored,
       message: restored
         ? `Repair batch removed — ${restored} device(s) put back`

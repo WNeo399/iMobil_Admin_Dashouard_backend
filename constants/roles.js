@@ -110,7 +110,15 @@ const ROLE_PERMISSIONS = {
   // Phone Supplier — Refurbished Phones market data + the AI Agent chat.
   // Deliberately NOT ai:skills:manage, so the Agent Skills knowledge base
   // stays hidden from suppliers.
-  [ROLES.PHONE_SUPPLIER]: ["refurb:offer:view", "ai:query:use"],
+  // Suppliers also hold the Stock page — but devices.js narrows every read
+  // and write to the stock source on their user record, so the permission
+  // only ever reaches their own shelf.
+  [ROLES.PHONE_SUPPLIER]: [
+    "refurb:offer:view",
+    "ai:query:use",
+    "refurb:stock:view",
+    "refurb:stock:manage",
+  ],
   // Consignment Shop — scoped to the shop on the user record (consignShopId).
   [ROLES.CONSIGNMENT_SHOP]: [
     "consign:device:view",

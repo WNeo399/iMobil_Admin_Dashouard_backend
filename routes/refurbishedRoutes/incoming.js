@@ -28,6 +28,7 @@ const {
   normalizeStockSource,
   normalizeReceiveLocation,
   LOCATION_IMOBILE,
+  STATUS_NOT_RECEIVED,
 } = require("./stockSource");
 const {
   ORDERS,
@@ -318,9 +319,54 @@ router.post("/", MANAGE, async (req, res) => {
     };
     const r = await db.collection(BATCHES).insertOne(doc);
 
+    // Every listed unit goes onto the register immediately: status "Not
+    // Yet Received", no location until it physically lands. Codes already
+    // in the register are left alone (they're flagged on the line).
+    const toCreate = lines.filter((l) => !l.alreadyInStock);
+    let onRegister = 0;
+    if (toCreate.length) {
+      const docs = toCreate.map((l) => ({
+        imei: l.code,
+        brand: "",
+        model: l.model || "",
+        color: l.color || "",
+        storage: l.capacity || "",
+        grade: l.grade || "",
+        costPrice: l.price == null ? null : Number(l.price),
+        currency: doc.currency,
+        stockSource: doc.stockSource,
+        location: "",
+        status: STATUS_NOT_RECEIVED,
+        salesOrder: null,
+        serialNumber: "",
+        batteryHealth: l.battery,
+        batteryCycleCount: null,
+        batteryCapacity: "",
+        aNumber: "",
+        blackbeltChecked: false,
+        blackbeltReportId: "",
+        blackbeltStatus: "",
+        note: "",
+        incomingBatchId: r.insertedId,
+        history: [
+          { at: now, by: doc.createdBy, action: "created", note: `Uploaded on ${title} — not yet received` },
+        ],
+        createdAt: now,
+        updatedAt: now,
+        createdBy: doc.createdBy,
+      }));
+      try {
+        const ins = await db.collection(DEVICES).insertMany(docs, { ordered: false });
+        onRegister = ins.insertedCount;
+      } catch (e) {
+        // A race on a duplicate IMEI skips that one row, not the batch.
+        onRegister = (e && e.result && e.result.insertedCount) || 0;
+      }
+    }
+
     // Deliberately no Blackbelt sweep here — lines stay "pending" until the
     // Check Blackbelt button fires the recheck endpoint.
-    return res.json({ success: true, id: r.insertedId, accepted: lines.length, rejected });
+    return res.json({ success: true, id: r.insertedId, accepted: lines.length, onRegister, rejected });
   } catch (e) {
     console.error("Incoming create error:", e);
     return res.status(500).json({ success: false, message: "Failed to create the batch" });
@@ -458,11 +504,14 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
     );
   }
 
+  // Full docs, not just imeis: a device pre-created at upload ("Not Yet
+  // Received") is received by updating it, and its stored values are the
+  // fallback wherever the sheet and Blackbelt are silent.
   const existing = await db
     .collection(DEVICES)
-    .find({ imei: { $in: codes } }, { projection: { imei: 1 } })
+    .find({ imei: { $in: codes } })
     .toArray();
-  const already = new Set(existing.map((d) => d.imei));
+  const heldByImei = new Map(existing.map((d) => [d.imei, d]));
 
   let created = 0;
   const skipped = [];
@@ -489,7 +538,8 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       "lines.$[l].receivedBy": who,
       "lines.$[l].grade": gradeFor(l),
     };
-    if (already.has(code)) {
+    const held = heldByImei.get(code);
+    if (held && held.status !== STATUS_NOT_RECEIVED) {
       await db.collection(BATCHES).updateOne(
         { _id: batch._id },
         { $set: { ...receive, "lines.$[l].alreadyInStock": true } },
@@ -503,8 +553,8 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       {
         at: now,
         by: who,
-        action: "created",
-        note: `Received via Incoming Stocks — ${batch.title}`,
+        action: held ? `Received — ${batch.title}` : "created",
+        note: held ? "" : `Received via Incoming Stocks — ${batch.title}`,
       },
     ];
     if (sale) {
@@ -553,14 +603,58 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       createdBy: who,
     };
     try {
-      const r = await db.collection(DEVICES).insertOne(doc);
+      let deviceId;
+      if (held) {
+        // Pre-created at upload — receiving fills it in and puts it
+        // somewhere. Sheet/Blackbelt values win; the stored ones back
+        // them up. The status guard keeps a concurrent receive honest.
+        const set = {
+          model: doc.model || held.model || "",
+          color: doc.color || held.color || "",
+          storage: doc.storage || held.storage || "",
+          grade: doc.grade || held.grade || "",
+          brand: doc.brand || held.brand || "",
+          serialNumber: doc.serialNumber || held.serialNumber || "",
+          costPrice: doc.costPrice == null ? held.costPrice : doc.costPrice,
+          batteryHealth: doc.batteryHealth == null ? held.batteryHealth : doc.batteryHealth,
+          batteryCycleCount: doc.batteryCycleCount == null ? held.batteryCycleCount : doc.batteryCycleCount,
+          batteryCapacity: doc.batteryCapacity || held.batteryCapacity || "",
+          aNumber: doc.aNumber || held.aNumber || "",
+          blackbeltChecked: held.blackbeltChecked === true || doc.blackbeltChecked,
+          blackbeltReportId: doc.blackbeltReportId || held.blackbeltReportId || "",
+          blackbeltStatus: doc.blackbeltStatus || held.blackbeltStatus || "",
+          location,
+          status: doc.status,
+          salesOrder: doc.salesOrder,
+          incomingBatchId: batch._id,
+          updatedAt: now,
+        };
+        const u = await db.collection(DEVICES).findOneAndUpdate(
+          { _id: held._id, status: STATUS_NOT_RECEIVED },
+          {
+            $set: set,
+            $push: { history: { $each: history, $slice: -100 } },
+          },
+          { returnDocument: "after" },
+        );
+        const updatedDoc = u ? u.value || u : null;
+        if (!updatedDoc) {
+          skipped.push({ code, reason: "Already in stock" });
+          return;
+        }
+        deviceId = held._id;
+        devices.push(updatedDoc);
+      } else {
+        const r = await db.collection(DEVICES).insertOne(doc);
+        deviceId = r.insertedId;
+        devices.push({ ...doc, _id: r.insertedId });
+      }
       await db.collection(BATCHES).updateOne(
         { _id: batch._id },
-        { $set: { ...receive, "lines.$[l].deviceId": r.insertedId, "lines.$[l].committedAt": now } },
+        { $set: { ...receive, "lines.$[l].deviceId": deviceId, "lines.$[l].committedAt": now } },
         { arrayFilters: [{ "l.code": code }] },
       );
       created += 1;
-      devices.push({ ...doc, _id: r.insertedId });
     } catch (e) {
       skipped.push({ code, reason: (e && e.message) || "Insert failed" });
     }
@@ -795,14 +889,19 @@ router.post("/:id/recheck", MANAGE, async (req, res) => {
 });
 
 // ── DELETE /refurbished/incoming/:id ────────────────────────────────
-// Devices already added to stock are left alone — deleting the paperwork
-// shouldn't silently delete the stock.
+// Received devices are real stock and are left alone — deleting the
+// paperwork shouldn't silently delete them. The upload's never-received
+// register entries go with the batch, though: they only ever described
+// this shipment.
 router.delete("/:id", MANAGE, async (req, res) => {
   try {
     const ctx = await loadBatch(req, res);
     if (!ctx) return;
+    const gone = await ctx.db
+      .collection(DEVICES)
+      .deleteMany({ incomingBatchId: ctx.batch._id, status: STATUS_NOT_RECEIVED });
     await ctx.db.collection(BATCHES).deleteOne({ _id: ctx.batch._id });
-    return res.json({ success: true });
+    return res.json({ success: true, removedDevices: gone.deletedCount });
   } catch (e) {
     console.error("Incoming delete error:", e);
     return res.status(500).json({ success: false, message: "Failed to delete the batch" });

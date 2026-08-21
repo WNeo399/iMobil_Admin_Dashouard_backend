@@ -33,7 +33,12 @@ const LOCATION_EXYON = "Assigned To Exyon";
 const RECEIVE_LOCATIONS = [LOCATION_IMOBILE, LOCATION_EXYON];
 
 function locationForUser(user) {
-  return user && user.role === "phone-supplier" ? LOCATION_SUPPLIER : LOCATION_IMOBILE;
+  if (user && user.role === "phone-supplier") {
+    // Named after the supplier, not a generic shelf — "DICO" says where the
+    // unit physically sits in a way "Supplier Stock" never did.
+    return normalizeStockSource(user.stockSource) || LOCATION_SUPPLIER;
+  }
+  return LOCATION_IMOBILE;
 }
 
 // Device sale status. A unit away at a repairer is neither sellable nor
@@ -43,7 +48,21 @@ function locationForUser(user) {
 const STATUS_IN_STOCK = "In Stock";
 const STATUS_SOLD = "Sold";
 const STATUS_OUT_FOR_REPAIR = "Out for Repair";
-const DEVICE_STATUSES = [STATUS_IN_STOCK, STATUS_SOLD, STATUS_OUT_FOR_REPAIR];
+// A unit listed on an incoming shipment that hasn't physically landed:
+// on the register (so the paperwork exists) but nowhere (location empty)
+// and not sellable until it's received.
+const STATUS_NOT_RECEIVED = "Not Yet Received";
+// A unit that entered the register via a repair list: in the repair
+// pipeline from day one, with no location until it comes back. Distinct
+// from "Out for Repair", which is our own shelf stock sent away.
+const STATUS_REPAIRING = "Repairing";
+const DEVICE_STATUSES = [
+  STATUS_IN_STOCK,
+  STATUS_SOLD,
+  STATUS_OUT_FOR_REPAIR,
+  STATUS_NOT_RECEIVED,
+  STATUS_REPAIRING,
+];
 
 function normalizeReceiveLocation(v) {
   const s = String(v == null ? "" : v).trim().toLowerCase();
@@ -54,6 +73,8 @@ module.exports = {
   STATUS_IN_STOCK,
   STATUS_SOLD,
   STATUS_OUT_FOR_REPAIR,
+  STATUS_NOT_RECEIVED,
+  STATUS_REPAIRING,
   DEVICE_STATUSES,
   STOCK_SOURCES,
   DEFAULT_STOCK_SOURCE,

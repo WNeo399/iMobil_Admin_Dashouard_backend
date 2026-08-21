@@ -28,7 +28,7 @@ const {
   computeTotals,
   num,
 } = require("./salesOrderCore");
-const { LOCATION_IMOBILE } = require("./stockSource");
+const { LOCATION_IMOBILE, STATUS_NOT_RECEIVED, STATUS_REPAIRING } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:sale:view");
 const MANAGE = requirePermission("refurb:sale:manage");
@@ -205,6 +205,15 @@ router.post("/", MANAGE, async (req, res) => {
         message: `Already sold: ${alreadySold.map((d) => d.imei).join(", ")}`,
       });
     }
+    const notHere = devices.filter(
+      (d) => d.status === STATUS_NOT_RECEIVED || d.status === STATUS_REPAIRING,
+    );
+    if (notHere.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Not sellable yet (unreceived or being repaired): ${notHere.map((d) => d.imei).join(", ")}`,
+      });
+    }
 
     const { seq, orderNo } = await nextOrderNumber(db);
 
@@ -295,15 +304,13 @@ router.put("/:id", MANAGE, async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: "Sales order not found" });
     }
-    if (order.status !== STATUS_PENDING) {
-      return res.status(400).json({
-        success: false,
-        message:
-          order.status === STATUS_CONFIRMED
-            ? "This order is confirmed — only pending orders can be edited"
-            : "A cancelled order can't be edited",
-      });
+    if (order.status === STATUS_CANCELLED) {
+      return res.status(400).json({ success: false, message: "A cancelled order can't be edited" });
     }
+    // Editing a confirmed order reopens it: the confirmation attested to a
+    // document that no longer exists, so the order drops back to Pending
+    // and has to be confirmed again.
+    const reopening = order.status === STATUS_CONFIRMED;
 
     const customer = await db.collection(CUSTOMERS).findOne({ _id: customerId });
     if (!customer) {
@@ -318,8 +325,10 @@ router.put("/:id", MANAGE, async (req, res) => {
       return res.status(400).json({ success: false, message: "A selected device no longer exists" });
     }
 
+    const returnedLines = (order.lines || []).filter((l) => l.returned);
+    const activeLines = (order.lines || []).filter((l) => !l.returned);
     const wasOnOrder = new Set(
-      (order.lines || []).map((l) => String(l.deviceId)).filter(Boolean),
+      activeLines.map((l) => String(l.deviceId)).filter(Boolean),
     );
     const nowOnOrder = new Set(deviceIds.map(String));
 
@@ -337,9 +346,20 @@ router.put("/:id", MANAGE, async (req, res) => {
         message: `Already sold on another order: ${taken.map((d) => d.imei).join(", ")}`,
       });
     }
+    const notHere = devices.filter(
+      (d) =>
+        !wasOnOrder.has(String(d._id)) &&
+        (d.status === STATUS_NOT_RECEIVED || d.status === STATUS_REPAIRING),
+    );
+    if (notHere.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Not sellable yet (unreceived or being repaired): ${notHere.map((d) => d.imei).join(", ")}`,
+      });
+    }
 
     const now = new Date();
-    const removedIds = (order.lines || [])
+    const removedIds = activeLines
       .map((l) => l.deviceId)
       .filter((did) => did && !nowOnOrder.has(String(did)));
     const addedIds = deviceIds.filter((did) => !wasOnOrder.has(String(did)));
@@ -403,9 +423,13 @@ router.put("/:id", MANAGE, async (req, res) => {
     }
 
     const byId = new Map(devices.map((d) => [String(d._id), d]));
-    const lines = deviceIds.map((oid) =>
-      deviceLine(byId.get(String(oid)), priceById.get(String(oid))),
-    );
+    const lines = [
+      // Returned lines are the historical record of units that went back
+      // to stock — they ride through an edit untouched, outside the
+      // editable set.
+      ...returnedLines,
+      ...deviceIds.map((oid) => deviceLine(byId.get(String(oid)), priceById.get(String(oid)))),
+    ];
     const totals = computeTotals(lines, body.gstRate);
 
     // What changed, in words, for the order's own audit trail.
@@ -416,6 +440,7 @@ router.put("/:id", MANAGE, async (req, res) => {
     if (Math.round((order.total || 0) * 100) !== Math.round(totals.total * 100)) {
       bits.push(`total ${(order.total || 0).toFixed(2)} → ${totals.total.toFixed(2)}`);
     }
+    if (reopening) bits.push("reopened — needs confirming again");
 
     const result = await db.collection(ORDERS).findOneAndUpdate(
       { _id: order._id },
@@ -427,6 +452,9 @@ router.put("/:id", MANAGE, async (req, res) => {
           notes: String(body.notes || "").trim().slice(0, 1000),
           lines,
           ...totals,
+          // Editing a confirmed order reopens it — back to Pending, to be
+          // confirmed again against the new document.
+          ...(reopening ? { status: STATUS_PENDING, confirmedAt: null, confirmedBy: null } : {}),
           updatedAt: now,
           updatedBy: actor(req),
         },
@@ -446,7 +474,13 @@ router.put("/:id", MANAGE, async (req, res) => {
       { returnDocument: "after" },
     );
     const updated = result ? result.value || result : null;
-    return res.json({ success: true, message: `${order.orderNo} updated`, order: updated });
+    return res.json({
+      success: true,
+      message: reopening
+        ? `${order.orderNo} updated — it needs confirming again`
+        : `${order.orderNo} updated`,
+      order: updated,
+    });
   } catch (e) {
     console.error("Update refurb sales order error:", e);
     return res.status(500).json({ success: false, message: "Failed to update the sales order" });
@@ -619,6 +653,117 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
   } catch (e) {
     console.error("Confirm refurb sales order error:", e);
     return res.status(500).json({ success: false, message: "Failed to confirm the sales order" });
+  }
+});
+
+// ── POST /refurbished/sales-orders/:id/return-device ────────────────
+// A sold device came back. Record-only for now (no credit note): the
+// device returns to stock and the order keeps its line — the invoice was
+// issued and the paperwork must keep saying so — with the line flagged
+// returned, carrying when, who and why. The freed device is then ordinary
+// stock; reselling it needs nothing special.
+//
+// Confirmed orders only: a Pending order is editable, so removing the
+// line there already does the right thing.
+router.post("/:id/return-device", MANAGE, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const body = req.body || {};
+    if (!ObjectId.isValid(body.deviceId)) {
+      return res.status(400).json({ success: false, message: "A device is required" });
+    }
+    const reason = String(body.reason || "").trim().slice(0, 200);
+    if (!reason) {
+      return res.status(400).json({ success: false, message: "A reason is required" });
+    }
+    const note = String(body.note || "").trim().slice(0, 500);
+
+    const db = await connectToDatabase();
+    const order = await db.collection(ORDERS).findOne({ _id: new ObjectId(id) });
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Sales order not found" });
+    }
+    if (order.status !== STATUS_CONFIRMED) {
+      return res.status(400).json({
+        success: false,
+        message:
+          order.status === STATUS_PENDING
+            ? "This order is still pending — edit it and remove the device instead"
+            : "A cancelled order has nothing to return",
+      });
+    }
+    const deviceId = new ObjectId(body.deviceId);
+    const line = (order.lines || []).find((l) => String(l.deviceId) === String(deviceId));
+    if (!line) {
+      return res.status(404).json({ success: false, message: "That device isn't on this order" });
+    }
+    if (line.returned) {
+      return res.status(400).json({ success: false, message: `${line.imei} has already been returned` });
+    }
+
+    const now = new Date();
+    const who = actor(req);
+
+    // Free the device — but only if it is still sold under THIS order, so
+    // a unit that has since been legitimately resold isn't yanked back.
+    const upd = await db.collection(DEVICES).updateOne(
+      { _id: deviceId, status: "Sold", "salesOrder.id": order._id },
+      {
+        $set: { status: "In Stock", salesOrder: null, updatedAt: now },
+        $push: {
+          history: {
+            $each: [
+              {
+                at: now,
+                by: who,
+                action:
+                  `Returned from ${order.orderNo} (${order.customerName}) — ${reason}` +
+                  (note ? ` · ${note}` : ""),
+              },
+            ],
+            $slice: -100,
+          },
+        },
+      },
+    );
+    if (!upd.matchedCount) {
+      return res.status(409).json({
+        success: false,
+        message: "This device is no longer sold under this order — it may have been resold since",
+      });
+    }
+
+    const result = await db.collection(ORDERS).findOneAndUpdate(
+      { _id: order._id },
+      {
+        $set: {
+          "lines.$[l].returned": true,
+          "lines.$[l].returnedAt": now,
+          "lines.$[l].returnedBy": who,
+          "lines.$[l].returnReason": reason,
+          "lines.$[l].returnNote": note,
+        },
+        $push: {
+          history: {
+            $each: [{ at: now, by: who, action: `${line.imei} returned — ${reason}` }],
+            $slice: -100,
+          },
+        },
+      },
+      { arrayFilters: [{ "l.deviceId": deviceId }], returnDocument: "after" },
+    );
+    const updated = result ? result.value || result : null;
+    return res.json({
+      success: true,
+      message: `${line.imei} returned to stock`,
+      order: updated,
+    });
+  } catch (e) {
+    console.error("Return refurb sales order device error:", e);
+    return res.status(500).json({ success: false, message: "Failed to return the device" });
   }
 });
 
