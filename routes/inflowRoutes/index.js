@@ -980,10 +980,49 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
     }
     if (req.query.customer) match.customerName = String(req.query.customer);
 
+    // The dispatch status is derived from quantities, so filtering on it
+    // has to happen inside the pipeline — matching after pagination would
+    // punch holes in the pages. $convert guards against stringy quantities.
+    const qtySum = (field) => ({
+      $sum: {
+        $map: {
+          input: { $ifNull: ["$lineItems", []] },
+          as: "li",
+          in: { $convert: { input: `$$li.${field}`, to: "double", onError: 0, onNull: 0 } },
+        },
+      },
+    });
+    const statusStages = [
+      { $addFields: { _ordered: qtySum("quantity"), _dispatched: qtySum("dispatchedQty") } },
+      {
+        $addFields: {
+          _status: {
+            $cond: [
+              { $lte: ["$_dispatched", 0] },
+              "pending",
+              { $cond: [{ $lt: ["$_dispatched", "$_ordered"] }, "partial", "dispatched"] },
+            ],
+          },
+        },
+      },
+    ];
+    // A comma list of statuses ("pending,partial"); nothing or all three
+    // means no filter. "active" survives as an alias for the default pair.
+    const VALID = ["pending", "partial", "dispatched"];
+    const raw = String(req.query.status || "");
+    const picked =
+      raw === "active"
+        ? ["pending", "partial"]
+        : raw.split(",").map((v) => v.trim()).filter((v) => VALID.includes(v));
+    if (picked.length && picked.length < VALID.length) {
+      statusStages.push({ $match: { _status: { $in: picked } } });
+    }
+
     const [agg] = await db
       .collection(DISPATCH_UPLOADS)
       .aggregate([
         { $match: match },
+        ...statusStages,
         { $addFields: { recordType: "manual", invoiceDate: "$createdAt" } },
         { $sort: { invoiceDate: -1, _id: -1 } },
         {
