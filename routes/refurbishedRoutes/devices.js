@@ -19,7 +19,12 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const blackbelt = require("../../utils/blackbelt");
-const { stockSourceForUser, locationForUser } = require("./stockSource");
+const {
+  stockSourceForUser,
+  locationForUser,
+  RECEIVE_LOCATIONS,
+  STATUS_WITH_SUPPLIER,
+} = require("./stockSource");
 
 const VIEW = requirePermission("refurb:stock:view");
 const MANAGE = requirePermission("refurb:stock:manage");
@@ -175,9 +180,14 @@ router.get("/", VIEW, async (req, res) => {
     if (req.query.location) match.location = String(req.query.location);
     if (req.query.model) match.model = String(req.query.model);
     // Sale status. Devices recorded before the field existed are unsold, so
-    // "In Stock" also matches docs with no status at all.
-    if (req.query.status === "In Stock") match.status = { $in: ["In Stock", null] };
-    else if (req.query.status) match.status = String(req.query.status);
+    // "In Stock" also matches docs with no status at all. A comma list
+    // matches any of the named statuses (the supply picker spans our stock
+    // and the supplier's shelf).
+    if (req.query.status) {
+      const picked = String(req.query.status).split(",").map((v) => v.trim()).filter(Boolean);
+      const withLegacy = picked.includes("In Stock") ? [...picked, null] : picked;
+      match.status = withLegacy.length === 1 ? withLegacy[0] : { $in: withLegacy };
+    }
     const checked = String(req.query.blackbeltChecked || "");
     if (checked === "true") match.blackbeltChecked = true;
     else if (checked === "false") match.blackbeltChecked = { $ne: true };
@@ -561,8 +571,12 @@ router.post("/", MANAGE, async (req, res) => {
       ...buildDevice(req.body || {}),
       stockSource: stockSourceForUser(req.user),
       location: locationForUser(req.user),
-      // Sale status — flips to "Sold" when the device lands on a sales order.
-      status: "In Stock",
+      // Sale status — flips to "Sold" when the device lands on a sales
+      // order. A supplier's unit sits on THEIR shelf, not ours, so it
+      // starts With Supplier and only becomes In Stock by arriving
+      // through a supply batch.
+      status:
+        req.user && req.user.role === "phone-supplier" ? STATUS_WITH_SUPPLIER : "In Stock",
       history: [historyEntry(req.user, "created")],
       createdAt: now,
       updatedAt: now,
@@ -573,6 +587,81 @@ router.post("/", MANAGE, async (req, res) => {
   } catch (e) {
     console.error("Refurb device create error:", e);
     return res.status(500).json({ success: false, message: "Failed to add device" });
+  }
+});
+
+// ── POST /refurbished/devices/bulk-location ─────────────────────────
+// Move a set of In Stock devices to another of our shelves in one go —
+// the Stock page's Bulk Action. Only In Stock units move (a sold or away
+// device's location is part of its story); everything else is reported
+// back. Suppliers never shuffle stock between our shelves.
+router.post("/bulk-location", MANAGE, async (req, res) => {
+  try {
+    if (supplierSource(req.user) !== null) {
+      return res.status(403).json({ success: false, message: "Forbidden" });
+    }
+    const body = req.body || {};
+    const location = RECEIVE_LOCATIONS.find(
+      (l) => l.toLowerCase() === String(body.location || "").trim().toLowerCase(),
+    );
+    if (!location) {
+      return res.status(400).json({
+        success: false,
+        message: `Location must be one of: ${RECEIVE_LOCATIONS.join(", ")}`,
+      });
+    }
+    const deviceIds = [...new Set((Array.isArray(body.deviceIds) ? body.deviceIds : []).map(String))]
+      .filter((v) => ObjectId.isValid(v))
+      .slice(0, 500)
+      .map((v) => new ObjectId(v));
+    if (!deviceIds.length) {
+      return res.status(400).json({ success: false, message: "Add at least one device" });
+    }
+
+    const db = await connectToDatabase();
+    const devices = await db
+      .collection(DEVICES)
+      .find({ _id: { $in: deviceIds } }, { projection: { imei: 1, status: 1, location: 1 } })
+      .toArray();
+
+    const now = new Date();
+    const who = (req.user && req.user.username) || null;
+    let moved = 0;
+    const skipped = [];
+    for (const d of devices) {
+      if (d.status && d.status !== "In Stock") {
+        skipped.push({ imei: d.imei, reason: `${d.status} — not movable` });
+        continue;
+      }
+      if (d.location === location) {
+        skipped.push({ imei: d.imei, reason: `Already at ${location}` });
+        continue;
+      }
+      const r = await db.collection(DEVICES).updateOne(
+        // Status re-checked in the write so a concurrent sale can't race in.
+        { _id: d._id, $or: [{ status: "In Stock" }, { status: null }, { status: { $exists: false } }] },
+        {
+          $set: { location, updatedAt: now },
+          $push: {
+            history: {
+              $each: [{ at: now, by: who, action: `Moved to ${location}` }],
+              $slice: -HISTORY_CAP,
+            },
+          },
+        },
+      );
+      if (r.modifiedCount) moved += 1;
+      else skipped.push({ imei: d.imei, reason: "No longer In Stock" });
+    }
+    return res.json({
+      success: true,
+      moved,
+      skipped,
+      message: `${moved} device(s) moved to ${location}`,
+    });
+  } catch (e) {
+    console.error("Refurb bulk-location error:", e);
+    return res.status(500).json({ success: false, message: "Failed to move the devices" });
   }
 });
 
@@ -643,9 +732,19 @@ router.delete("/:id", MANAGE, async (req, res) => {
     // A sold device is referenced by its sales order — cancel that first.
     const existing = await db
       .collection(DEVICES)
-      .findOne({ _id }, { projection: { status: 1, salesOrder: 1, stockSource: 1 } });
+      .findOne({ _id }, { projection: { status: 1, salesOrder: 1, stockSource: 1, location: 1 } });
     if (!existing || outOfScope(req.user, existing)) {
       return res.status(404).json({ success: false, message: "Device not found" });
+    }
+    // A supplier may only delete what is physically still on their shelf —
+    // once a unit is on the road or received here, its record is part of
+    // our paperwork too.
+    const src = supplierSource(req.user);
+    if (src !== null && (existing.location || "") !== src) {
+      return res.status(400).json({
+        success: false,
+        message: "This device isn't at your location — only devices on your shelf can be deleted",
+      });
     }
     if (existing.status === "Sold") {
       const orderNo = (existing.salesOrder && existing.salesOrder.orderNo) || "a sales order";

@@ -31,7 +31,7 @@ const LOCATION_SUPPLIER = "Supplier Stock";
 const LOCATION_EXYON = "Assigned To Exyon";
 // A supplier shipment on the road to iMobile — set by Supply Batches, and
 // replaced by a real shelf when the warehouse receives the box.
-const LOCATION_IN_TRANSIT = "In Transit";
+const LOCATION_SENDING_IMOBILE = "Sending to iMobile";
 // What the receive dialog may choose from.
 const RECEIVE_LOCATIONS = [LOCATION_IMOBILE, LOCATION_EXYON];
 
@@ -59,12 +59,17 @@ const STATUS_NOT_RECEIVED = "Not Yet Received";
 // pipeline from day one, with no location until it comes back. Distinct
 // from "Out for Repair", which is our own shelf stock sent away.
 const STATUS_REPAIRING = "Repairing";
+// A unit a phone supplier recorded on their own shelf. "In Stock" means
+// OUR stock; a supplier's unit only becomes that by arriving through a
+// supply batch. Not sellable from here.
+const STATUS_WITH_SUPPLIER = "With Supplier";
 const DEVICE_STATUSES = [
   STATUS_IN_STOCK,
   STATUS_SOLD,
   STATUS_OUT_FOR_REPAIR,
   STATUS_NOT_RECEIVED,
   STATUS_REPAIRING,
+  STATUS_WITH_SUPPLIER,
 ];
 
 function normalizeReceiveLocation(v) {
@@ -78,6 +83,7 @@ module.exports = {
   STATUS_OUT_FOR_REPAIR,
   STATUS_NOT_RECEIVED,
   STATUS_REPAIRING,
+  STATUS_WITH_SUPPLIER,
   DEVICE_STATUSES,
   STOCK_SOURCES,
   DEFAULT_STOCK_SOURCE,
@@ -86,7 +92,7 @@ module.exports = {
   LOCATION_IMOBILE,
   LOCATION_SUPPLIER,
   LOCATION_EXYON,
-  LOCATION_IN_TRANSIT,
+  LOCATION_SENDING_IMOBILE,
   RECEIVE_LOCATIONS,
   locationForUser,
   normalizeReceiveLocation,
