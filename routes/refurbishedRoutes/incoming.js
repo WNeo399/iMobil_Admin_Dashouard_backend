@@ -266,8 +266,9 @@ router.post("/", MANAGE, async (req, res) => {
       lines.push({
         no: num(r.no),
         code,
-        // Uppercased so mixed supplier casings read uniformly.
-        model: str(r.model, 120).toUpperCase(),
+        // Colour and capacity are uppercased so mixed supplier casings
+        // read uniformly; model keeps its casing to match Blackbelt.
+        model: str(r.model, 120),
         color: str(r.color, 60).toUpperCase(),
         capacity: str(r.capacity, 40).toUpperCase(),
         battery: batteryPercent(r.battery),
@@ -453,7 +454,7 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
   for (const k of Object.keys(rawDetails)) {
     const d = rawDetails[k] || {};
     details[normalizeCode(k)] = {
-      model: str(d.model, 120).toUpperCase(),
+      model: str(d.model, 120),
       color: str(d.color, 60).toUpperCase(),
       capacity: str(d.storage || d.capacity, 40).toUpperCase(),
     };
