@@ -26,6 +26,9 @@ router.use("/repairers", require("./repairers"));
 router.use("/supply", require("./supplyBatches"));
 router.use("/repairs", require("./repairs"));
 router.use("/sales-orders", require("./salesOrders"));
+// Devices coming back from a customer — raised against the customer,
+// picked from what they currently hold.
+router.use("/sales-returns", require("./salesReturns"));
 
 const VIEW = requirePermission("refurb:offer:view");
 const TABLE = "stg_reebelo_offers";
