@@ -7,11 +7,6 @@ var locationRouter = require("./location/index");
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 
-const { categoriesQueryMap } = require("../../constants");
-const {
-  getViewData,
-  handleZohoInventoryRequest,
-} = require("../../utils/zohoRequest");
 const { requirePermission } = require("../../middleware/auth");
 
 /* GET home page. */
@@ -24,74 +19,14 @@ router.use("/salesOrder", salesOrderRouter);
 router.use("/buzztech", buzztechRouter);
 router.use("/location", locationRouter);
 
-// ── Shared helpers for /collectionStocks ────────────────────────────────────
-// Hoisted out of the request handler so both the Criteria path (via Analytics)
-// and the Selection path (via the stored productIds) converge on the same
-// inventory fetch + response shape.
-
-const STOCK_WORKSPACE_ID = "1404913000003936002";
-const STOCK_ITEMS_VIEW_ID = "1404913000003936100";
-const STOCK_ORGANIZATION_ID = "746138234";
-const STOCK_BATCH_SIZE = 100;
-
-function chunkArray(arr, size = STOCK_BATCH_SIZE) {
-  const chunks = [];
-  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
-  return chunks;
-}
-
-// Resolve a Criteria collection to its matching item IDs via Zoho Analytics.
-async function getItemIdsFromCriteria(criteria) {
-  const config = {
-    responseFormat: "json",
-    selectedColumns: ["Item ID"],
-    criteria,
-  };
-  const url = `https://analyticsapi.zoho.com/restapi/v2/workspaces/${STOCK_WORKSPACE_ID}/views/${STOCK_ITEMS_VIEW_ID}/data?CONFIG=${encodeURIComponent(JSON.stringify(config))}`;
-  const viewData = await getViewData(url);
-  if (!Array.isArray(viewData) || viewData.length === 0) return [];
-  return [...new Set(viewData.map((r) => r["Item ID"]).filter(Boolean))];
-}
-
-// Bulk-fetch inventory details for a set of item IDs and shape them into the
-// `{ id, sku, productName, location, stock }` payload Stock Monitoring expects.
-// This is the single point of truth for both Criteria and Selection collections.
-async function fetchStockShapedItems(itemIds) {
-  if (!Array.isArray(itemIds) || itemIds.length === 0) return [];
-
-  const batches = chunkArray(itemIds, STOCK_BATCH_SIZE);
-  const responses = await Promise.all(
-    batches.map((batchIds) => {
-      const url =
-        `https://www.zohoapis.com/inventory/v1/itemdetails` +
-        `?item_ids=${encodeURIComponent(batchIds.join(","))}` +
-        `&organization_id=${STOCK_ORGANIZATION_ID}`;
-      return handleZohoInventoryRequest(url);
-    }),
-  );
-  const allItems = responses.flatMap((resp) =>
-    Array.isArray(resp?.items) ? resp.items : [],
-  );
-
-  return allItems
-    .map((item) => {
-      const locationField = item.custom_fields?.find(
-        (c) => c.label === "Location",
-      );
-      return {
-        id: item.item_id,
-        sku: item.sku,
-        productName: item.name,
-        location: locationField?.value || "",
-        // actual_available_for_sale_stock already nets out committed stock —
-        // subtracting actual_committed_stock again double-counted it, so a fully
-        // committed item (e.g. on-hand 2, committed 2 → for-sale 0) showed -2.
-        // Use it as-is, matching the product detail dialog + the location endpoint.
-        stock: Number(item.actual_available_for_sale_stock || 0),
-      };
-    })
-    .sort((a, b) => a.productName.localeCompare(b.productName));
-}
+// The stock and sales reads these two endpoints are built on now live in
+// utils/zohoStock.js, so the daily snapshot job can ask the same questions
+// without going through HTTP. Both routes below are thin wrappers over it.
+const {
+  resolveCollectionItemIds,
+  fetchStockShapedItems,
+  getSalesTotals,
+} = require("../../utils/zohoStock");
 
 router.get("/collectionStocks", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
@@ -119,23 +54,7 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
       return res.status(404).json({ success: false, message: "Collection not found" });
     }
 
-    // Collections can carry BOTH a criteria expression AND manually
-    // picked products — the resolved item set is the union of the two
-    // sources, deduped. Resolution is content-driven rather than
-    // type-driven: the stored `type` field is now a display label only
-    // (Criteria / Selection / Combined, derived on save by the
-    // frontend). Legacy docs work unchanged because they only ever
-    // have one source populated.
-    const criteria = collectionData?.rules?.[0]?.criteria?.equals;
-    const criteriaIds =
-      criteria && String(criteria).trim()
-        ? await getItemIdsFromCriteria(criteria)
-        : [];
-    const selectedIds = (collectionData.products || [])
-      .map((p) => p && p.itemId)
-      .filter(Boolean);
-
-    const itemIds = [...new Set([...criteriaIds, ...selectedIds])];
+    const itemIds = await resolveCollectionItemIds(collectionData);
     if (itemIds.length === 0) {
       // Neither source produced anything (empty collection or a
       // criteria that matched nothing) — empty list rather than an
@@ -153,159 +72,11 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
 router.post("/salesTotal", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { itemIds, duration = 30 } = req.body;
-
-    if (!Array.isArray(itemIds) || itemIds.length === 0) {
-      return res.json({ result: [] });
-    }
-
-    const BATCH_SIZE = 100;
-    const workspaceId = "1404913000003936002";
-
-    const formattedDate = new Date(Date.now() - duration * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .split("T")[0];
-
-    const chunkArray = (arr, size = 100) => {
-      const chunks = [];
-
-      for (let i = 0; i < arr.length; i += size) {
-        chunks.push(arr.slice(i, i + size));
-      }
-
-      return chunks;
-    };
-
-    const buildInClause = (ids) =>
-      ids.map((id) => `'${String(id).replace(/'/g, "''")}'`).join(",");
-
-    const buildZohoUrl = (viewId, config) => {
-      const encoded = encodeURIComponent(JSON.stringify(config));
-
-      return `https://analyticsapi.zoho.com/restapi/v2/workspaces/${workspaceId}/views/${viewId}/data?CONFIG=${encoded}`;
-    };
-
-    const itemIdBatches = chunkArray(itemIds, BATCH_SIZE);
-
-    let zohoSalesData = [];
-    let offLineSalesData = [];
-
-    // fetch all batches
-    for (const batchIds of itemIdBatches) {
-      const inClause = buildInClause(batchIds);
-
-      const salesUrl = buildZohoUrl("1404913000003936103", {
-        responseFormat: "json",
-        selectedColumns: ["Product ID", "Quantity", "Created Time"],
-        criteria: `("Product ID" IN (${inClause})) AND ("Created Time" >= '${formattedDate}')`,
-      });
-
-      const offlineUrl = buildZohoUrl("1404913000003936206", {
-        responseFormat: "json",
-        selectedColumns: [
-          "Product ID",
-          "Inventory Adjustment ID",
-          "Quantity Adjusted",
-          "Created Time",
-        ],
-        criteria: `("Product ID" IN (${inClause})) AND ("Created Time" >= '${formattedDate}')`,
-      });
-
-      const [salesBatch, offlineBatch] = await Promise.all([
-        getViewData(salesUrl),
-        getViewData(offlineUrl),
-      ]);
-
-      zohoSalesData.push(...salesBatch);
-      offLineSalesData.push(...offlineBatch);
-    }
-
-    const adjustmentIds = [
-      ...new Set(
-        offLineSalesData
-          .map((item) => item["Inventory Adjustment ID"])
-          .filter(Boolean),
-      ),
-    ];
-
-    let reasonMap = {};
-
-    if (adjustmentIds.length > 0) {
-      const adjustmentBatches = chunkArray(adjustmentIds, BATCH_SIZE);
-
-      let adjustmentData = [];
-
-      for (const batchIds of adjustmentBatches) {
-        const inClause = buildInClause(batchIds);
-
-        const adjustmentUrl = buildZohoUrl("1404913000003936086", {
-          responseFormat: "json",
-          selectedColumns: ["Inventory Adjustment ID", "Reason"],
-          criteria: `"Inventory Adjustment ID" IN (${inClause})`,
-        });
-
-        const batchData = await getViewData(adjustmentUrl);
-
-        adjustmentData.push(...batchData);
-      }
-
-      reasonMap = Object.fromEntries(
-        adjustmentData.map((item) => [
-          item["Inventory Adjustment ID"],
-          item.Reason,
-        ]),
-      );
-    }
-
-    const validOfflineReasons = new Set([
-      "iMobile Repair Team",
-      "Inflow Recurring Adjustment",
-    ]);
-
-    const resultMap = {};
-
-    // zoho sales
-    for (const item of zohoSalesData) {
-      const id = item["Product ID"];
-      const qty = Number(item["Quantity"]) || 0;
-
-      if (!resultMap[id]) {
-        resultMap[id] = {
-          id,
-          zohoSales: 0,
-          offlineSales: 0,
-        };
-      }
-
-      resultMap[id].zohoSales += qty;
-    }
-
-    // offline sales
-    for (const item of offLineSalesData) {
-      const id = item["Product ID"];
-      const adjustmentId = item["Inventory Adjustment ID"];
-
-      const reason = reasonMap[adjustmentId];
-
-      if (!validOfflineReasons.has(reason)) continue;
-
-      const qty = (Number(item["Quantity Adjusted"]) || 0) * -1;
-
-      if (!resultMap[id]) {
-        resultMap[id] = {
-          id,
-          zohoSales: 0,
-          offlineSales: 0,
-        };
-      }
-
-      resultMap[id].offlineSales += qty;
-    }
-
-    res.json({
-      result: Object.values(resultMap),
-    });
+    const result = await getSalesTotals(itemIds, duration);
+    return res.json({ result });
   } catch (error) {
     next(error);
   }
 });
+
 module.exports = router;
