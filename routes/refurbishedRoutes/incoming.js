@@ -29,6 +29,7 @@ const {
   normalizeReceiveLocation,
   LOCATION_IMOBILE,
   STATUS_NOT_RECEIVED,
+  STATUS_IN_STOCK,
 } = require("./stockSource");
 const {
   ORDERS,
@@ -128,12 +129,83 @@ async function askBlackbelt(code) {
   }
 }
 
+// Push a "found" result onto the register record for that IMEI.
+//
+// The upload files every listed unit as "Not Yet Received" carrying the
+// supplier's own wording ("14-128 CH"), and until now that stood until the
+// unit was physically received. Blackbelt is the authority on what a device
+// is, so its answer goes onto the register as soon as it lands — the Stock
+// page then reads the same identity the receive dialog is showing.
+//
+// Only devices we still hold are touched. A Sold or Out-for-Repair unit has
+// its identity snapshotted onto an order or repair batch, and quietly
+// changing the register underneath those would leave the two disagreeing.
+const REGISTER_UPDATABLE = [STATUS_NOT_RECEIVED, STATUS_IN_STOCK];
+
+async function applyBlackbeltToRegister(db, code, result, by) {
+  if (!result || result.bbStatus !== "found") return 0;
+  const bb = result.bbDevice || {};
+
+  // Only what Blackbelt actually answered. Some reports come back with an
+  // empty colour; blanking the supplier's value would be a downgrade.
+  const answered = {};
+  for (const [field, value] of [
+    ["brand", bb.brand],
+    ["model", bb.model],
+    ["color", bb.color],
+    ["storage", bb.storage],
+    ["serialNumber", bb.serialNumber],
+    ["batteryCapacity", bb.batteryCapacity],
+    ["aNumber", bb.aNumber],
+  ]) {
+    if (value) answered[field] = value;
+  }
+  if (bb.batteryHealth != null) answered.batteryHealth = bb.batteryHealth;
+  if (bb.batteryCycleCount != null) answered.batteryCycleCount = bb.batteryCycleCount;
+
+  const devices = await db
+    .collection(DEVICES)
+    .find({ imei: code, status: { $in: REGISTER_UPDATABLE } })
+    .toArray();
+  if (!devices.length) return 0;
+
+  const now = new Date();
+  let updated = 0;
+  for (const d of devices) {
+    // Identity fields that genuinely move, so a re-check of an already
+    // correct device doesn't add a history line saying nothing changed.
+    const changes = Object.entries(answered).filter(([f, v]) => d[f] !== v);
+    const newlyChecked = d.blackbeltChecked !== true;
+    const reportChanged = !!result.bbReportId && d.blackbeltReportId !== result.bbReportId;
+    if (!changes.length && !newlyChecked && !reportChanged) continue;
+
+    const $set = { ...answered, blackbeltChecked: true, updatedAt: now };
+    if (result.bbReportId) $set.blackbeltReportId = result.bbReportId;
+    if (bb.reportStatus) $set.blackbeltStatus = bb.reportStatus;
+
+    const described = changes
+      .filter(([f]) => ["model", "color", "storage", "brand"].includes(f))
+      .map(([f, v]) => `${f} → ${v}`)
+      .join(", ");
+    const action = described
+      ? `Blackbelt check updated ${described}`
+      : "Blackbelt check confirmed the device details";
+
+    await db.collection(DEVICES).updateOne(
+      { _id: d._id },
+      { $set, $push: { history: { $each: [{ at: now, by, action }], $slice: -100 } } },
+    );
+    updated += 1;
+  }
+  return updated;
+}
+
 // Runs after a batch is created, outside the request. Each result is written
 // as it lands so the page can show progress, and a crash mid-sweep just
 // leaves lines "pending" for the recheck endpoint to pick up.
 const sweeping = new Set(); // batch ids with a sweep in flight
 
-async function sweepBlackbelt(batchId, codes) {
+async function sweepBlackbelt(batchId, codes, by = null) {
   const key = String(batchId);
   if (sweeping.has(key)) return;
   sweeping.add(key);
@@ -158,6 +230,14 @@ async function sweepBlackbelt(batchId, codes) {
           );
         } catch (e) {
           console.error("Incoming Blackbelt write failed:", (e && e.message) || e);
+        }
+        // The register carries the same device, so it learns the same
+        // answer. Kept separate from the batch write: failing to update a
+        // register row must not cost the batch its Blackbelt result.
+        try {
+          await applyBlackbeltToRegister(db, code, set, by);
+        } catch (e) {
+          console.error("Incoming Blackbelt register write failed:", (e && e.message) || e);
         }
       }
     };
@@ -881,7 +961,7 @@ router.post("/:id/recheck", MANAGE, async (req, res) => {
         { _id: batch._id },
         { $set: { blackbelt: { total: (batch.lines || []).length, done, running: true } } },
       );
-    sweepBlackbelt(batch._id, codes);
+    sweepBlackbelt(batch._id, codes, (req.user && req.user.username) || null);
     return res.json({ success: true, queued: codes.length });
   } catch (e) {
     console.error("Incoming recheck error:", e);
@@ -910,3 +990,49 @@ router.delete("/:id", MANAGE, async (req, res) => {
 });
 
 module.exports = router;
+
+// Mark the batch lines for these devices received.
+//
+// Selling an unreceived unit proves it arrived — you cannot ship what you
+// do not have — so the shipment paperwork is closed off rather than left
+// showing a line the warehouse will hunt for. Exported because the sales
+// order path drives it; kept here so the "received" shape is written in one
+// place and can't drift from the receive dialog's own.
+//
+// Devices carry `incomingBatchId` from the upload, so no lookup by IMEI is
+// needed. Safe to call with an empty list, and safe to call twice.
+async function receiveLinesForDevices(db, devices, who, note) {
+  const onBatches = (devices || []).filter((d) => d && d.incomingBatchId && d.imei);
+  if (!onBatches.length) return 0;
+
+  const byBatch = new Map();
+  for (const d of onBatches) {
+    const key = String(d.incomingBatchId);
+    if (!byBatch.has(key)) byBatch.set(key, { id: d.incomingBatchId, codes: [] });
+    byBatch.get(key).codes.push(d.imei);
+  }
+
+  const now = new Date();
+  let updated = 0;
+  for (const { id, codes } of byBatch.values()) {
+    const r = await db.collection(BATCHES).updateOne(
+      { _id: id },
+      {
+        $set: {
+          "lines.$[l].received": true,
+          "lines.$[l].receivedAt": now,
+          "lines.$[l].receivedBy": who || null,
+          "lines.$[l].receivedNote": note || "",
+          updatedAt: now,
+        },
+      },
+      // Only lines not already received, so a re-run can't rewrite a
+      // genuine receive date with a later one.
+      { arrayFilters: [{ "l.code": { $in: codes }, "l.received": { $ne: true } }] },
+    );
+    updated += r.modifiedCount;
+  }
+  return updated;
+}
+
+module.exports.receiveLinesForDevices = receiveLinesForDevices;

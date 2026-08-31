@@ -28,6 +28,8 @@ const {
   computeTotals,
   num,
 } = require("./salesOrderCore");
+// Selling an unreceived unit closes off its shipment line.
+const { receiveLinesForDevices } = require("./incoming");
 const {
   LOCATION_IMOBILE,
   STATUS_NOT_RECEIVED,
@@ -210,18 +212,21 @@ router.post("/", MANAGE, async (req, res) => {
         message: `Already sold: ${alreadySold.map((d) => d.imei).join(", ")}`,
       });
     }
+    // A unit still away at a repairer or sitting on the supplier's shelf is
+    // not ours to sell. An unreceived one IS — it is a shipment we have
+    // already bought, and selling it is how a lot of stock leaves: straight
+    // back out before it is ever shelved. Its batch line is closed off
+    // after the sale.
     const notHere = devices.filter(
-      (d) =>
-        d.status === STATUS_NOT_RECEIVED ||
-        d.status === STATUS_REPAIRING ||
-        d.status === STATUS_WITH_SUPPLIER,
+      (d) => d.status === STATUS_REPAIRING || d.status === STATUS_WITH_SUPPLIER,
     );
     if (notHere.length) {
       return res.status(400).json({
         success: false,
-        message: `Not sellable (unreceived, being repaired, or with the supplier): ${notHere.map((d) => d.imei).join(", ")}`,
+        message: `Not sellable (being repaired, or with the supplier): ${notHere.map((d) => d.imei).join(", ")}`,
       });
     }
+    const unreceived = devices.filter((d) => d.status === STATUS_NOT_RECEIVED);
 
     const { seq, orderNo } = await nextOrderNumber(db);
 
@@ -274,7 +279,32 @@ router.post("/", MANAGE, async (req, res) => {
       );
     }
 
-    return res.json({ success: true, message: `${order.orderNo} created`, order: { ...order, _id: r.insertedId } });
+    // Selling an unreceived unit proves the shipment arrived, so its
+    // incoming line is marked received rather than left open for the
+    // warehouse to chase. Best-effort: the order is already written, and
+    // failing to tidy the paperwork must not fail the sale.
+    let received = 0;
+    if (unreceived.length) {
+      try {
+        received = await receiveLinesForDevices(
+          db,
+          unreceived,
+          actor(req),
+          `Received by selling on ${order.orderNo}`,
+        );
+      } catch (e) {
+        console.error(`Sales order ${order.orderNo}: incoming lines not marked received:`, e && e.message);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message:
+        `${order.orderNo} created` +
+        (received ? ` — ${received} device(s) marked received on their incoming batch` : ""),
+      receivedFromIncoming: received,
+      order: { ...order, _id: r.insertedId },
+    });
   } catch (e) {
     console.error("Create refurb sales order error:", e);
     return res.status(500).json({ success: false, message: "Failed to create the sales order" });
@@ -354,19 +384,22 @@ router.put("/:id", MANAGE, async (req, res) => {
         message: `Already sold on another order: ${taken.map((d) => d.imei).join(", ")}`,
       });
     }
+    // Same rule as create: unreceived stock is sellable, away-at-a-repairer
+    // and with-the-supplier stock is not.
     const notHere = devices.filter(
       (d) =>
         !wasOnOrder.has(String(d._id)) &&
-        (d.status === STATUS_NOT_RECEIVED ||
-          d.status === STATUS_REPAIRING ||
-          d.status === STATUS_WITH_SUPPLIER),
+        (d.status === STATUS_REPAIRING || d.status === STATUS_WITH_SUPPLIER),
     );
     if (notHere.length) {
       return res.status(400).json({
         success: false,
-        message: `Not sellable (unreceived, being repaired, or with the supplier): ${notHere.map((d) => d.imei).join(", ")}`,
+        message: `Not sellable (being repaired, or with the supplier): ${notHere.map((d) => d.imei).join(", ")}`,
       });
     }
+    const unreceived = devices.filter(
+      (d) => !wasOnOrder.has(String(d._id)) && d.status === STATUS_NOT_RECEIVED,
+    );
 
     const now = new Date();
     const removedIds = activeLines
@@ -484,11 +517,31 @@ router.put("/:id", MANAGE, async (req, res) => {
       { returnDocument: "after" },
     );
     const updated = result ? result.value || result : null;
+
+    // Devices added to the order straight off a shipment close their
+    // incoming line, same as on create.
+    let received = 0;
+    if (unreceived.length) {
+      try {
+        received = await receiveLinesForDevices(
+          db,
+          unreceived,
+          actor(req),
+          `Received by selling on ${order.orderNo}`,
+        );
+      } catch (e) {
+        console.error(`Sales order ${order.orderNo}: incoming lines not marked received:`, e && e.message);
+      }
+    }
+
     return res.json({
       success: true,
-      message: reopening
-        ? `${order.orderNo} updated — it needs confirming again`
-        : `${order.orderNo} updated`,
+      message:
+        (reopening
+          ? `${order.orderNo} updated — it needs confirming again`
+          : `${order.orderNo} updated`) +
+        (received ? ` · ${received} device(s) marked received` : ""),
+      receivedFromIncoming: received,
       order: updated,
     });
   } catch (e) {
