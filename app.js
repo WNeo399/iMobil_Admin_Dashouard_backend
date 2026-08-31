@@ -43,6 +43,9 @@ var notificationRouter = require('./routes/notificationRoutes/index');
 var purchaseOrderRouter = require('./routes/purchaseOrderRoutes/index');
 // Refurbished Phones — read-only views over the external scraper MySQL DB.
 var refurbishedRouter = require('./routes/refurbishedRoutes/index');
+// Stock Monitoring — reads the daily snapshot bin/stockSnapshot.js writes,
+// so the dashboard never waits on Zoho.
+var stockMonitorRouter = require('./routes/stockMonitorRoutes/index');
 // Ask the Data — agentic Claude chat that answers questions by running
 // read-only SQL over the scraper MySQL (see utils/aiSql.js for the guardrails).
 var aiQueryRouter = require('./routes/aiQueryRoutes/index');
@@ -173,6 +176,7 @@ app.use('/svpSerial', authenticate, svpSerialRouter);
 app.use('/notifications', authenticate, notificationRouter);
 app.use('/purchaseOrder', authenticate, purchaseOrderRouter);
 app.use('/refurbished', authenticate, refurbishedRouter);
+app.use('/stock-monitor', authenticate, stockMonitorRouter);
 app.use('/aiQuery', authenticate, aiQueryRouter);
 app.use('/inflow', authenticate, inflowRouter);
 app.use('/exengine', authenticate, exengineRouter);
