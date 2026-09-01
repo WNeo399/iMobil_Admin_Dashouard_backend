@@ -275,7 +275,7 @@ router.get("/filters", VIEW, async (req, res) => {
       storages,
       colors,
       locations,
-      statuses: ["In Stock", "Sold"],
+      statuses: ["In Stock", "Sold", "On Consignment"],
     });
   } catch (e) {
     console.error("Refurb devices filters error:", e);

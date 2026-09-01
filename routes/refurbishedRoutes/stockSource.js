@@ -63,6 +63,10 @@ const STATUS_REPAIRING = "Repairing";
 // OUR stock; a supplier's unit only becomes that by arriving through a
 // supply batch. Not sellable from here.
 const STATUS_WITH_SUPPLIER = "With Supplier";
+// Ours, but sitting at a consignment partner shop for sale there. Set
+// when a consignment batch is assigned; back to In Stock when the unit
+// is marked returned, or Sold when the shop sells it.
+const STATUS_ON_CONSIGNMENT = "On Consignment";
 const DEVICE_STATUSES = [
   STATUS_IN_STOCK,
   STATUS_SOLD,
@@ -70,6 +74,7 @@ const DEVICE_STATUSES = [
   STATUS_NOT_RECEIVED,
   STATUS_REPAIRING,
   STATUS_WITH_SUPPLIER,
+  STATUS_ON_CONSIGNMENT,
 ];
 
 function normalizeReceiveLocation(v) {
@@ -84,6 +89,7 @@ module.exports = {
   STATUS_NOT_RECEIVED,
   STATUS_REPAIRING,
   STATUS_WITH_SUPPLIER,
+  STATUS_ON_CONSIGNMENT,
   DEVICE_STATUSES,
   STOCK_SOURCES,
   DEFAULT_STOCK_SOURCE,

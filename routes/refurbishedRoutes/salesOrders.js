@@ -35,6 +35,7 @@ const {
   STATUS_NOT_RECEIVED,
   STATUS_REPAIRING,
   STATUS_WITH_SUPPLIER,
+  STATUS_ON_CONSIGNMENT,
 } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:sale:view");
@@ -218,12 +219,15 @@ router.post("/", MANAGE, async (req, res) => {
     // back out before it is ever shelved. Its batch line is closed off
     // after the sale.
     const notHere = devices.filter(
-      (d) => d.status === STATUS_REPAIRING || d.status === STATUS_WITH_SUPPLIER,
+      (d) =>
+        d.status === STATUS_REPAIRING ||
+        d.status === STATUS_WITH_SUPPLIER ||
+        d.status === STATUS_ON_CONSIGNMENT,
     );
     if (notHere.length) {
       return res.status(400).json({
         success: false,
-        message: `Not sellable (being repaired, or with the supplier): ${notHere.map((d) => d.imei).join(", ")}`,
+        message: `Not sellable (being repaired, with the supplier, or on consignment): ${notHere.map((d) => d.imei).join(", ")}`,
       });
     }
     const unreceived = devices.filter((d) => d.status === STATUS_NOT_RECEIVED);
@@ -389,12 +393,14 @@ router.put("/:id", MANAGE, async (req, res) => {
     const notHere = devices.filter(
       (d) =>
         !wasOnOrder.has(String(d._id)) &&
-        (d.status === STATUS_REPAIRING || d.status === STATUS_WITH_SUPPLIER),
+        (d.status === STATUS_REPAIRING ||
+          d.status === STATUS_WITH_SUPPLIER ||
+          d.status === STATUS_ON_CONSIGNMENT),
     );
     if (notHere.length) {
       return res.status(400).json({
         success: false,
-        message: `Not sellable (being repaired, or with the supplier): ${notHere.map((d) => d.imei).join(", ")}`,
+        message: `Not sellable (being repaired, with the supplier, or on consignment): ${notHere.map((d) => d.imei).join(", ")}`,
       });
     }
     const unreceived = devices.filter(

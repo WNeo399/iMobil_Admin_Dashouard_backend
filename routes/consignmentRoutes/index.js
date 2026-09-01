@@ -1,5 +1,10 @@
 // Consignment — devices placed with partner shops on consignment.
 //
+// Devices come from the Refurbished Device stock register (refurb_devices),
+// resolved by IMEI / serial — the same pool a sales order draws from.
+// Records assigned before that change carry EX_DB stock ids instead of a
+// register reference; both shapes coexist in consignment_devices.
+//
 // Flow: admin assigns devices in batch to a shop (status "in-transit") → the
 // shop's own login marks them "received" → marks each "sold" as they sell →
 // or initiates a return ("returning") which admin closes out as "returned"
@@ -8,7 +13,9 @@
 //
 // Data:
 //   consignment_shops    { name, active, createdAt }
-//   consignment_devices  { shopId, batchId, model, imei, price, status,
+//   consignment_devices  { shopId, batchId, model, imei, costPrice,
+//                          shopPrice (what invoices bill), retailPrice,
+//                          status,
 //                          assignedAt/receivedAt/soldAt/returnAt/returnedAt,
 //                          invoiceId, statusHistory[] }
 //   consignment_invoices { number, shopId, shopName, periodStart, periodEnd,
@@ -26,7 +33,6 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { hashPassword } = require("../../utils/authToken");
 const { ROLES } = require("../../constants/roles");
-const { exQuery } = require("../../utils/exDb");
 
 const SHOPS = "consignment_shops";
 const DEVICES = "consignment_devices";
@@ -48,6 +54,16 @@ const TRANSITIONS = {
 };
 
 const { hasPermission } = require("../../constants/roles");
+const {
+  STATUS_IN_STOCK,
+  STATUS_NOT_RECEIVED,
+  STATUS_ON_CONSIGNMENT,
+  LOCATION_IMOBILE,
+} = require("../refurbishedRoutes/stockSource");
+// Consigning an unreceived unit proves its shipment arrived, same as
+// selling one does.
+const { receiveLinesForDevices } = require("../refurbishedRoutes/incoming");
+const REFURB_DEVICES = "refurb_devices";
 
 function oid(v) {
   try { return new ObjectId(String(v)); } catch (e) { return null; }
@@ -94,9 +110,9 @@ router.get("/shops", MANAGE, async function (req, res) {
       { $group: {
         _id: { shopId: "$shopId", status: "$status" },
         n: { $sum: 1 },
-        value: { $sum: { $ifNull: ["$price", 0] } },
+        value: { $sum: { $ifNull: ["$shopPrice", 0] } },
         uninvoiced: { $sum: { $cond: [{ $and: [{ $eq: ["$status", "sold"] }, { $not: ["$invoiceId"] }] }, 1, 0] } },
-        uninvoicedValue: { $sum: { $cond: [{ $and: [{ $eq: ["$status", "sold"] }, { $not: ["$invoiceId"] }] }, { $ifNull: ["$price", 0] }, 0] } },
+        uninvoicedValue: { $sum: { $cond: [{ $and: [{ $eq: ["$status", "sold"] }, { $not: ["$invoiceId"] }] }, { $ifNull: ["$shopPrice", 0] }, 0] } },
       } },
     ]).toArray();
     const byShop = {};
@@ -271,7 +287,7 @@ router.get("/devices", DEVICE_VIEW, async function (req, res) {
     const total = await col.countDocuments(match);
     // Shop logins never see our internal costs — only the Sales Price
     // (`price`). Enforced here, not just hidden in the UI.
-    const projection = scope ? { deviceCost: 0, systemPrice: 0 } : {};
+    const projection = scope ? { costPrice: 0, deviceCost: 0, systemPrice: 0 } : {};
     const rows = await col.find(match).project(projection).sort({ assignedAt: -1, _id: -1 })
       .skip((page - 1) * pageSize).limit(pageSize).toArray();
 
@@ -300,78 +316,93 @@ router.get("/devices", DEVICE_VIEW, async function (req, res) {
   }
 });
 
-// Resolve Stock IDs / IMEIs against the ExEngine stock database (admin).
-// Body: { codes: [...] } → { devices: [{stockId, imei, sku, productName, grade,
-// deviceCost, systemPrice, ...}], notFound: [], alreadyOut: [] }
+// Resolve IMEIs / serials against the Refurbished Device stock register
+// (admin). Consignment draws from the same pool a sales order does: our own
+// register, not the ExEngine database — the rule for what may go out is the
+// sales-order rule (In Stock or Not Yet Received sells; a unit that is
+// Sold, Repairing or With Supplier is not ours to place).
+// Body: { codes: [...] } → { devices: [{stockId, imei, productName, grade,
+// costPrice, ...}], notFound: [], rejected: [{code, reason}], alreadyOut: [] }
 router.post("/devices/lookup", ASSIGN, async function (req, res) {
   try {
     const codes = [
       ...new Set(
         (Array.isArray(req.body && req.body.codes) ? req.body.codes : [])
-          .map((c) => String(c || "").trim())
+          .map((c) => String(c || "").replace(/[\s-]/g, "").trim().toUpperCase())
           .filter(Boolean),
       ),
     ];
-    if (!codes.length) return res.status(400).json({ success: false, message: "No Stock IDs / IMEIs provided." });
+    if (!codes.length) return res.status(400).json({ success: false, message: "No IMEIs / serials provided." });
     if (codes.length > 500) return res.status(400).json({ success: false, message: "Too many codes (max 500)." });
 
-    // Stock IDs in EX_DB are zero-padded to 10 digits — also try the padded
-    // form of purely numeric inputs so "212353" finds "0000212353".
-    const candidates = new Set();
-    for (const c of codes) {
-      candidates.add(c);
-      if (/^\d{1,10}$/.test(c)) candidates.add(c.padStart(10, "0"));
-    }
-    const list = [...candidates];
-    const ph = list.map(() => "?").join(",");
-    const rows = await exQuery(
-      `SELECT \`Stock ID\` AS stockId, device_identifier AS imei, sku, \`Product Name\` AS productName,
-              \`Grade\` AS grade, \`Device Cost\` AS deviceCost, \`System Price\` AS systemPrice,
-              \`Stock Status\` AS stockStatus, \`Zone Location Item Status\` AS zoneStatus
-       FROM vw_full_stock_details
-       WHERE \`Stock ID\` IN (${ph}) OR device_identifier IN (${ph})`,
-      [...list, ...list],
-    );
+    const db = await connectToDatabase();
+    // The register files serials under `imei` too, but older records may
+    // carry a separate serialNumber — match either.
+    const rows = await db.collection("refurb_devices")
+      .find({ $or: [{ imei: { $in: codes } }, { serialNumber: { $in: codes } }] })
+      .toArray();
 
-    // Map each input code to its matched device (case-insensitive, padded-aware).
-    const norm = (v) => String(v == null ? "" : v).trim().toLowerCase();
+    const norm = (v) => String(v == null ? "" : v).trim().toUpperCase();
     const byKey = new Map();
     for (const r of rows) {
-      byKey.set(norm(r.stockId), r);
       if (r.imei) byKey.set(norm(r.imei), r);
+      if (r.serialNumber) byKey.set(norm(r.serialNumber), r);
     }
-    const found = new Map(); // stockId -> device
+
+    const found = new Map(); // imei -> register doc
     const notFound = [];
+    const rejected = [];
     for (const c of codes) {
-      const hit = byKey.get(norm(c)) || (/^\d{1,10}$/.test(c) ? byKey.get(norm(c.padStart(10, "0"))) : null);
-      if (hit) found.set(String(hit.stockId), hit);
-      else notFound.push(c);
+      const hit = byKey.get(c);
+      if (!hit) {
+        notFound.push(c);
+        continue;
+      }
+      const status = hit.status || "In Stock";
+      if (status === "Sold" || status === "Repairing" || status === "With Supplier" ||
+          status === "Out for Repair" || status === STATUS_ON_CONSIGNMENT) {
+        rejected.push({ code: c, reason: `${hit.imei} is ${status} — not available to assign` });
+        continue;
+      }
+      found.set(String(hit.imei), hit);
     }
 
     // Which of these are already out on consignment (not yet returned)?
-    const db = await connectToDatabase();
-    const stockIds = [...found.keys()];
-    const out = stockIds.length
+    // New records key on the IMEI; older EX_DB-era records carried their
+    // own stock ids but also stored the IMEI, so check both fields.
+    const keys = [...found.keys()];
+    const out = keys.length
       ? await db.collection(DEVICES)
-          .find({ stockId: { $in: stockIds }, status: { $nin: ["returned"] } })
-          .project({ stockId: 1 }).toArray()
+          .find({
+            $or: [{ stockId: { $in: keys } }, { imei: { $in: keys } }],
+            status: { $nin: ["returned"] },
+          })
+          .project({ stockId: 1, imei: 1 }).toArray()
       : [];
-    const alreadyOut = [...new Set(out.map((d) => d.stockId))];
+    const outKeys = new Set(out.flatMap((d) => [d.stockId, d.imei].filter(Boolean).map(norm)));
 
-    const devices = [...found.values()].map((r) => ({
-      stockId: String(r.stockId),
-      imei: r.imei != null ? String(r.imei) : "",
-      sku: r.sku != null ? String(r.sku) : "",
-      productName: r.productName != null ? String(r.productName) : "",
-      grade: String(r.grade || "").trim(),
-      deviceCost: Number.isFinite(Number(r.deviceCost)) ? Number(r.deviceCost) : null,
-      systemPrice: Number.isFinite(Number(r.systemPrice)) ? Number(r.systemPrice) : null,
-      stockStatus: r.stockStatus || "",
-      zoneStatus: r.zoneStatus || "",
-      alreadyOut: alreadyOut.includes(String(r.stockId)),
+    const devices = [...found.values()].map((d) => ({
+      // The IMEI doubles as the stock id: it is the register's key and
+      // what the batch pages display and guard on.
+      stockId: String(d.imei),
+      imei: String(d.imei),
+      refurbDeviceId: String(d._id),
+      sku: "",
+      productName: [d.model, d.storage, d.color].filter(Boolean).join(" · ") || String(d.imei),
+      grade: String(d.grade || "").trim(),
+      costPrice: Number.isFinite(Number(d.costPrice)) ? Number(d.costPrice) : null,
+      stockStatus: d.status || "In Stock",
+      zoneStatus: d.location || "",
+      alreadyOut: outKeys.has(norm(d.imei)),
     }));
 
-    return res.json({ success: true, devices, notFound, alreadyOut });
+    return res.json({
+      success: true,
+      devices,
+      notFound,
+      rejected,
+      alreadyOut: devices.filter((d) => d.alreadyOut).map((d) => d.stockId),
+    });
   } catch (e) {
     console.error("consignment lookup error:", e);
     return res.status(502).json({ success: false, message: e.message || "Stock lookup failed" });
@@ -379,9 +410,10 @@ router.post("/devices/lookup", ASSIGN, async function (req, res) {
 });
 
 // Batch assign (admin) — devices resolved via /devices/lookup:
-// [{ stockId, imei, sku, productName, grade, deviceCost, systemPrice, salesPrice }]
-// salesPrice (defaulted to systemPrice in the UI, editable) is what the shop
-// sees and what the weekly invoice bills.
+// [{ stockId, imei, refurbDeviceId, sku, productName, grade, costPrice, shopPrice }]
+// shopPrice is the shop's cost: what they see and what the weekly invoice
+// bills. retailPrice (what the shop charges the customer) starts null and
+// is theirs to set later.
 router.post("/devices/assign", ASSIGN, async function (req, res) {
   try {
     const shopId = oid(req.body && req.body.shopId);
@@ -405,32 +437,40 @@ router.post("/devices/assign", ASSIGN, async function (req, res) {
       if (!stockId) return res.status(400).json({ success: false, message: `Device ${i + 1}: stockId is required.` });
       if (!productName) return res.status(400).json({ success: false, message: `Device ${i + 1}: productName is required.` });
       const num = (v) => (v != null && String(v).trim() !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
-      const systemPrice = num(d.systemPrice);
-      const salesPrice = num(d.salesPrice);
-      if (salesPrice == null || salesPrice < 0) {
-        return res.status(400).json({ success: false, message: `Device ${i + 1} (${stockId}): a valid Sales Price is required.` });
+      const shopPrice = num(d.shopPrice);
+      if (shopPrice == null || shopPrice < 0) {
+        return res.status(400).json({ success: false, message: `Device ${i + 1} (${stockId}): a valid Shop Price is required.` });
       }
       docs.push({
         shopId, batchId,
         stockId,
         imei: String(d.imei || "").trim(),
+        // Back-reference to the stock register record the device came
+        // from, so a future status sync has something to key on.
+        refurbDeviceId: String(d.refurbDeviceId || "").trim() || null,
         sku: String(d.sku || "").trim(),
         productName,
         grade: String(d.grade || "").trim(),
-        deviceCost: num(d.deviceCost),
-        systemPrice,
-        // `price` = the Sales Price: what the shop sees and what the weekly
-        // invoice bills.
-        price: salesPrice,
+        costPrice: num(d.costPrice),
+        // The shop's cost: what they see and what the weekly invoice bills.
+        shopPrice,
+        // What the shop sells for — theirs to set from their dashboard.
+        retailPrice: null,
         status: "in-transit",
         assignedAt: now, assignedBy: by,
         invoiceId: null,
         statusHistory: [{ status: "in-transit", at: now, by }],
       });
     }
-    // Guard: any of these stock IDs still out on consignment (not returned)?
+    // Guard: any of these devices still out on consignment (not returned)?
+    // Checked by stock id AND imei, since register-sourced records key on
+    // the IMEI while EX_DB-era ones carried their own stock ids.
+    const guardKeys = [...new Set(docs.flatMap((d) => [d.stockId, d.imei].filter(Boolean)))];
     const dupes = await db.collection(DEVICES)
-      .find({ stockId: { $in: docs.map((d) => d.stockId) }, status: { $nin: ["returned"] } })
+      .find({
+        $or: [{ stockId: { $in: guardKeys } }, { imei: { $in: guardKeys } }],
+        status: { $nin: ["returned"] },
+      })
       .project({ stockId: 1 }).toArray();
     if (dupes.length) {
       return res.status(400).json({
@@ -439,13 +479,51 @@ router.post("/devices/assign", ASSIGN, async function (req, res) {
       });
     }
     await db.collection(DEVICES).insertMany(docs);
+
+    // The register follows: these units are still ours, but they are on
+    // a partner's shelf now — not sellable on a sales order, not
+    // assignable twice. Best-effort after the batch is written: a
+    // register hiccup must not lose the consignment record.
+    let registerUpdated = 0;
+    try {
+      const refurbIds = docs.map((d) => oid(d.refurbDeviceId)).filter(Boolean);
+      if (refurbIds.length) {
+        const regDevices = await db.collection(REFURB_DEVICES)
+          .find({ _id: { $in: refurbIds } }).toArray();
+        const r = await db.collection(REFURB_DEVICES).updateMany(
+          // Guarded on still being assignable, so a unit sold in the
+          // race window is reported (count mismatch) rather than moved.
+          { _id: { $in: refurbIds }, status: { $in: [STATUS_IN_STOCK, STATUS_NOT_RECEIVED, null] } },
+          {
+            $set: { status: STATUS_ON_CONSIGNMENT, location: shop.name, updatedAt: now },
+            $push: {
+              history: {
+                $each: [{ at: now, by, action: `Assigned to ${shop.name} on consignment` }],
+                $slice: -100,
+              },
+            },
+          },
+        );
+        registerUpdated = r.modifiedCount;
+        if (registerUpdated !== refurbIds.length) {
+          console.warn(`consignment assign: ${refurbIds.length - registerUpdated} register record(s) not updated (status changed underneath)`);
+        }
+        // A unit consigned straight off a shipment has evidently arrived.
+        const unreceived = regDevices.filter((d) => d.status === STATUS_NOT_RECEIVED);
+        if (unreceived.length) {
+          await receiveLinesForDevices(db, unreceived, by, `Received by consigning to ${shop.name}`);
+        }
+      }
+    } catch (e) {
+      console.error("consignment assign: register update failed:", e && e.message);
+    }
     await Promise.all([
       db.collection(DEVICES).createIndex({ shopId: 1, status: 1 }),
       db.collection(DEVICES).createIndex({ batchId: 1 }),
       db.collection(DEVICES).createIndex({ stockId: 1 }),
       db.collection(DEVICES).createIndex({ imei: 1 }),
     ]).catch(() => {});
-    return res.json({ success: true, batchId, assigned: docs.length, shopName: shop.name });
+    return res.json({ success: true, batchId, assigned: docs.length, registerUpdated, shopName: shop.name });
   } catch (e) {
     console.error("consignment assign error:", e);
     return res.status(500).json({ success: false, message: "Failed to assign devices" });
@@ -475,6 +553,39 @@ router.post("/devices/updateStatus", DEVICE_VIEW, async function (req, res) {
       $set: { status: t.to, [t.stamp]: now, updatedAt: now },
       $push: { statusHistory: { status: t.to, at: now, by } },
     });
+
+    // The register follows the two transitions that end a consignment:
+    // sold stays sold, returned comes home. Guarded on the register
+    // still saying On Consignment, so nothing else is clobbered.
+    if (r.modifiedCount && (action === "sell" || action === "markReturned")) {
+      try {
+        const moved = await db.collection(DEVICES)
+          .find({ _id: { $in: ids }, status: t.to })
+          .project({ refurbDeviceId: 1, shopId: 1 }).toArray();
+        const refurbIds = moved.map((d) => oid(d.refurbDeviceId)).filter(Boolean);
+        if (refurbIds.length) {
+          const shopDoc = await db.collection(SHOPS).findOne({ _id: moved[0].shopId });
+          const shopName = (shopDoc && shopDoc.name) || "consignment";
+          const $set =
+            action === "sell"
+              ? { status: "Sold", updatedAt: now }
+              : { status: STATUS_IN_STOCK, location: LOCATION_IMOBILE, updatedAt: now };
+          const note =
+            action === "sell"
+              ? `Sold on consignment at ${shopName}`
+              : `Returned from consignment at ${shopName}`;
+          await db.collection(REFURB_DEVICES).updateMany(
+            { _id: { $in: refurbIds }, status: STATUS_ON_CONSIGNMENT },
+            {
+              $set,
+              $push: { history: { $each: [{ at: now, by, action: note }], $slice: -100 } },
+            },
+          );
+        }
+      } catch (e) {
+        console.error("consignment updateStatus: register update failed:", e && e.message);
+      }
+    }
     return res.json({
       success: true,
       updated: r.modifiedCount,
@@ -496,18 +607,18 @@ router.get("/insights", INSIGHT, async function (req, res) {
 
     const byStatus = {};
     const statusAgg = await col.aggregate([
-      { $group: { _id: "$status", n: { $sum: 1 }, value: { $sum: { $ifNull: ["$price", 0] } } } },
+      { $group: { _id: "$status", n: { $sum: 1 }, value: { $sum: { $ifNull: ["$shopPrice", 0] } } } },
     ]).toArray();
     for (const r of statusAgg) byStatus[r._id] = { count: r.n, value: Math.round(r.value * 100) / 100 };
 
     const uninvoiced = await col.aggregate([
       { $match: { status: "sold", invoiceId: null } },
-      { $group: { _id: null, n: { $sum: 1 }, value: { $sum: { $ifNull: ["$price", 0] } } } },
+      { $group: { _id: null, n: { $sum: 1 }, value: { $sum: { $ifNull: ["$shopPrice", 0] } } } },
     ]).toArray();
 
     // Per-shop summary.
     const perShopAgg = await col.aggregate([
-      { $group: { _id: { shopId: "$shopId", status: "$status" }, n: { $sum: 1 }, value: { $sum: { $ifNull: ["$price", 0] } } } },
+      { $group: { _id: { shopId: "$shopId", status: "$status" }, n: { $sum: 1 }, value: { $sum: { $ifNull: ["$shopPrice", 0] } } } },
     ]).toArray();
     const shops = await db.collection(SHOPS).find({}).project({ name: 1, active: 1 }).toArray();
     const shopRows = shops.map((s) => {
@@ -526,7 +637,7 @@ router.get("/insights", INSIGHT, async function (req, res) {
       { $group: {
         _id: { $dateToString: { format: "%G-W%V", date: "$soldAt", timezone: "Australia/Melbourne" } },
         n: { $sum: 1 },
-        value: { $sum: { $ifNull: ["$price", 0] } },
+        value: { $sum: { $ifNull: ["$shopPrice", 0] } },
       } },
       { $sort: { _id: 1 } },
     ]).toArray();
@@ -566,7 +677,7 @@ router.post("/invoices/generate", MANAGE, async function (req, res) {
 
     const seq = (await db.collection(INVOICES).countDocuments({})) + 1;
     const number = `CI-${week.endLabel.replace(/-/g, "")}-${String(seq).padStart(4, "0")}`;
-    const total = Math.round(devices.reduce((s, d) => s + (Number(d.price) || 0), 0) * 100) / 100;
+    const total = Math.round(devices.reduce((s, d) => s + (Number(d.shopPrice) || 0), 0) * 100) / 100;
     const doc = {
       number,
       shopId,
@@ -617,7 +728,7 @@ router.get("/invoices/:id", MANAGE, async function (req, res) {
     if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
     const devices = await db.collection(DEVICES)
       .find({ _id: { $in: invoice.deviceIds || [] } })
-      .project({ stockId: 1, productName: 1, sku: 1, grade: 1, imei: 1, price: 1, soldAt: 1 })
+      .project({ stockId: 1, productName: 1, sku: 1, grade: 1, imei: 1, shopPrice: 1, soldAt: 1 })
       .toArray();
     return res.json({ success: true, invoice, devices });
   } catch (e) {
