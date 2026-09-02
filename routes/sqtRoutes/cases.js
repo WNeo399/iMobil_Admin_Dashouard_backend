@@ -323,6 +323,15 @@ router.get(
         query.shopId = new ObjectId(shopId);
       }
 
+      // Return-tracking rollup filter — drives the BER sub-nodes in the
+      // sidebar tree (Return Pending / Returned / No Return). Meaningful on
+      // terminal statuses only; other rows have no summaryStatus and simply
+      // never match.
+      const returnSummary = String(req.query.returnSummary || "");
+      if (["pending", "complete", "none"].includes(returnSummary)) {
+        query["returnTracking.summaryStatus"] = returnSummary;
+      }
+
       if (search) {
         const re = { $regex: String(search), $options: "i" };
         query.$or = [
@@ -416,7 +425,30 @@ router.get(
         }
       }
 
-      return res.json({ success: true, data: { total, byStatus: counts } });
+      // Return-tracking rollup per terminal status, for the tree's sub-nodes
+      // (e.g. BER → Return Pending / Returned / No Return). Same scope as the
+      // main counts so the numbers agree with the filtered list.
+      const rtPipeline = [];
+      if (Object.keys(match).length > 0) rtPipeline.push({ $match: match });
+      rtPipeline.push(
+        { $match: { status: { $in: TERMINAL_RETURN_STATUSES } } },
+        {
+          $group: {
+            _id: { status: "$status", summary: "$returnTracking.summaryStatus" },
+            count: { $sum: 1 },
+          },
+        },
+      );
+      const rtRows = await db.collection(COLLECTION).aggregate(rtPipeline).toArray();
+      const returnsByStatus = {};
+      for (const row of rtRows) {
+        const s = row._id && row._id.status;
+        if (!s) continue;
+        const summary = (row._id && row._id.summary) || "untracked";
+        (returnsByStatus[s] = returnsByStatus[s] || {})[summary] = row.count;
+      }
+
+      return res.json({ success: true, data: { total, byStatus: counts, returnsByStatus } });
     } catch (error) {
       console.error("Case counts error:", error);
       return res
