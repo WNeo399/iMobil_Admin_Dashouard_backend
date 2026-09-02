@@ -22,14 +22,22 @@ const {
   handleZohoInventoryPostRequest,
 } = require("../../utils/zohoRequest");
 
+const {
+  canonicalVendor,
+  parseDMY,
+  upsertNamed,
+} = require("../inflowWebhookRoutes");
+
 const VIEW_ORDERS = requirePermission("inflow:order:view");
 const VIEW_CUSTOMERS = requirePermission("inflow:customer:view");
 const PAY = requirePermission("inflow:order:payment");
+const CREATE = requirePermission("inflow:order:create");
 const PORTAL = requirePermission("inflow:portal:manage");
 const STATEMENT = requirePermission("inflow:statement:view");
 
 const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
+const VENDORS = "inflow_vendors";
 const USERS = "users";
 // Global customer-barcode → iMobile-SKU mapping list (InFlow → SKU
 // Mapping page). Each barcode is mapped ONCE; saving a mapping
@@ -50,6 +58,9 @@ const DISPATCH_UPLOADS = "inflow_dispatch_uploads";
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+function round2(v) {
+  return Math.round(num(v) * 100) / 100;
 }
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -229,6 +240,126 @@ router.get("/salesorders", VIEW_ORDERS, async (req, res) => {
   } catch (e) {
     console.error("InFlow orders list error:", e);
     return res.status(500).json({ success: false, message: "Failed to load sales orders" });
+  }
+});
+
+// ── POST /inflow/salesorders — create an order from an uploaded list ─
+// The dashboard-side twin of the ingestion webhook: the user types the
+// order number, picks the supplier + customer, and uploads the item list
+// (parsed to rows in the browser). Same document shape and side effects
+// as a webhook ingest — customer/vendor upserted, SKU mappings stamped so
+// a mapped order arrives dispatch-ready — but a duplicate order number is
+// refused instead of refreshed: this is manual entry, and silently
+// overwriting a real order would hide a typo.
+router.post("/salesorders", CREATE, async (req, res) => {
+  try {
+    const p = req.body || {};
+    const invoiceNumber = String(p.invoiceNumber || "").trim();
+    const customerName = String(p.customerName || "").trim();
+    const vendorName = canonicalVendor(p.vendor);
+    if (!invoiceNumber) {
+      return res.status(400).json({ success: false, message: "Order number is required" });
+    }
+    if (!vendorName) {
+      return res.status(400).json({ success: false, message: "Supplier is required" });
+    }
+    if (!customerName) {
+      return res.status(400).json({ success: false, message: "Customer is required" });
+    }
+
+    const lineItems = [];
+    for (const li of Array.isArray(p.lineItems) ? p.lineItems : []) {
+      if (!li) continue;
+      const sku = String(li.sku == null ? "" : li.sku).trim();
+      const description = String(li.description == null ? "" : li.description).trim();
+      const quantity = num(li.quantity);
+      const unitPrice = round2(li.unitPrice);
+      if ((!sku && !description) || quantity <= 0) continue;
+      const line = {
+        sku,
+        description,
+        quantity,
+        unitPrice,
+        subTotal: round2(li.subTotal == null || li.subTotal === "" ? quantity * unitPrice : li.subTotal),
+      };
+      // The supplier's own item number, when the file carries one — kept
+      // for reference; nothing downstream keys on it.
+      const itemNo = String(li.itemNo == null ? "" : li.itemNo).trim();
+      if (itemNo) line.itemNo = itemNo;
+      lineItems.push(line);
+    }
+    if (!lineItems.length) {
+      return res.status(400).json({ success: false, message: "No usable line items in the file" });
+    }
+
+    const db = await connectToDatabase();
+    const dup = await db
+      .collection(ORDERS)
+      .findOne({ invoiceNumber }, { projection: { _id: 1 } });
+    if (dup) {
+      return res
+        .status(409)
+        .json({ success: false, message: `Order ${invoiceNumber} already exists` });
+    }
+
+    const now = new Date();
+    const customerId = await upsertNamed(db, CUSTOMERS, customerName, now);
+    const vendorId = await upsertNamed(db, VENDORS, vendorName, now);
+
+    const barcodes = [...new Set(lineItems.map((li) => li.sku).filter(Boolean))];
+    let mapped = 0;
+    if (barcodes.length) {
+      const maps = await db
+        .collection(SKU_MAP)
+        .find({ barcode: { $in: barcodes }, sku: { $nin: ["", null] } })
+        .toArray();
+      const skuByBarcode = new Map(maps.map((m) => [m.barcode, m.sku]));
+      for (const li of lineItems) {
+        if (skuByBarcode.has(li.sku)) {
+          li.imbSku = skuByBarcode.get(li.sku);
+          mapped++;
+        }
+      }
+    }
+
+    const subtotal = round2(lineItems.reduce((s, li) => s + li.subTotal, 0));
+    const tax = round2(p.tax);
+    const totalAmount = round2(subtotal + tax);
+    const dateRaw = p.invoiceDate != null && String(p.invoiceDate).trim() ? String(p.invoiceDate).trim() : null;
+    const doc = {
+      invoiceNumber,
+      vendor: vendorName,
+      vendorId,
+      customerName,
+      customerId,
+      invoiceDate: parseDMY(dateRaw) || new Date(now.getFullYear(), now.getMonth(), now.getDate()),
+      invoiceDateRaw: dateRaw,
+      invoiceUrl: null,
+      subtotal,
+      tax,
+      totalAmount,
+      isCreditNote: totalAmount < 0,
+      lineItems,
+      paidAmount: 0,
+      payments: [],
+      source: "upload",
+      createdBy: (req.user && (req.user.username || req.user.email)) || null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const r = await db.collection(ORDERS).insertOne(doc);
+    return res.json({
+      success: true,
+      id: r.insertedId,
+      invoiceNumber,
+      lines: lineItems.length,
+      mapped,
+      subtotal,
+      totalAmount,
+    });
+  } catch (e) {
+    console.error("InFlow create order error:", e);
+    return res.status(500).json({ success: false, message: "Failed to create sales order" });
   }
 });
 

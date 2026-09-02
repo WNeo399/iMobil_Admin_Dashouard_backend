@@ -205,3 +205,9 @@ async function handleWebhook(req, res) {
 router.all("/", handleWebhook);
 
 module.exports = router;
+// Shared with the authenticated create-order endpoint (routes/inflowRoutes),
+// so an uploaded order lands with exactly the webhook's shape and side
+// effects — same vendor canonicalisation, date parsing and name upserts.
+module.exports.canonicalVendor = canonicalVendor;
+module.exports.parseDMY = parseDMY;
+module.exports.upsertNamed = upsertNamed;
