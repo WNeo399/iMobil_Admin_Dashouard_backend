@@ -2053,12 +2053,19 @@ router.post("/dispatch/manual", VIEW_ORDERS, async (req, res) => {
       customer = orderCustomer;
     }
 
+    // Oscar Mobile's faulty-item labels carry a return code of the form
+    // SS-<prefix>-<barcode>; the prefix (typically a date like 310826) is
+    // typed at upload time and stored on the record for label printing.
+    const faultyCodePrefix =
+      String((req.body && req.body.faultyCodePrefix) || "").trim() || null;
+
     const doc = {
       invoiceNumber,
       source: "upload",
       lineItems,
       ...linked,
       ...customer,
+      faultyCodePrefix,
       createdAt: now,
       createdBy: (req.user && req.user.username) || null,
       updatedAt: now,
@@ -2239,10 +2246,13 @@ router.post("/dispatch/manual/:id/customer", VIEW_ORDERS, async (req, res) => {
       .collection(CUSTOMERS)
       .findOne({ nameLower: rawName.toLowerCase() });
     if (!cust) return res.status(404).json({ success: false, message: "Customer not found" });
-    await db.collection(DISPATCH_UPLOADS).updateOne(
-      { _id },
-      { $set: { customerId: cust._id, customerName: cust.name, updatedAt: now } },
-    );
+    const set = { customerId: cust._id, customerName: cust.name, updatedAt: now };
+    // Optional faulty-code prefix (Oscar Mobile) — set alongside the
+    // customer so records linked after upload can still print return codes.
+    if (req.body && req.body.faultyCodePrefix !== undefined) {
+      set.faultyCodePrefix = String(req.body.faultyCodePrefix || "").trim() || null;
+    }
+    await db.collection(DISPATCH_UPLOADS).updateOne({ _id }, { $set: set });
     return res.json({ success: true, customerName: cust.name });
   } catch (e) {
     console.error("InFlow dispatch customer link error:", e);
