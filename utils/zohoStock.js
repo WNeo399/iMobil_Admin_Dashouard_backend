@@ -229,6 +229,13 @@ async function fetchStockShapedItems(itemIds, options = {}) {
       // -2. Use it as-is, matching the product detail dialog and the
       // location endpoint.
       stock: Number(item.actual_available_for_sale_stock || 0),
+      // Zoho splits stock into Accounting (invoice-driven, the un-prefixed
+      // fields) and Physical (shipment-driven, the actual_* fields — what
+      // `stock` above reads). The Accessories page shows both.
+      accountingStock: Number(item.available_for_sale_stock || 0),
+      // Zoho's reorder level — maintained for accessories (the Accessories
+      // page shows it as "Reorder Point"); parts don't use it.
+      reorderLevel: Number(item.reorder_level || 0),
     }))
     .sort((a, b) => a.productName.localeCompare(b.productName));
 }
@@ -241,6 +248,9 @@ async function fetchStockShapedItems(itemIds, options = {}) {
 const OFFLINE_SALE_REASONS = new Set([
   "iMobile Repair Team",
   "Inflow Recurring Adjustment",
+  // Accessories sold through the Neto storefront leave stock as
+  // adjustments with this reason — demand, same as the two above.
+  "Neto Accessories Sold",
 ]);
 
 // Past this many ids, filtering the Analytics views by Product ID costs

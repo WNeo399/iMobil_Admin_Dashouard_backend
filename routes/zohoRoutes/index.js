@@ -8,6 +8,7 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 
 const { requirePermission } = require("../../middleware/auth");
+const { handleZohoInventoryPutRequest, refreshToken } = require("../../utils/zohoRequest");
 
 /* GET home page. */
 router.get("/", function (req, res, next) {
@@ -27,6 +28,7 @@ const {
   fetchStockShapedItems,
   getSalesTotals,
 } = require("../../utils/zohoStock");
+const { getItemCategories } = require("../../utils/itemCategories");
 
 router.get("/collectionStocks", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
@@ -63,9 +65,55 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
     }
 
     const result = await fetchStockShapedItems(itemIds);
+
+    // Accessories carry a Zoho category (parts don't use them) — joined
+    // in live from the Analytics items view for the meta line + filter.
+    if (store === "accessoryCollections") {
+      const categories = await getItemCategories(itemIds);
+      for (const item of result) {
+        item.category = categories.get(String(item.id)) || "";
+      }
+    }
     return res.json(result);
   } catch (error) {
     next(error);
+  }
+});
+
+// ── PUT /zoho/items/:id/reorderLevel ────────────────────────────────
+// Inline reorder-point edit on the Accessories page: writes straight to
+// Zoho Inventory (the item's Reorder Point field), so Zoho stays the
+// single source of truth. zoho:stock:edit = admin + iMobile Admin
+// (zoho:*:*); no narrower role holds it.
+router.put("/items/:id/reorderLevel", requirePermission("zoho:stock:edit"), async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!/^\d{5,25}$/.test(id)) {
+      return res.status(400).json({ success: false, message: "Bad item id" });
+    }
+    const level = Number(req.body && req.body.reorderLevel);
+    if (!Number.isFinite(level) || level < 0 || level > 1000000) {
+      return res.status(400).json({ success: false, message: "Reorder point must be 0 or a positive number" });
+    }
+    // Pre-warm the token: a write should not burn its first attempt on
+    // discovering an expired one.
+    await refreshToken();
+    const resp = await handleZohoInventoryPutRequest(
+      `https://www.zohoapis.com/inventory/v1/items/${id}?organization_id=746138234`,
+      { reorder_level: Math.floor(level) },
+    );
+    if (!resp || resp.code !== 0) {
+      return res
+        .status(502)
+        .json({ success: false, message: (resp && resp.message) || "Zoho rejected the update" });
+    }
+    return res.json({
+      success: true,
+      reorderLevel: Number((resp.item && resp.item.reorder_level) || 0),
+    });
+  } catch (error) {
+    console.error("Reorder level update error:", error);
+    return res.status(500).json({ success: false, message: "Failed to update the reorder point" });
   }
 });
 

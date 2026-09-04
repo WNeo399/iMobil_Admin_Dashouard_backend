@@ -39,6 +39,9 @@ function isTokenExpired(data) {
     data.summary === "SECURITY_NEEDS_LOGIN" ||
     data.code === 14 ||
     data.code === 57 ||
+    // The PUT/POST helpers wrap axios errors as { success, error: <zoho
+    // body> }, so the auth codes can arrive nested.
+    data.error?.code == 14 ||
     data.error?.code == 57 ||
     data.errorCode == 8535 ||
     data.errorCode == 7309
