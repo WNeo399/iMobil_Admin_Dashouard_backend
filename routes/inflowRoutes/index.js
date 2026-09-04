@@ -27,6 +27,8 @@ const {
   parseDMY,
   upsertNamed,
 } = require("../inflowWebhookRoutes");
+// Live Blackbelt report fetch for the portal's My Devices detail.
+const blackbelt = require("../../utils/blackbelt");
 
 const VIEW_ORDERS = requirePermission("inflow:order:view");
 const VIEW_CUSTOMERS = requirePermission("inflow:customer:view");
@@ -39,6 +41,11 @@ const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
 const VENDORS = "inflow_vendors";
 const USERS = "users";
+// Refurbished Device module collections — read-only here, for the portal's
+// Devices tab (an inflow customer can be linked to a refurb customer).
+const REFURB_CUSTOMERS = "refurb_customers";
+const REFURB_SALES_ORDERS = "refurb_sales_orders";
+const REFURB_DEVICES = "refurb_devices";
 // Global customer-barcode → iMobile-SKU mapping list (InFlow → SKU
 // Mapping page). Each barcode is mapped ONCE; saving a mapping
 // retro-applies it to existing orders' line items and the webhook looks
@@ -782,11 +789,53 @@ router.get("/customers/:name/portal", PORTAL, async (req, res) => {
       success: true,
       customerName: name,
       portalEnabled: !!(cust && cust.portalEnabled),
+      // Refurbished-customer link: when set, this customer's portal logins
+      // also see their refurbished-device purchases (Devices tab).
+      refurbCustomerId: cust && cust.refurbCustomerId ? String(cust.refurbCustomerId) : null,
+      refurbCustomerName: (cust && cust.refurbCustomerName) || null,
       users,
     });
   } catch (e) {
     console.error("InFlow portal get error:", e);
     return res.status(500).json({ success: false, message: "Failed to load portal" });
+  }
+});
+
+// ── PUT /inflow/customers/:name/portal — link a Refurbished customer ─
+// One link per customer (not per login): every portal login for this
+// customer inherits it. Pass refurbCustomerId to link, null/"" to unlink.
+router.put("/customers/:name/portal", PORTAL, async (req, res) => {
+  try {
+    const name = String(req.params.name || "").trim();
+    if (!name) return res.status(400).json({ success: false, message: "Customer required" });
+    const db = await connectToDatabase();
+    const cust = await db.collection(CUSTOMERS).findOne({ nameLower: name.toLowerCase() });
+    if (!cust) return res.status(404).json({ success: false, message: "Customer not found" });
+
+    const raw = req.body && req.body.refurbCustomerId;
+    const now = new Date();
+    if (!raw) {
+      await db.collection(CUSTOMERS).updateOne(
+        { _id: cust._id },
+        { $set: { refurbCustomerId: null, refurbCustomerName: null, updatedAt: now } },
+      );
+      return res.json({ success: true, refurbCustomerId: null, refurbCustomerName: null });
+    }
+    if (!ObjectId.isValid(raw)) {
+      return res.status(400).json({ success: false, message: "Bad refurb customer id" });
+    }
+    const rc = await db
+      .collection(REFURB_CUSTOMERS)
+      .findOne({ _id: new ObjectId(raw) }, { projection: { name: 1 } });
+    if (!rc) return res.status(404).json({ success: false, message: "Refurbished customer not found" });
+    await db.collection(CUSTOMERS).updateOne(
+      { _id: cust._id },
+      { $set: { refurbCustomerId: rc._id, refurbCustomerName: rc.name, updatedAt: now } },
+    );
+    return res.json({ success: true, refurbCustomerId: String(rc._id), refurbCustomerName: rc.name });
+  } catch (e) {
+    console.error("InFlow portal refurb link error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the link" });
   }
 });
 
@@ -923,6 +972,175 @@ router.get("/statement", STATEMENT, async (req, res) => {
   } catch (e) {
     console.error("InFlow statement error:", e);
     return res.status(500).json({ success: false, message: "Failed to load statement" });
+  }
+});
+
+// ── GET /inflow/statement/devices ───────────────────────────────────
+// The portal's Devices tab: the linked Refurbished customer's sales
+// orders, devices, prices and totals. Pending orders are internal
+// drafts and stay hidden; Confirmed and Cancelled show with a status.
+router.get("/statement/devices", STATEMENT, async (req, res) => {
+  try {
+    const custId = req.user && req.user.inflowCustomerId;
+    if (!custId) return res.json({ success: true, linked: false, orders: [] });
+    const db = await connectToDatabase();
+    const cust = await db
+      .collection(CUSTOMERS)
+      .findOne(
+        { _id: custId instanceof ObjectId ? custId : new ObjectId(custId) },
+        { projection: { refurbCustomerId: 1, refurbCustomerName: 1 } },
+      );
+    const rcId = cust && cust.refurbCustomerId;
+    if (!rcId) return res.json({ success: true, linked: false, orders: [] });
+
+    const raw = await db
+      .collection(REFURB_SALES_ORDERS)
+      // customerId robustness: match the ObjectId and its string form.
+      .find({
+        customerId: { $in: [rcId, String(rcId)] },
+        status: { $ne: "Pending" },
+      })
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .toArray();
+
+    // Blackbelt state lives on the stock register — join it in by the
+    // line's deviceId so the portal can show each device's test result.
+    const deviceIds = [
+      ...new Set(
+        raw.flatMap((o) => (Array.isArray(o.lines) ? o.lines : []))
+          .map((l) => l && l.deviceId)
+          .filter((id) => id && ObjectId.isValid(id)),
+      ),
+    ].map((id) => new ObjectId(id));
+    const regDocs = deviceIds.length
+      ? await db
+          .collection(REFURB_DEVICES)
+          .find(
+            { _id: { $in: deviceIds } },
+            {
+              projection: {
+                blackbeltChecked: 1,
+                blackbeltStatus: 1,
+                blackbeltReportId: 1,
+                batteryCycleCount: 1,
+                batteryCapacity: 1,
+                aNumber: 1,
+              },
+            },
+          )
+          .toArray()
+      : [];
+    const regById = new Map(regDocs.map((d) => [String(d._id), d]));
+
+    const orders = raw.map((o) => ({
+      id: String(o._id),
+      orderNo: o.orderNo || "",
+      date: o.confirmedAt || o.createdAt || null,
+      status: o.status || "",
+      currency: o.currency || "AUD",
+      subTotal: num(o.subTotal),
+      gstAmount: num(o.gstAmount),
+      total: num(o.total),
+      deviceCount: Array.isArray(o.lines) ? o.lines.length : 0,
+      lines: (Array.isArray(o.lines) ? o.lines : []).map((l) => {
+        const reg = regById.get(String(l && l.deviceId)) || {};
+        return {
+          deviceId: l && l.deviceId ? String(l.deviceId) : "",
+          imei: (l && l.imei) || "",
+          serialNumber: (l && l.serialNumber) || "",
+          brand: (l && l.brand) || "",
+          model: (l && l.model) || "",
+          color: (l && l.color) || "",
+          storage: (l && l.storage) || "",
+          grade: (l && l.grade) || "",
+          batteryHealth: l && l.batteryHealth != null ? l.batteryHealth : null,
+          price: num(l && l.price),
+          // Blackbelt result, from the register record.
+          bbChecked: reg.blackbeltChecked === true,
+          bbStatus: reg.blackbeltStatus || "",
+          bbReportId: reg.blackbeltReportId || "",
+          batteryCycleCount: reg.batteryCycleCount != null ? reg.batteryCycleCount : null,
+          batteryCapacity: reg.batteryCapacity || "",
+          aNumber: reg.aNumber || "",
+        };
+      }),
+    }));
+    const confirmed = orders.filter((o) => o.status !== "Cancelled");
+    const summary = {
+      orders: confirmed.length,
+      devices: confirmed.reduce((s, o) => s + o.deviceCount, 0),
+      total: Math.round(confirmed.reduce((s, o) => s + o.total, 0) * 100) / 100,
+    };
+    return res.json({
+      success: true,
+      linked: true,
+      refurbCustomerName: (cust && cust.refurbCustomerName) || null,
+      summary,
+      orders,
+    });
+  } catch (e) {
+    console.error("InFlow statement devices error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load devices" });
+  }
+});
+
+// ── GET /inflow/statement/devices/:deviceId/report ──────────────────
+// Full Blackbelt report for one of the caller's own devices — fetched
+// live by the report id, same as the Refurbished Stock page's Report
+// tab. Scoped hard: the device must appear on one of the linked refurb
+// customer's (non-pending) sales orders, so a portal login can never
+// pull a report for a device that wasn't sold to them.
+router.get("/statement/devices/:deviceId/report", STATEMENT, async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId;
+    if (!ObjectId.isValid(deviceId)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const custId = req.user && req.user.inflowCustomerId;
+    if (!custId) return res.status(404).json({ success: false, message: "Device not found" });
+    const db = await connectToDatabase();
+    const cust = await db
+      .collection(CUSTOMERS)
+      .findOne(
+        { _id: custId instanceof ObjectId ? custId : new ObjectId(custId) },
+        { projection: { refurbCustomerId: 1 } },
+      );
+    const rcId = cust && cust.refurbCustomerId;
+    if (!rcId) return res.status(404).json({ success: false, message: "Device not found" });
+    const owns = await db.collection(REFURB_SALES_ORDERS).findOne(
+      {
+        customerId: { $in: [rcId, String(rcId)] },
+        status: { $ne: "Pending" },
+        "lines.deviceId": { $in: [deviceId, new ObjectId(deviceId)] },
+      },
+      { projection: { _id: 1 } },
+    );
+    if (!owns) return res.status(404).json({ success: false, message: "Device not found" });
+
+    const device = await db
+      .collection(REFURB_DEVICES)
+      .findOne({ _id: new ObjectId(deviceId) }, { projection: { blackbeltReportId: 1 } });
+    if (!device || !device.blackbeltReportId) {
+      return res.json({ success: true, hasReport: false, message: "No Blackbelt report recorded for this device." });
+    }
+    const r = await blackbelt.fetchReportDetail(device.blackbeltReportId);
+    if (r.notConfigured) {
+      return res.json({ success: true, hasReport: false, message: "Blackbelt credentials aren't set on the server." });
+    }
+    if (r.error) return res.json({ success: true, hasReport: false, message: r.error });
+    if (!r.found) {
+      return res.json({ success: true, hasReport: false, message: "Blackbelt no longer returns this report." });
+    }
+    return res.json({
+      success: true,
+      hasReport: true,
+      reportId: String(device.blackbeltReportId),
+      report: r.report,
+    });
+  } catch (e) {
+    console.error("InFlow statement device report error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load the report" });
   }
 });
 
