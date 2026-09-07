@@ -128,6 +128,13 @@ router.get("/", VIEW, async (req, res) => {
     const query = {};
     const scope = supplierSource(req.user);
     if (scope !== null) query.stockSource = scope;
+    // The Stock page's bulk-add picker: only Pending drafts the caller's
+    // freshly recorded devices could actually board — batches on their own
+    // stock source (a supplier's shelf, or iMobile for staff).
+    if (req.query.pendingFor === "me") {
+      query.status = STATUS_PENDING;
+      query.stockSource = stockSourceForUser(req.user);
+    }
 
     const batches = await db
       .collection(SUPPLY)
@@ -205,11 +212,9 @@ router.get("/:id", VIEW, async (req, res) => {
 // Devices are untouched until the batch is confirmed.
 router.post("/", MANAGE, async (req, res) => {
   try {
-    // Creation is the supplier's act: they box up their own shelf. Staff
-    // watch here and receive through Incoming Stocks.
-    if (supplierSource(req.user) === null) {
-      return res.status(403).json({ success: false, message: "Supply batches are created by suppliers" });
-    }
+    // Creation is usually the supplier boxing up their own shelf, but staff
+    // may also open a batch on a supplier's behalf (the Stock page's bulk
+    // add). resolveDevices still scopes a supplier to their own devices.
     const body = req.body || {};
     const db = await connectToDatabase();
     const resolved = await resolveDevices(db, req, body.deviceIds);
@@ -300,6 +305,74 @@ router.put("/:id", MANAGE, async (req, res) => {
   } catch (e) {
     console.error("Update supply batch error:", e);
     return res.status(500).json({ success: false, message: "Failed to update the supply batch" });
+  }
+});
+
+// ── POST /refurbished/supply/:id/add ────────────────────────────────
+// Append devices to a Pending batch — the Stock page's bulk add drops
+// freshly scanned devices straight onto an open draft. Devices already
+// aboard are skipped; the rest pass the same checks as a create and
+// must match the batch's stock source.
+router.post("/:id/add", MANAGE, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const batch = await db.collection(SUPPLY).findOne({ _id: new ObjectId(req.params.id) });
+    if (!batch) return res.status(404).json({ success: false, message: "Supply batch not found" });
+    const scope = supplierSource(req.user);
+    if (scope !== null && batch.stockSource !== scope) {
+      return res.status(404).json({ success: false, message: "Supply batch not found" });
+    }
+    if (batch.status !== STATUS_PENDING) {
+      return res.status(400).json({ success: false, message: "Devices can only be added to a pending batch" });
+    }
+
+    const resolved = await resolveDevices(db, req, (req.body || {}).deviceIds);
+    if (resolved.error) {
+      return res.status(resolved.code).json({ success: false, message: resolved.error });
+    }
+    if (resolved.stockSource !== batch.stockSource) {
+      return res.status(400).json({
+        success: false,
+        message: `These devices are ${resolved.stockSource} stock — ${batch.batchNo} carries ${batch.stockSource}`,
+      });
+    }
+
+    const aboard = new Set((batch.lines || []).map((l) => String(l.deviceId)));
+    const fresh = resolved.devices.filter((d) => !aboard.has(String(d._id)));
+    if (!fresh.length) {
+      return res.json({
+        success: true,
+        message: `Already on ${batch.batchNo}`,
+        added: 0,
+        total: aboard.size,
+        batchNo: batch.batchNo,
+      });
+    }
+    if (aboard.size + fresh.length > MAX_LINES) {
+      return res.status(400).json({ success: false, message: `A batch holds at most ${MAX_LINES} devices` });
+    }
+
+    await db.collection(SUPPLY).updateOne(
+      // Status re-checked in the write so a concurrent confirm can't race in.
+      { _id: batch._id, status: STATUS_PENDING },
+      {
+        $push: { lines: { $each: snapshotLines(fresh) } },
+        $set: { updatedAt: new Date(), updatedBy: actor(req) },
+      },
+    );
+    return res.json({
+      success: true,
+      message: `${fresh.length} device(s) added to ${batch.batchNo}`,
+      added: fresh.length,
+      total: aboard.size + fresh.length,
+      batchNo: batch.batchNo,
+    });
+  } catch (e) {
+    console.error("Add to supply batch error:", e);
+    return res.status(500).json({ success: false, message: "Failed to add to the supply batch" });
   }
 });
 

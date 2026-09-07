@@ -2440,6 +2440,35 @@ router.post("/dispatch/manual/:id/link", VIEW_ORDERS, async (req, res) => {
 // used when the dispatch list arrives before the invoice exists, so the
 // customer's portal login can already follow the dispatch status. Body:
 // { customerName } to link, { customerName: null } to clear.
+// ── POST /inflow/dispatch/manual/:id/title — rename a record ────────
+// The title (invoiceNumber) is hand-typed at upload; typos happen, and
+// records created before an order existed often want the real invoice
+// number later. Display-only everywhere it appears (labels, packing
+// lists, portal), so renaming is safe — no other document keys on it.
+router.post("/dispatch/manual/:id/title", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const title = String((req.body && req.body.invoiceNumber) || "").trim();
+    if (!title) {
+      return res.status(400).json({ success: false, message: "Title is required" });
+    }
+    const db = await connectToDatabase();
+    const r = await db.collection(DISPATCH_UPLOADS).findOneAndUpdate(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { invoiceNumber: title, updatedAt: new Date() } },
+      { returnDocument: "after", projection: { invoiceNumber: 1 } },
+    );
+    const doc = r ? r.value || r : null;
+    if (!doc) return res.status(404).json({ success: false, message: "Record not found" });
+    return res.json({ success: true, invoiceNumber: doc.invoiceNumber });
+  } catch (e) {
+    console.error("InFlow dispatch rename error:", e);
+    return res.status(500).json({ success: false, message: "Failed to rename the record" });
+  }
+});
+
 router.post("/dispatch/manual/:id/customer", VIEW_ORDERS, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
