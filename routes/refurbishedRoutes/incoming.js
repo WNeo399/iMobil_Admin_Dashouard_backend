@@ -697,6 +697,10 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
           brand: doc.brand || held.brand || "",
           serialNumber: doc.serialNumber || held.serialNumber || "",
           costPrice: doc.costPrice == null ? held.costPrice : doc.costPrice,
+          // When the line carries a price (e.g. a supply batch's Price to
+          // iMobile) it replaces the holder's own cost — so its currency
+          // must come along with it.
+          currency: doc.costPrice == null ? held.currency || doc.currency : doc.currency,
           batteryHealth: doc.batteryHealth == null ? held.batteryHealth : doc.batteryHealth,
           batteryCycleCount: doc.batteryCycleCount == null ? held.batteryCycleCount : doc.batteryCycleCount,
           batteryCapacity: doc.batteryCapacity || held.batteryCapacity || "",
