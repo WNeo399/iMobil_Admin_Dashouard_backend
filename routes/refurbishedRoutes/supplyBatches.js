@@ -68,27 +68,6 @@ async function nextBatchNumber(db) {
   return { seq, batchNo: `SPL-${seq}` };
 }
 
-// The batch's Price to iMobile figures — what WE pay per unit. A device's
-// own costPrice is the supplier's private cost, never ours; this is the
-// commercial price of the shipment, and it becomes the register cost when
-// the warehouse receives the box.
-const PRICE_CURRENCIES = ["AUD", "CNY", "HKD"];
-function normalizePriceCurrency(v) {
-  const s = String(v == null ? "" : v).trim().toUpperCase();
-  return PRICE_CURRENCIES.includes(s) ? s : "AUD";
-}
-
-// { deviceId: price } off the request body.
-function parseSupplyPrices(body) {
-  const out = new Map();
-  const raw = (body && body.prices) || {};
-  for (const k of Object.keys(raw)) {
-    const n = Number(raw[k]);
-    if (isFinite(n) && n >= 0) out.set(String(k), Math.round(n * 100) / 100);
-  }
-  return out;
-}
-
 // A batch may carry the supplier's With Supplier units or our own In Stock
 // ones — anything else (sold, away, already moving) can't board.
 function sendable(d) {
@@ -129,7 +108,9 @@ async function resolveDevices(db, req, rawIds) {
   return { devices, stockSource: sources[0] };
 }
 
-function snapshotLines(devices, prices) {
+// A supplier device's costPrice IS their price to iMobile — the figure
+// they enter is what they charge us, so the batch simply snapshots it.
+function snapshotLines(devices) {
   return devices.map((d) => ({
     deviceId: d._id,
     imei: d.imei,
@@ -139,9 +120,6 @@ function snapshotLines(devices, prices) {
     grade: d.grade || "",
     costPrice: d.costPrice == null ? null : d.costPrice,
     currency: d.currency || "AUD",
-    // Price to iMobile — what we pay for this unit. costPrice above is
-    // the supplier's own cost, kept for their side of the ledger.
-    supplyPrice: prices && prices.has(String(d._id)) ? prices.get(String(d._id)) : null,
   }));
 }
 
@@ -255,8 +233,7 @@ router.post("/", MANAGE, async (req, res) => {
       notes: String(body.notes || "").trim().slice(0, 1000),
       tracking: String(body.tracking || "").trim().slice(0, 100),
       status: STATUS_PENDING,
-      lines: snapshotLines(resolved.devices, parseSupplyPrices(body)),
-      priceCurrency: normalizePriceCurrency(body.priceCurrency),
+      lines: snapshotLines(resolved.devices),
       incomingBatchId: null,
       createdAt: now,
       updatedAt: now,
@@ -314,10 +291,7 @@ router.put("/:id", MANAGE, async (req, res) => {
           stockSource: resolved.stockSource,
           notes: String(body.notes || "").trim().slice(0, 1000),
           tracking: String(body.tracking || "").trim().slice(0, 100),
-          lines: snapshotLines(resolved.devices, parseSupplyPrices(body)),
-          priceCurrency: normalizePriceCurrency(
-            body.priceCurrency !== undefined ? body.priceCurrency : batch.priceCurrency,
-          ),
+          lines: snapshotLines(resolved.devices),
           updatedAt: new Date(),
           updatedBy: actor(req),
         },
@@ -387,7 +361,7 @@ router.post("/:id/add", MANAGE, async (req, res) => {
       // Status re-checked in the write so a concurrent confirm can't race in.
       { _id: batch._id, status: STATUS_PENDING },
       {
-        $push: { lines: { $each: snapshotLines(fresh, parseSupplyPrices(req.body)) } },
+        $push: { lines: { $each: snapshotLines(fresh) } },
         $set: { updatedAt: new Date(), updatedBy: actor(req) },
       },
     );
@@ -443,29 +417,12 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
     const who = actor(req);
     const tracking = batch.tracking || "";
 
-    // Every unit must carry its Price to iMobile before the box ships —
-    // that figure (not the supplier's own cost) becomes OUR register cost
-    // when the warehouse receives it.
-    const priced = new Map(
-      (batch.lines || []).map((l) => [
-        String(l.deviceId),
-        l.supplyPrice == null ? null : Number(l.supplyPrice),
-      ]),
-    );
-    const unpriced = devices.filter((d) => priced.get(String(d._id)) == null).length;
-    if (unpriced) {
-      return res.status(400).json({
-        success: false,
-        message: `${unpriced} device(s) have no Price to iMobile — edit the batch and price every unit before confirming`,
-      });
-    }
-
     // The incoming record first, so the batch can point at it. Its lines
     // carry the devices' own details — including their Blackbelt answer,
     // so the receiving dialog starts green where it can.
     const incomingDoc = {
       title: `${batch.batchNo} — ${batch.stockSource} supply`,
-      currency: normalizePriceCurrency(batch.priceCurrency),
+      currency: devices[0].currency || "AUD",
       stockSource: batch.stockSource,
       // The tracking number rides on the note so the warehouse sees it
       // wherever the incoming record's note surfaces.
@@ -479,9 +436,9 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
         color: d.color || "",
         capacity: d.storage || "",
         battery: d.batteryHealth == null ? null : d.batteryHealth,
-        // The price the warehouse receives at — iMobile's cost, straight
-        // off the batch. Never the device's costPrice (the supplier's own).
-        price: priced.get(String(d._id)),
+        // The supplier's price IS the price to iMobile — it receives at
+        // this figure and becomes the register cost.
+        price: d.costPrice == null ? null : d.costPrice,
         grade: d.grade || "",
         bbStatus: d.blackbeltChecked ? "found" : "pending",
         bbMessage: "",
@@ -574,7 +531,6 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
           status: STATUS_SENT,
           lines: flipped.map((d) => ({
             ...snapshotLines([d])[0],
-            supplyPrice: priced.get(String(d._id)),
             // Where and how it sat before the road, for a cancel.
             previousLocation: d.location || "",
             previousStatus: d.status || STATUS_IN_STOCK,
