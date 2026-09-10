@@ -496,6 +496,11 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
           $set: {
             status: STATUS_NOT_RECEIVED,
             location: LOCATION_SENDING_IMOBILE,
+            // Link the unit to its shipment paperwork, the same field an
+            // incoming upload stamps — it's what lets a sale of the unit
+            // before the box is opened close its batch line automatically
+            // (receiveLinesForDevices matches on it).
+            incomingBatchId: inc.insertedId,
             updatedAt: now,
           },
           $push: {
@@ -609,6 +614,9 @@ router.post("/:id/cancel", MANAGE, async (req, res) => {
             location: l.previousLocation || "",
             updatedAt: now,
           },
+          // The incoming record dies with the batch — drop the link so
+          // nothing points at deleted paperwork.
+          $unset: { incomingBatchId: "" },
           $push: {
             history: {
               $each: [
