@@ -117,6 +117,48 @@ router.put("/items/:id/reorderLevel", requirePermission("zoho:stock:edit"), asyn
   }
 });
 
+// ── GET /zoho/items/:id/image ───────────────────────────────────────
+// Proxies the item's (first) product image out of Zoho Inventory, which
+// only serves it with OAuth — the browser can't load it directly. "No
+// image" is a 204, never an error, so the stock table can probe every
+// row without producing toast spam client-side. Cached a day: images
+// effectively never change.
+const axios = require("axios");
+router.get("/items/:id/image", requirePermission("zoho:stock:view"), async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!/^\d{5,25}$/.test(id)) {
+      return res.status(400).json({ success: false, message: "Bad item id" });
+    }
+    let token = await refreshToken();
+    const fetchOnce = () =>
+      axios.get(
+        `https://www.zohoapis.com/inventory/v1/items/${id}/image?organization_id=746138234`,
+        {
+          headers: { Authorization: `Zoho-oauthtoken ${token}` },
+          responseType: "arraybuffer",
+          validateStatus: null,
+        },
+      );
+    let resp = await fetchOnce();
+    if (resp.status === 401) {
+      token = await refreshToken(true);
+      if (token) resp = await fetchOnce();
+    }
+    const type = String((resp.headers && resp.headers["content-type"]) || "");
+    // Zoho answers a JSON body (item has no image / error) or the binary.
+    if (resp.status !== 200 || !resp.data || !resp.data.length || type.includes("json")) {
+      return res.status(204).end();
+    }
+    res.set("Content-Type", type || "image/jpeg");
+    res.set("Cache-Control", "private, max-age=86400");
+    return res.send(Buffer.from(resp.data));
+  } catch (error) {
+    console.error("Item image proxy error:", error.message);
+    return res.status(204).end();
+  }
+});
+
 router.post("/salesTotal", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { itemIds, duration = 30 } = req.body;
