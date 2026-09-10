@@ -94,6 +94,43 @@ router.post("/create", async function (req, res, next) {
   }
 });
 
+// ── POST /copy/:id ──────────────────────────────────────────────────
+// Duplicate a collection wholesale — every field it carries, criteria
+// and picked products included — as a new DRAFT named "<title> - Copy"
+// (then "<title> - Copy 2", … when that name is already taken).
+router.post("/copy/:id", async function (req, res, next) {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid collection ID" });
+    }
+    const db = await connectToDatabase();
+    const collection = db.collection(collectionsName);
+    const source = await collection.findOne({ _id: new ObjectId(id) });
+    if (!source) {
+      return res.status(404).json({ success: false, message: "Collection not found" });
+    }
+    let title = `${source.title} - Copy`;
+    for (let n = 2; await collection.findOne({ title }); n++) {
+      title = `${source.title} - Copy ${n}`;
+    }
+    const now = new Date();
+    const { _id, ...rest } = source;
+    // "Draft" capitalized — the status vocabulary the form dialog and the
+    // status tag colouring use.
+    const copy = { ...rest, title, status: "Draft", createdAt: now, updatedAt: now };
+    const result = await collection.insertOne(copy);
+    return res.status(201).json({
+      success: true,
+      message: `Copied to "${title}" (draft)`,
+      data: { _id: result.insertedId, ...copy },
+    });
+  } catch (error) {
+    console.error("Copy collection error:", error);
+    return res.status(500).json({ success: false, message: "Failed to copy the collection" });
+  }
+});
+
 router.put("/update/:id", async function (req, res, next) {
   try {
     const { id } = req.params;

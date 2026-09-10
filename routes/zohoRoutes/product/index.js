@@ -34,6 +34,26 @@ router.use(
   }),
 );
 
+// ── GET /zoho/product/categories ────────────────────────────────────
+// The Zoho item-category tree as a flat {id, name} list (ROOT dropped),
+// for the collection criteria builder's Category picker — Analytics
+// stores only Category IDs, so the picker shows names and saves ids.
+// Served from itemCategories' hour-long in-memory cache.
+const { categoryNames } = require("../../../utils/itemCategories");
+router.get("/categories", requirePermission("zoho:collection:view"), async function (req, res) {
+  try {
+    const names = await categoryNames();
+    const list = [...names.entries()]
+      .filter(([, name]) => name && name !== "ROOT")
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return res.json({ success: true, data: list });
+  } catch (error) {
+    console.error("Categories list error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load categories" });
+  }
+});
+
 // Resolve a SKU to its real Zoho Inventory item_id (Commerce product_id ≠
 // Inventory item_id) and pull the Wholesale-pricebook rate. Used by the SQT
 // Send Parts picker after the user selects a product from search.

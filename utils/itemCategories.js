@@ -74,4 +74,4 @@ async function getItemCategories(itemIds) {
   return out;
 }
 
-module.exports = { getItemCategories };
+module.exports = { getItemCategories, categoryNames };
