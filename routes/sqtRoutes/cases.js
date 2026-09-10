@@ -332,6 +332,14 @@ router.get(
         query["returnTracking.summaryStatus"] = returnSummary;
       }
 
+      // Unrepairable-review filter — "true" = reviewed by an admin,
+      // "false" = still awaiting review. Meaningful with the unrepairable
+      // status filter; the scheduled processor queries reviewed=true.
+      const reviewed = String(req.query.reviewed || "");
+      if (reviewed === "true" || reviewed === "false") {
+        query["unrepairableReview.reviewedAt"] = { $exists: reviewed === "true" };
+      }
+
       if (search) {
         const re = { $regex: String(search), $options: "i" };
         query.$or = [
@@ -732,6 +740,23 @@ router.post(
       };
 
       const setFields = { status, updatedAt: now };
+      // Start Repair can attach the IMEI the shop just read off the device
+      // (the dialog collects it when the case has none on file). It only
+      // fills a blank/placeholder record — a real IMEI is never overwritten
+      // by a status change.
+      if (status === "repairing" && req.body.imei != null && String(req.body.imei).trim()) {
+        const imei = String(req.body.imei).replace(/[^0-9]/g, "");
+        if (!/^[0-9]{14,17}$/.test(imei)) {
+          return res.status(400).json({
+            success: false,
+            message: "That doesn't look like a valid IMEI (14–17 digits)",
+          });
+        }
+        const existing = String((theCase.device && theCase.device.imei) || "").replace(/[^0-9]/g, "");
+        if (!/^[0-9]{14,17}$/.test(existing)) {
+          setFields["device.imei"] = imei;
+        }
+      }
       // Return tracking: entering a terminal status initialises / reconciles
       // the tracker (parts to return + device, for ber/unrepairable). Moving
       // back out of a terminal status deactivates it but keeps the record for
@@ -800,6 +825,54 @@ router.post(
     }
   },
 );
+
+// ── POST /sqt/cases/review-unrepairable/:id ─────────────────────────
+// Admin reviews (and may adjust) the reason an unrepairable case was
+// declared unrepairable. Writes `unrepairableReview` {reason, reviewedAt,
+// reviewedBy} — the flag the scheduled processor of reviewed cases will
+// query on. Re-running adjusts the reason and re-stamps who/when.
+// ADMIN ONLY by explicit role check: a permission string can't express
+// this, because TechElite Admin's sqt:*:* would match any sqt permission.
+router.post("/review-unrepairable/:id", async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "Only an admin can review unrepairable cases" });
+    }
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid case id" });
+    }
+    const reason = String((req.body && req.body.reason) || "").trim().slice(0, 1000);
+    if (!reason) {
+      return res.status(400).json({ success: false, message: "The unrepairable reason is required" });
+    }
+    const db = await connectToDatabase();
+    const collection = db.collection(COLLECTION);
+    const theCase = await collection.findOne({ _id: new ObjectId(id) });
+    if (!theCase) {
+      return res.status(404).json({ success: false, message: "Case not found" });
+    }
+    if (theCase.status !== "unrepairable") {
+      return res.status(400).json({ success: false, message: "Only unrepairable cases can be reviewed" });
+    }
+    const now = new Date();
+    const result = await collection.findOneAndUpdate(
+      { _id: theCase._id },
+      {
+        $set: {
+          unrepairableReview: { reason, reviewedAt: now, reviewedBy: actor(req) },
+          updatedAt: now,
+        },
+      },
+      { returnDocument: "after" },
+    );
+    const updated = result ? result.value || result : null;
+    return res.json({ success: true, message: "Review saved", data: updated });
+  } catch (error) {
+    console.error("Review unrepairable error:", error);
+    return res.status(500).json({ success: false, message: "Failed to save the review" });
+  }
+});
 
 router.post(
   "/:id/sendParts",
