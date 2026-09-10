@@ -703,6 +703,13 @@ router.post(
           message: "A note describing the extra parts needed is required",
         });
       }
+      // Declaring a device unrepairable must say why.
+      if (status === "unrepairable" && !(note && String(note).trim())) {
+        return res.status(400).json({
+          success: false,
+          message: "A reason why the device is unrepairable is required",
+        });
+      }
 
       const db = await connectToDatabase();
       const collection = db.collection(COLLECTION);
