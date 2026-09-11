@@ -120,7 +120,83 @@ function snapshotLines(devices) {
     grade: d.grade || "",
     costPrice: d.costPrice == null ? null : d.costPrice,
     currency: d.currency || "AUD",
+    // The supplier's own upstream supplier (Suppliers page), so the
+    // batch remembers where each unit came from.
+    supplier: d.supplier ? { id: d.supplier.id, name: d.supplier.name } : null,
   }));
+}
+
+const CURRENCIES = ["AUD", "CNY", "HKD"];
+
+// The create/edit dialog can fill gaps on the devices as the batch is
+// saved: a missing cost (with its currency) and the unit's upstream
+// supplier. Applied to the device docs BEFORE snapshotting, so the
+// batch lines and the register can't disagree.
+//   updates: [{ deviceId, costPrice, currency, supplierId }]
+// Costs only ever FILL a blank (an existing figure is never silently
+// overwritten from this path); supplier changes are phone-supplier
+// only, validated against their own scoped list ('' clears it).
+async function applyDeviceUpdates(db, req, devices, rawUpdates) {
+  const updates = Array.isArray(rawUpdates) ? rawUpdates : [];
+  if (!updates.length) return null;
+  const byId = new Map(devices.map((d) => [String(d._id), d]));
+  const isSupplierUser = req.user && req.user.role === "phone-supplier";
+  const who = actor(req);
+  const now = new Date();
+
+  for (const u of updates) {
+    const d = u && byId.get(String(u.deviceId));
+    if (!d) continue;
+    const set = {};
+    const history = [];
+
+    const cost = u.costPrice;
+    if (d.costPrice == null && cost != null && cost !== "" && Number.isFinite(Number(cost)) && Number(cost) >= 0) {
+      const currency = CURRENCIES.includes(String(u.currency || "").toUpperCase())
+        ? String(u.currency).toUpperCase()
+        : d.currency || "AUD";
+      set.costPrice = Number(cost);
+      set.currency = currency;
+      history.push(`Cost set to ${currency} ${Number(cost).toFixed(2)} while boarding a supply batch`);
+    }
+
+    if (isSupplierUser && u.supplierId !== undefined) {
+      const currentId = d.supplier ? String(d.supplier.id) : "";
+      const wantedId = u.supplierId == null ? "" : String(u.supplierId);
+      if (wantedId !== currentId) {
+        if (!wantedId) {
+          set.supplier = null;
+          history.push("Supplier cleared while boarding a supply batch");
+        } else if (ObjectId.isValid(wantedId)) {
+          const sup = await db.collection("refurb_suppliers").findOne({
+            _id: new ObjectId(wantedId),
+            stockSource: stockSourceForUser(req.user),
+          });
+          if (!sup) return `A picked supplier isn't on your suppliers list (${d.imei})`;
+          set.supplier = { id: sup._id, name: sup.name };
+          history.push(`Supplier set to ${sup.name} while boarding a supply batch`);
+        }
+      }
+    }
+
+    if (Object.keys(set).length) {
+      set.updatedAt = now;
+      await db.collection(DEVICES).updateOne(
+        { _id: d._id },
+        {
+          $set: set,
+          $push: {
+            history: {
+              $each: history.map((action) => ({ at: now, by: who, action })),
+              $slice: -100,
+            },
+          },
+        },
+      );
+      Object.assign(d, set); // the snapshot reads these in-memory docs
+    }
+  }
+  return null;
 }
 
 // ── GET /refurbished/supply ─────────────────────────────────────────
@@ -223,6 +299,8 @@ router.post("/", MANAGE, async (req, res) => {
     if (resolved.error) {
       return res.status(resolved.code).json({ success: false, message: resolved.error });
     }
+    const updErr = await applyDeviceUpdates(db, req, resolved.devices, body.deviceUpdates);
+    if (updErr) return res.status(400).json({ success: false, message: updErr });
 
     const now = new Date();
     const { seq, batchNo } = await nextBatchNumber(db);
@@ -283,6 +361,8 @@ router.put("/:id", MANAGE, async (req, res) => {
     if (resolved.error) {
       return res.status(resolved.code).json({ success: false, message: resolved.error });
     }
+    const updErr = await applyDeviceUpdates(db, req, resolved.devices, body.deviceUpdates);
+    if (updErr) return res.status(400).json({ success: false, message: updErr });
 
     const r = await db.collection(SUPPLY).findOneAndUpdate(
       { _id: batch._id },

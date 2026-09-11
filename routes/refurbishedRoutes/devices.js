@@ -191,6 +191,13 @@ router.get("/", VIEW, async (req, res) => {
     const checked = String(req.query.blackbeltChecked || "");
     if (checked === "true") match.blackbeltChecked = true;
     else if (checked === "false") match.blackbeltChecked = { $ne: true };
+    // Filter by the unit's own supplier (a phone supplier's upstream
+    // supplier, picked at creation). "none" = units with no supplier.
+    if (req.query.supplierId === "none") {
+      match["supplier.id"] = { $exists: false };
+    } else if (req.query.supplierId && ObjectId.isValid(String(req.query.supplierId))) {
+      match["supplier.id"] = new ObjectId(String(req.query.supplierId));
+    }
 
     const SORTABLE = ["imei", "model", "color", "storage", "grade", "costPrice", "stockSource", "createdAt"];
     const sortField = SORTABLE.includes(req.query.sort) ? req.query.sort : "createdAt";
