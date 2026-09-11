@@ -565,10 +565,29 @@ router.post("/", MANAGE, async (req, res) => {
     if (clash) {
       return res.status(409).json({ success: false, message: `IMEI ${imei} is already in stock` });
     }
+    // A phone supplier can record which of THEIR suppliers the unit came
+    // from — validated against their own scoped list, stored as an
+    // id + name snapshot.
+    let supplierRef = null;
+    const supplierId = req.body && req.body.supplierId;
+    if (supplierId && req.user && req.user.role === "phone-supplier") {
+      if (!ObjectId.isValid(String(supplierId))) {
+        return res.status(400).json({ success: false, message: "Bad supplier id" });
+      }
+      const sup = await db.collection("refurb_suppliers").findOne({
+        _id: new ObjectId(String(supplierId)),
+        stockSource: stockSourceForUser(req.user),
+      });
+      if (!sup) {
+        return res.status(400).json({ success: false, message: "That supplier isn't on your suppliers list" });
+      }
+      supplierRef = { id: sup._id, name: sup.name };
+    }
     const now = new Date();
     const doc = {
       imei,
       ...buildDevice(req.body || {}),
+      ...(supplierRef ? { supplier: supplierRef } : {}),
       stockSource: stockSourceForUser(req.user),
       location: locationForUser(req.user),
       // Sale status — flips to "Sold" when the device lands on a sales
