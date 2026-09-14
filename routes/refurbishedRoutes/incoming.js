@@ -473,7 +473,53 @@ router.get("/:id", MANAGE, async (req, res) => {
   try {
     const ctx = await loadBatch(req, res);
     if (!ctx) return;
-    return res.json({ success: true, batch: { ...ctx.batch, summary: summarize(ctx.batch) } });
+    const { db, batch } = ctx;
+
+    // Price the lines off the LIVE register, not the upload snapshot:
+    //   ourPrice             OUR landed cost (AUD) where one is known — the
+    //                        line's stored ourCost, or a split device's
+    //                        costPrice (its supplier figure moved aside);
+    //   supplierPriceLive    what the supplier charges, live from the device
+    //                        doc where the unit is on the register (so a cost
+    //                        corrected in transit shows), else the line price.
+    const lines = batch.lines || [];
+    const ids = lines.map((l) => l.deviceId).filter(Boolean);
+    const codes = lines.map((l) => l.code).filter(Boolean);
+    const devices =
+      ids.length || codes.length
+        ? await db
+            .collection(DEVICES)
+            .find(
+              { $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] },
+              { projection: { imei: 1, costPrice: 1, currency: 1, supplierPrice: 1, supplierCurrency: 1 } },
+            )
+            .toArray()
+        : [];
+    const byId = new Map(devices.map((d) => [String(d._id), d]));
+    const byImei = new Map(devices.map((d) => [d.imei, d]));
+    const shaped = lines.map((l) => {
+      const d = (l.deviceId && byId.get(String(l.deviceId))) || byImei.get(l.code) || null;
+      let supplierPriceLive = l.price == null ? null : Number(l.price);
+      let supplierCurrencyLive = batch.currency || "AUD";
+      if (d && d.supplierPrice != null) {
+        supplierPriceLive = d.supplierPrice;
+        supplierCurrencyLive = d.supplierCurrency || "AUD";
+      } else if (d && d.costPrice != null) {
+        // Pre-split register figure IS the supplier's price.
+        supplierPriceLive = d.costPrice;
+        supplierCurrencyLive = d.currency || supplierCurrencyLive;
+      }
+      let ourPrice = l.ourCost != null ? l.ourCost : null;
+      if (ourPrice == null && d && d.supplierPrice != null && d.costPrice != null) {
+        ourPrice = d.costPrice; // split device: its register cost is OURS (AUD)
+      }
+      return { ...l, ourPrice, supplierPriceLive, supplierCurrencyLive };
+    });
+
+    return res.json({
+      success: true,
+      batch: { ...batch, lines: shaped, summary: summarize(batch) },
+    });
   } catch (e) {
     console.error("Incoming get error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the batch" });
@@ -538,6 +584,20 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       color: str(d.color, 60).toUpperCase(),
       capacity: str(d.storage || d.capacity, 40).toUpperCase(),
     };
+  }
+
+  // "Our cost" typed in the Receive dialog, keyed by code (the dialog
+  // takes one figure per model · storage group and fans it out per
+  // device). Always AUD: this is iMobile's landed cost — the supplier's
+  // price plus shipping and the exchange rate — and it is stored apart
+  // from what the supplier charges (supplierPrice/supplierCurrency).
+  const ourCosts = {};
+  const rawCosts = (req.body && req.body.costs) || {};
+  for (const k of Object.keys(rawCosts)) {
+    const v = Number(rawCosts[k]);
+    if (Number.isFinite(v) && v >= 0 && v < 10000000) {
+      ourCosts[normalizeCode(k)] = Math.round(v * 100) / 100;
+    }
   }
 
   // Codes that aren't on the supplier's list become unlisted lines. Their
@@ -613,11 +673,20 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
     }
     // The unit was physically scanned, so it's received either way — a
     // clash with the stock register only blocks the device creation.
+    // The dialog's figure wins; a cost saved on the line earlier (Save
+    // Prices before the box arrived) backs it up.
+    const ourCost = Object.prototype.hasOwnProperty.call(ourCosts, code)
+      ? ourCosts[code]
+      : l.ourCost != null
+        ? l.ourCost
+        : null;
     const receive = {
       "lines.$[l].received": true,
       "lines.$[l].receivedAt": now,
       "lines.$[l].receivedBy": who,
       "lines.$[l].grade": gradeFor(l),
+      // The landed cost this line was received at, for the record.
+      ...(ourCost != null ? { "lines.$[l].ourCost": ourCost } : {}),
     };
     const held = heldByImei.get(code);
     if (held && held.status !== STATUS_NOT_RECEIVED) {
@@ -630,6 +699,20 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       return;
     }
     const bb = l.bbDevice || {};
+    // What the supplier charges, kept apart from OUR landed cost. For a
+    // held unit the register carries the live supplier figure; the
+    // sheet's line price backs it up. An earlier receive's stored
+    // supplierPrice is never clobbered.
+    const supplierPrice = held && held.supplierPrice != null
+      ? held.supplierPrice
+      : held && held.costPrice != null
+        ? held.costPrice
+        : l.price == null ? null : Number(l.price);
+    const supplierCurrency = held && held.supplierPrice != null
+      ? held.supplierCurrency || "AUD"
+      : held && held.costPrice != null
+        ? held.currency || batch.currency || "AUD"
+        : batch.currency || "AUD";
     const history = [
       {
         at: now,
@@ -638,6 +721,17 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
         note: held ? "" : `Received via Incoming Stocks — ${batch.title}`,
       },
     ];
+    if (ourCost != null) {
+      history.push({
+        at: now,
+        by: who,
+        action:
+          `Cost set to AUD ${ourCost.toFixed(2)} at receive` +
+          (supplierPrice != null
+            ? ` (supplier price ${supplierCurrency} ${Number(supplierPrice).toFixed(2)})`
+            : ""),
+      });
+    }
     if (sale) {
       history.push({
         at: now,
@@ -653,8 +747,12 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       color: bb.color || fix.color || l.color || "",
       storage: bb.storage || fix.capacity || l.capacity || "",
       grade: gradeFor(l),
-      costPrice: l.price == null ? null : Number(l.price),
-      currency: batch.currency || "AUD",
+      // OUR landed cost when the dialog supplied one (always AUD);
+      // otherwise the supplier's figure stands in until it's set.
+      costPrice: ourCost != null ? ourCost : l.price == null ? null : Number(l.price),
+      currency: ourCost != null ? "AUD" : batch.currency || "AUD",
+      supplierPrice,
+      supplierCurrency,
       stockSource: normalizeStockSource(batch.stockSource, DEFAULT_STOCK_SOURCE),
       location,
       // Sale status. Sold straight off the shipment when this receive is
@@ -696,11 +794,24 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
           grade: doc.grade || held.grade || "",
           brand: doc.brand || held.brand || "",
           serialNumber: doc.serialNumber || held.serialNumber || "",
-          costPrice: doc.costPrice == null ? held.costPrice : doc.costPrice,
-          // When the line carries a price (e.g. a supply batch's Price to
-          // iMobile) it replaces the holder's own cost — so its currency
-          // must come along with it.
-          currency: doc.costPrice == null ? held.currency || doc.currency : doc.currency,
+          // A cost typed in the Receive dialog is OUR landed cost and wins
+          // outright (always AUD). Otherwise the register is the live
+          // source of truth: a price corrected on the Stock page while the
+          // box was in transit must not be overwritten by the line's
+          // ship-time snapshot — the line price only fills a device that
+          // still has no cost, and its currency comes along with it.
+          costPrice: ourCost != null
+            ? ourCost
+            : held.costPrice == null
+              ? (l.price == null ? null : Number(l.price))
+              : held.costPrice,
+          currency: ourCost != null
+            ? "AUD"
+            : held.costPrice == null
+              ? batch.currency || "AUD"
+              : held.currency || batch.currency || "AUD",
+          supplierPrice,
+          supplierCurrency,
           batteryHealth: doc.batteryHealth == null ? held.batteryHealth : doc.batteryHealth,
           batteryCycleCount: doc.batteryCycleCount == null ? held.batteryCycleCount : doc.batteryCycleCount,
           batteryCapacity: doc.batteryCapacity || held.batteryCapacity || "",
@@ -872,6 +983,103 @@ router.post("/:id/sell", MANAGE, SELL, async (req, res) => {
   } catch (e) {
     console.error("Incoming sell error:", e);
     return res.status(500).json({ success: false, message: "Failed to create the sale" });
+  }
+});
+
+// ── POST /refurbished/incoming/:id/costs ────────────────────────────
+// Save OUR landed cost (AUD) per device code, independent of receiving.
+// Two workflows need it: batches already received before the landed cost
+// was known (their devices get the price NOW), and batches priced ahead
+// of the box arriving (the cost is stored on the line and the receive
+// path applies it automatically).
+//   - every named line gets lines.$.ourCost;
+//   - lines already received apply it to their device: costPrice becomes
+//     the AUD figure, and if the device still carried the supplier's
+//     price as its cost (pre-split receives), that figure moves to
+//     supplierPrice/supplierCurrency first so nothing is lost.
+// Body: { costs: { code: aud } }
+router.post("/:id/costs", MANAGE, async (req, res) => {
+  try {
+    const ctx = await loadBatch(req, res);
+    if (!ctx) return;
+    const { db, batch } = ctx;
+
+    const raw = (req.body && req.body.costs) || {};
+    const costs = new Map();
+    for (const k of Object.keys(raw)) {
+      const v = Number(raw[k]);
+      if (Number.isFinite(v) && v >= 0 && v < 10000000) {
+        costs.set(normalizeCode(k), Math.round(v * 100) / 100);
+      }
+    }
+    if (!costs.size) {
+      return res.status(400).json({ success: false, message: "No valid costs to save" });
+    }
+
+    const byCode = new Map((batch.lines || []).map((l) => [l.code, l]));
+    const now = new Date();
+    const who = (req.user && req.user.username) || null;
+    let savedLines = 0;
+    let updatedDevices = 0;
+    const skipped = [];
+
+    for (const [code, aud] of costs) {
+      const l = byCode.get(code);
+      if (!l) {
+        skipped.push({ code, reason: "Not on this batch" });
+        continue;
+      }
+      await db.collection(BATCHES).updateOne(
+        { _id: batch._id },
+        { $set: { "lines.$[l].ourCost": aud, updatedAt: now } },
+        { arrayFilters: [{ "l.code": code }] },
+      );
+      savedLines++;
+
+      if (!l.deviceId) continue; // not received yet — applied at receive
+      const device = await db.collection(DEVICES).findOne({ _id: l.deviceId });
+      if (!device) {
+        skipped.push({ code, reason: "Device no longer in the register" });
+        continue;
+      }
+      if (device.costPrice === aud && device.currency === "AUD") continue; // already right
+
+      const set = { costPrice: aud, currency: "AUD", updatedAt: now };
+      // First price update on a pre-split device: its costPrice IS the
+      // supplier's figure — keep it before overwriting.
+      if (device.supplierPrice == null && device.costPrice != null) {
+        set.supplierPrice = device.costPrice;
+        set.supplierCurrency = device.currency || batch.currency || "AUD";
+      }
+      await db.collection(DEVICES).updateOne(
+        { _id: device._id },
+        {
+          $set: set,
+          $push: {
+            history: {
+              $each: [
+                {
+                  at: now,
+                  by: who,
+                  action:
+                    `Cost set to AUD ${aud.toFixed(2)} — price update on ${batch.title}` +
+                    (set.supplierPrice != null
+                      ? ` (supplier price ${set.supplierCurrency} ${Number(set.supplierPrice).toFixed(2)} kept)`
+                      : ""),
+                },
+              ],
+              $slice: -100,
+            },
+          },
+        },
+      );
+      updatedDevices++;
+    }
+
+    return res.json({ success: true, savedLines, updatedDevices, skipped });
+  } catch (e) {
+    console.error("Incoming save costs error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the prices" });
   }
 });
 

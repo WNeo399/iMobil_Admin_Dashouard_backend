@@ -108,8 +108,19 @@ async function resolveDevices(db, req, rawIds) {
   return { devices, stockSource: sources[0] };
 }
 
-// A supplier device's costPrice IS their price to iMobile — the figure
-// they enter is what they charge us, so the batch simply snapshots it.
+// A supply batch is the SUPPLIER's charging document, so its cost is
+// always the supplier's price. Pre-receive that's the device's own
+// costPrice (the figure they enter is what they charge us); once the
+// warehouse has received the unit with a landed cost, costPrice becomes
+// OURS (AUD, shipping + FX in) and the supplier's figure lives on in
+// supplierPrice/supplierCurrency — which the batch prefers.
+function supplierFigure(d) {
+  if (d.supplierPrice != null) {
+    return { costPrice: d.supplierPrice, currency: d.supplierCurrency || "AUD" };
+  }
+  return { costPrice: d.costPrice == null ? null : d.costPrice, currency: d.currency || "AUD" };
+}
+
 function snapshotLines(devices) {
   return devices.map((d) => ({
     deviceId: d._id,
@@ -118,8 +129,7 @@ function snapshotLines(devices) {
     color: d.color || "",
     storage: d.storage || "",
     grade: d.grade || "",
-    costPrice: d.costPrice == null ? null : d.costPrice,
-    currency: d.currency || "AUD",
+    ...supplierFigure(d),
     // The supplier's own upstream supplier (Suppliers page), so the
     // batch remembers where each unit came from.
     supplier: d.supplier ? { id: d.supplier.id, name: d.supplier.name } : null,
@@ -271,10 +281,41 @@ router.get("/:id", VIEW, async (req, res) => {
     const receivedByCode = new Map(
       ((inc && inc.lines) || []).map((l) => [l.code, { received: !!l.received, receivedAt: l.receivedAt || null }]),
     );
-    const lines = (batch.lines || []).map((l) => ({
-      ...l,
-      ...(receivedByCode.get(l.imei) || { received: false, receivedAt: null }),
-    }));
+    // The stored lines are membership + a paper-trail fallback; what the
+    // dialog SHOWS is the register as it is right now — a cost or supplier
+    // edited on the Stock page appears here without any re-save. A device
+    // that has left the register falls back to its snapshot.
+    const deviceIds = (batch.lines || [])
+      .map((l) => l.deviceId)
+      .filter((v) => v && ObjectId.isValid(String(v)))
+      .map((v) => new ObjectId(String(v)));
+    const liveDevices = deviceIds.length
+      ? await db.collection(DEVICES).find({ _id: { $in: deviceIds } }).toArray()
+      : [];
+    const liveById = new Map(liveDevices.map((d) => [String(d._id), d]));
+    const lines = (batch.lines || []).map((l) => {
+      const d = liveById.get(String(l.deviceId));
+      const live = d
+        ? {
+            imei: d.imei,
+            model: d.model || "",
+            color: d.color || "",
+            storage: d.storage || "",
+            grade: d.grade || "",
+            // Always the supplier's price — never our landed cost.
+            ...supplierFigure(d),
+            supplier: d.supplier ? { id: d.supplier.id, name: d.supplier.name } : null,
+          }
+        : null;
+      return {
+        ...l,
+        ...(live || {}),
+        // The incoming line's code is the imei as SHIPPED — key the
+        // received flag on the snapshot imei so a corrected IMEI still
+        // finds its line.
+        ...(receivedByCode.get(l.imei) || { received: false, receivedAt: null }),
+      };
+    });
     return res.json({
       success: true,
       batch: { ...batch, lines, received: lines.filter((l) => l.received).length, total: lines.length },

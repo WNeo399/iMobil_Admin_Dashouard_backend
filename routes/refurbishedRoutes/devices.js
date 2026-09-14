@@ -203,6 +203,12 @@ router.get("/", VIEW, async (req, res) => {
     const sortField = SORTABLE.includes(req.query.sort) ? req.query.sort : "createdAt";
     const sortDir = String(req.query.order).toLowerCase() === "asc" ? 1 : -1;
 
+    // A phone supplier's "cost" is what THEY charge. Once a unit has been
+    // received with our landed cost (supplierPrice recorded), their pages
+    // keep showing the supplier figure — our AUD cost (shipping + FX in)
+    // stays internal, same as consignment hides costPrice from shops.
+    const supplierView = req.user && req.user.role === "phone-supplier";
+    const hasSupplierPrice = { $gt: ["$supplierPrice", null] };
     const [total, rows, checkedCount, valueAgg] = await Promise.all([
       db.collection(DEVICES).countDocuments(match),
       db
@@ -220,8 +226,20 @@ router.get("/", VIEW, async (req, res) => {
           {
             $group: {
               // Devices recorded before currencies existed are AUD.
-              _id: { $ifNull: ["$currency", DEFAULT_CURRENCY] },
-              v: { $sum: { $ifNull: ["$costPrice", 0] } },
+              _id: supplierView
+                ? {
+                    $cond: [
+                      hasSupplierPrice,
+                      { $ifNull: ["$supplierCurrency", DEFAULT_CURRENCY] },
+                      { $ifNull: ["$currency", DEFAULT_CURRENCY] },
+                    ],
+                  }
+                : { $ifNull: ["$currency", DEFAULT_CURRENCY] },
+              v: {
+                $sum: supplierView
+                  ? { $cond: [hasSupplierPrice, "$supplierPrice", { $ifNull: ["$costPrice", 0] }] }
+                  : { $ifNull: ["$costPrice", 0] },
+              },
             },
           },
         ])
@@ -241,7 +259,13 @@ router.get("/", VIEW, async (req, res) => {
       total,
       checkedCount,
       costTotals,
-      rows,
+      rows: supplierView
+        ? rows.map((d) =>
+            d.supplierPrice == null
+              ? d
+              : { ...d, costPrice: d.supplierPrice, currency: d.supplierCurrency || DEFAULT_CURRENCY },
+          )
+        : rows,
     });
   } catch (e) {
     console.error("Refurb devices list error:", e);
@@ -708,6 +732,46 @@ router.put("/:id", MANAGE, async (req, res) => {
 
     const set = buildDevice(req.body || {}, { partial: true });
 
+    // A phone supplier can re-point the unit at one of THEIR suppliers
+    // from the device view — validated against their own scoped list,
+    // '' clears it, same rules as the create and supply-batch paths.
+    // Other roles never touch the field through this route.
+    if (req.user && req.user.role === "phone-supplier" && req.body && req.body.supplierId !== undefined) {
+      const wantedId = req.body.supplierId == null ? "" : String(req.body.supplierId);
+      const currentId = existing.supplier ? String(existing.supplier.id) : "";
+      if (wantedId !== currentId) {
+        if (!wantedId) {
+          set.supplier = null;
+        } else if (ObjectId.isValid(wantedId)) {
+          const sup = await db.collection("refurb_suppliers").findOne({
+            _id: new ObjectId(wantedId),
+            stockSource: stockSourceForUser(req.user),
+          });
+          if (!sup) {
+            return res.status(400).json({ success: false, message: "That supplier isn't on your suppliers list" });
+          }
+          set.supplier = { id: sup._id, name: sup.name };
+        } else {
+          return res.status(400).json({ success: false, message: "Bad supplier id" });
+        }
+      }
+    }
+
+    // Once a unit has been received with our landed cost, the register's
+    // costPrice is OURS. A phone supplier editing "cost" is changing what
+    // THEY charge — routed to supplierPrice so our figure survives (their
+    // pages show the supplier price back to them, so the edit round-trips).
+    if (req.user && req.user.role === "phone-supplier" && existing.supplierPrice != null) {
+      if (set.costPrice !== undefined) {
+        set.supplierPrice = set.costPrice;
+        delete set.costPrice;
+      }
+      if (set.currency !== undefined) {
+        set.supplierCurrency = set.currency;
+        delete set.currency;
+      }
+    }
+
     // The IMEI / serial is the register's key — once a device is recorded
     // it can't be edited from the dashboard. Echoing the stored value back
     // is fine (the edit form always sends it); anything else is rejected.
@@ -724,8 +788,15 @@ router.put("/:id", MANAGE, async (req, res) => {
     set.updatedAt = new Date();
     set.updatedBy = (req.user && req.user.username) || null;
 
-    // Audit trail — only when something actually changed.
+    // Audit trail — only when something actually changed. The supplier
+    // change is logged by NAME, not as raw objects.
     const changes = diffDevice(existing, set);
+    for (const c of changes) {
+      if (c.field === "supplier") {
+        c.from = (existing.supplier && existing.supplier.name) || null;
+        c.to = (set.supplier && set.supplier.name) || null;
+      }
+    }
     const update = { $set: set };
     if (changes.length) {
       update.$push = {
