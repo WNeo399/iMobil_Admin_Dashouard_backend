@@ -39,9 +39,11 @@ const STOCK_HIDDEN = "imb_stock_hidden";
 router.get("/collectionStocks", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { collection } = req.query;
-    const collectionId = Array.isArray(collection) ? collection[0] : collection;
-
-    if (!collectionId || !ObjectId.isValid(collectionId)) {
+    // One id, or a comma-list — the tree's clickable parent nodes load a
+    // whole branch (e.g. every iPhone Screen collection) in one request.
+    const raw = Array.isArray(collection) ? collection.join(",") : String(collection || "");
+    const collectionIds = raw.split(",").map((s) => s.trim()).filter(Boolean);
+    if (!collectionIds.length || collectionIds.some((id) => !ObjectId.isValid(id))) {
       return res.status(400).json({ success: false, message: "Invalid collection id" });
     }
 
@@ -54,15 +56,26 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
         : "productCollections";
 
     const db = await connectToDatabase();
-    const collectionData = await db
+    const docs = await db
       .collection(store)
-      .findOne({ _id: new ObjectId(collectionId) });
+      .find({ _id: { $in: collectionIds.map((id) => new ObjectId(id)) } })
+      .toArray();
 
-    if (!collectionData) {
+    if (!docs.length) {
       return res.status(404).json({ success: false, message: "Collection not found" });
     }
 
-    const itemIds = await resolveCollectionItemIds(collectionData);
+    // Union of every requested collection. Resolved sequentially — each
+    // criteria collection is one Analytics query, and Analytics punishes
+    // fan-out harder than it rewards it.
+    const memberOf = new Map();
+    for (const doc of docs) {
+      for (const id of await resolveCollectionItemIds(doc)) {
+        if (!memberOf.has(id)) memberOf.set(id, []);
+        memberOf.get(id).push(String(doc._id));
+      }
+    }
+    const itemIds = [...memberOf.keys()];
     if (itemIds.length === 0) {
       // Neither source produced anything (empty collection or a
       // criteria that matched nothing) — empty list rather than an
@@ -71,6 +84,13 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
     }
 
     const result = await fetchStockShapedItems(itemIds);
+    // Branch requests tag each item with the collections it came from, so
+    // the page can offer those as a filter over the merged list.
+    if (docs.length > 1) {
+      for (const item of result) {
+        item.memberOf = memberOf.get(String(item.id)) || [];
+      }
+    }
 
     // Accessories carry a Zoho category (parts don't use them) — joined
     // in live from the Analytics items view for the meta line + filter.
