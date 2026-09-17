@@ -390,6 +390,70 @@ router.get("/salesorders/:id", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── PUT /inflow/salesorders/:id/invoice-number ──────────────────────
+// Rename an order's invoice number. invoiceNumber is the webhook's identity
+// key (repeat webhooks match on it), so this is mainly for fixing typos on
+// dashboard-created orders or realigning with a number changed in InFlow.
+// Real cross-references are by ObjectId; the display-string copies (linked
+// dispatch records, credit-note payment rows, credit applications) are
+// updated here so nothing shows the stale number.
+router.put("/salesorders/:id/invoice-number", CREATE, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const invoiceNumber = String((req.body || {}).invoiceNumber || "").trim();
+    if (!invoiceNumber) {
+      return res.status(400).json({ success: false, message: "Invoice number is required." });
+    }
+
+    const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
+    const _id = new ObjectId(req.params.id);
+    const order = await col.findOne({ _id }, { projection: { invoiceNumber: 1 } });
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    if (order.invoiceNumber === invoiceNumber) {
+      return res.json({ success: true, invoiceNumber, changed: false });
+    }
+
+    // Same uniqueness rule as create — invoiceNumber identifies the order.
+    const dup = await col.findOne({ invoiceNumber, _id: { $ne: _id } }, { projection: { _id: 1 } });
+    if (dup) {
+      return res.status(409).json({ success: false, message: `Order ${invoiceNumber} already exists` });
+    }
+
+    const now = new Date();
+    await col.updateOne({ _id }, { $set: { invoiceNumber, updatedAt: now } });
+
+    // Display-string copies. Each is best-effort by id, so a miss is a no-op.
+    await db
+      .collection(DISPATCH_UPLOADS)
+      .updateMany({ linkedOrderId: _id }, { $set: { linkedInvoiceNumber: invoiceNumber } });
+    // If this order is a credit note: payment rows on the invoices it paid.
+    await col.updateMany(
+      { "payments.creditNoteId": _id },
+      { $set: { "payments.$[p].creditNoteNumber": invoiceNumber } },
+      { arrayFilters: [{ "p.creditNoteId": _id }] },
+    );
+    // Applications recorded ON credit notes that were spent on this invoice.
+    await col.updateMany(
+      { "creditApplications.invoiceId": _id },
+      { $set: { "creditApplications.$[a].invoiceNumber": invoiceNumber } },
+      { arrayFilters: [{ "a.invoiceId": _id }] },
+    );
+
+    return res.json({
+      success: true,
+      invoiceNumber,
+      changed: true,
+      previous: order.invoiceNumber || "",
+    });
+  } catch (e) {
+    console.error("InFlow rename invoice error:", e);
+    return res.status(500).json({ success: false, message: "Failed to update the invoice number" });
+  }
+});
+
 // ── GET /inflow/salesorders/:id/credits ─────────────────────────────
 // Credit notes for THIS order's customer that still have credit to apply.
 // available = paidAmount - totalAmount  (credit consumed lowers paidAmount).
