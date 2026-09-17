@@ -52,7 +52,14 @@ async function analyticsRows(url, label) {
     const rows = await getViewData(url);
     if (Array.isArray(rows)) return rows;
     lastSeen = rows;
-    if (attempt < MAX_ATTEMPTS) await sleep(500 * 2 ** (attempt - 1));
+    if (attempt < MAX_ATTEMPTS) {
+      // A per-minute throttle (6045) only clears with the minute — the
+      // exponential micro-backoff below is for transient hiccups, not
+      // rate limits.
+      const throttled =
+        lastSeen && lastSeen.data && Number(lastSeen.data.errorCode) === 6045;
+      await sleep(throttled ? 65000 : 500 * 2 ** (attempt - 1));
+    }
   }
   throw new Error(
     `Zoho Analytics did not return rows for ${label} after ${MAX_ATTEMPTS} attempts` +

@@ -22,7 +22,12 @@ var express = require("express");
 var router = express.Router();
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
-const { getViewData, handleZohoInventoryRequest } = require("../../utils/zohoRequest");
+const {
+  getViewData,
+  handleZohoInventoryRequest,
+  handleZohoInventoryPutRequest,
+  refreshToken,
+} = require("../../utils/zohoRequest");
 const { mapWithLimit } = require("../../utils/zohoStock");
 
 const DAILY = "imb_stock_daily";
@@ -49,11 +54,25 @@ const FILTERS = {
   negative: { available: { $lt: 0 } },
   // Sold recently but at zero now — the shortest actionable list there is.
   sellingAndOut: { outOfStock: true, units90: { $gt: 0 } },
+  // Price health (the Price Monitoring page's tiles).
+  priceMissing: { priceMissing: true },
+  pricePlaceholder: { pricePlaceholder: true },
+  // The merged "Missing Price" tile: no rate in a list OR a placeholder
+  // rate — both mean "not really priced". $expr keeps it clear of the
+  // search filter's $or.
+  priceUnpriced: { $expr: { $or: ["$priceMissing", "$pricePlaceholder"] } },
+  priceBelowCost: { priceBelowCost: true },
+  priceOrderBroken: { priceOrderBroken: true },
+  // Cost-priced items whose rates sit >5% off the pricing formula.
+  priceRuleBroken: { priceRuleBroken: true },
+  // The Archive bucket — criteria matches + manual marks.
+  archived: { archived: true },
 };
 
 const SORTABLE = new Set([
   "sku", "name", "location", "available", "units7", "units14", "units30",
   "units90", "openPoQty", "daysOfCover", "daysSinceSale",
+  "purchasePrice", "pricePlatinum", "priceVip", "priceSvip", "priceWholesale",
 ]);
 
 function scopeOf(req) {
@@ -74,26 +93,32 @@ function escapeRegex(v) {
 // The newest snapshot we hold. Everything else is keyed off it, so a failed
 // overnight run shows yesterday's numbers rather than an empty page — with
 // the date attached so the UI can say how old they are.
+// An indexed sort-and-take-one, NOT a $group over every stored day — and
+// cached for a minute: this runs at the top of every request in the module,
+// the value changes once a night, and the Mongo server is a ~170ms network
+// round trip away.
+let snapshotDateCache = { value: null, at: 0 };
 async function latestSnapshotDate(db) {
-  const rows = await db
+  if (snapshotDateCache.value && Date.now() - snapshotDateCache.at < 60000) {
+    return snapshotDateCache.value;
+  }
+  const row = await db
     .collection(DAILY)
-    .aggregate([{ $group: { _id: "$snapshotDate" } }, { $sort: { _id: -1 } }, { $limit: 1 }])
-    .toArray();
-  return rows.length ? rows[0]._id : null;
+    .find({}, { projection: { _id: 0, snapshotDate: 1 } })
+    .sort({ snapshotDate: -1 })
+    .limit(1)
+    .next();
+  if (row) snapshotDateCache = { value: row.snapshotDate, at: Date.now() };
+  return row ? row.snapshotDate : null;
 }
 
-// Turn the query string into a match document. Dormant rows (no sales, no
-// stock in the whole window) are excluded unless asked for — they are 40%
-// of the accessories and would drown every list.
-function buildMatch(req, snapshotDate) {
+// The user-set filters (search box and the dropdowns) as a match fragment.
+// Shared by /items and /summary so the tiles count exactly the rows the
+// table would show under the same filters — the named tile filter itself is
+// deliberately NOT in here, or clicking a tile would zero out its siblings.
+function baseFilterMatch(req) {
   const q = req.query || {};
-  const match = { snapshotDate, scope: scopeOf(req) };
-
-  const filter = FILTERS[q.filter] ? q.filter : "all";
-  Object.assign(match, FILTERS[filter]);
-
-  if (String(q.includeDormant) !== "true") match.dormant = { $ne: true };
-
+  const match = {};
   const search = String(q.search || "").trim();
   if (search) {
     const re = new RegExp(escapeRegex(search), "i");
@@ -110,8 +135,63 @@ function buildMatch(req, snapshotDate) {
     const v = String(q[param] || "").trim();
     if (v) match[field] = v;
   }
+  return match;
+}
+
+// Turn the query string into a match document. Archive rows (criteria
+// matches + manual marks) are excluded from every view except the archive
+// filter itself.
+function buildMatch(req, snapshotDate) {
+  const q = req.query || {};
+  const match = { snapshotDate, scope: scopeOf(req), ...baseFilterMatch(req) };
+
+  const filter = FILTERS[q.filter] ? q.filter : "all";
+  Object.assign(match, FILTERS[filter]);
+
+  // The Archive bucket (criteria matches + manual marks) is hidden from
+  // every view except its own filter.
+  if (filter !== "archived") match.archived = { $ne: true };
+
   return { match, filter };
 }
+
+// ── POST /stock-monitor/snapshot/run ────────────────────────────────
+// Trigger the daily snapshot on demand (the dashboard's "Update snapshot"
+// button when the overnight job hasn't run). Spawns bin/stockSnapshot.js
+// --apply as a child process — the script is the cron entrypoint and calls
+// process.exit, so it must not run in-process. One run at a time; the
+// dashboard polls GET /snapshot/run until it finishes.
+const { spawn } = require("child_process");
+const path = require("path");
+let snapshotChild = null;
+
+router.post("/snapshot/run", VIEW, (req, res) => {
+  if (snapshotChild) {
+    return res.json({ success: true, running: true, alreadyRunning: true });
+  }
+  const backendRoot = path.join(__dirname, "..", "..");
+  const child = spawn(process.execPath, [path.join(backendRoot, "bin", "stockSnapshot.js"), "--apply"], {
+    cwd: backendRoot,
+    stdio: "ignore",
+  });
+  snapshotChild = child;
+  child.on("exit", (code) => {
+    snapshotChild = null;
+    // Drop the cached date so the fresh snapshot shows immediately.
+    snapshotDateCache = { value: null, at: 0 };
+    console.log(`stock snapshot run finished (exit ${code})`);
+  });
+  child.on("error", (e) => {
+    snapshotChild = null;
+    console.error("stock snapshot spawn error:", e.message);
+  });
+  console.log(`stock snapshot run started by ${(req.user && req.user.username) || "unknown"}`);
+  return res.json({ success: true, running: true });
+});
+
+router.get("/snapshot/run", VIEW, (req, res) => {
+  return res.json({ success: true, running: !!snapshotChild });
+});
 
 // ── GET /stock-monitor/summary ──────────────────────────────────────
 // One aggregation for every tile, plus the values the filter selects
@@ -126,15 +206,20 @@ router.get("/summary", VIEW, async (req, res, next) => {
     }
     const scope = scopeOf(req);
     const base = { snapshotDate, scope };
-    const live = { ...base, dormant: { $ne: true } };
+    // The Archive bucket sits outside every tile; its own count rides in
+    // counts.archived for the "view archived" link.
+    const live = { ...base, archived: { $ne: true } };
+    // The user's filters narrow the tiles too, so the numbers always
+    // describe what the table below them would show.
+    const filtered = { ...live, ...baseFilterMatch(req) };
 
-    // Every tile counts over the SAME row set the lists show — dormant
-    // excluded. Counting a tile over a wider set than its table is how a
+    // Every tile counts over the SAME row set the lists show — filters
+    // applied. Counting a tile over a wider set than its table is how a
     // dashboard ends up quietly lying: click 92 and get 155.
     const [tiles] = await db
       .collection(DAILY)
       .aggregate([
-        { $match: live },
+        { $match: filtered },
         {
           $group: {
             _id: null,
@@ -148,18 +233,23 @@ router.get("/summary", VIEW, async (req, res, next) => {
             sellingAndOut: {
               $sum: { $cond: [{ $and: ["$outOfStock", { $gt: ["$units90", 0] }] }, 1, 0] },
             },
+            priceMissing: { $sum: { $cond: ["$priceMissing", 1, 0] } },
+            pricePlaceholder: { $sum: { $cond: ["$pricePlaceholder", 1, 0] } },
+            priceUnpriced: { $sum: { $cond: [{ $or: ["$priceMissing", "$pricePlaceholder"] }, 1, 0] } },
+            priceRuleBroken: { $sum: { $cond: ["$priceRuleBroken", 1, 0] } },
+            priceBelowCost: { $sum: { $cond: ["$priceBelowCost", 1, 0] } },
+            priceOrderBroken: { $sum: { $cond: ["$priceOrderBroken", 1, 0] } },
             unitsOnHand: { $sum: { $cond: [{ $gt: ["$available", 0] }, "$available", 0] } },
           },
         },
       ])
       .toArray();
 
-    // Dormant is the one count that is deliberately about what is hidden.
     const [totals] = await db
       .collection(DAILY)
       .aggregate([
-        { $match: base },
-        { $group: { _id: null, all: { $sum: 1 }, dormant: { $sum: { $cond: ["$dormant", 1, 0] } } } },
+        { $match: { ...base, ...baseFilterMatch(req) } },
+        { $group: { _id: null, all: { $sum: 1 }, archived: { $sum: { $cond: ["$archived", 1, 0] } } } },
       ])
       .toArray();
 
@@ -205,7 +295,11 @@ router.get("/summary", VIEW, async (req, res, next) => {
             error: run.error || null,
           }
         : null,
-      counts: { ...stripId(tiles), dormant: (totals && totals.dormant) || 0, all: (totals && totals.all) || 0 },
+      counts: {
+        ...stripId(tiles),
+        all: (totals && totals.all) || 0,
+        archived: (totals && totals.archived) || 0,
+      },
       options: { categories, collections, vendors, qualities },
     });
   } catch (error) {
@@ -238,17 +332,42 @@ router.get("/items", VIEW, async (req, res, next) => {
             units7: 1, units14: 1, units30: 1, units90: 1, lastSaleAt: 1, daysSinceSale: 1,
             openPoQty: 1, openPoLines: 1, earliestPoDate: 1,
             outOfStock: 1, outOfStockCovered: 1, outOfStockUncovered: 1,
-            belowMonthCover: 1, stale: 1, dormant: 1, daysOfCover: 1, purchasePrice: 1,
+            belowMonthCover: 1, stale: 1, archived: 1, archivedReason: 1,
+            daysOfCover: 1, purchasePrice: 1,
+            pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1,
+            priceMissing: 1, pricePlaceholder: 1, priceBelowCost: 1, priceOrderBroken: 1,
+            priceRule: 1, priceExpected: 1, priceRuleBroken: 1,
           },
         })
         // _id breaks ties so paging can't repeat or skip a row when many
-        // share a sort value — most of them have units90: 0.
-        .sort({ [sortField]: order, _id: 1 })
+        // share a sort value — most of them have units90: 0. The merged
+        // Missing Price view groups truly-missing rows above placeholder
+        // ones before the user's sort applies.
+        .sort(
+          filter === "priceUnpriced"
+            ? { priceMissing: -1, [sortField]: order, _id: 1 }
+            : { [sortField]: order, _id: 1 },
+        )
         .skip((page - 1) * pageSize)
         .limit(pageSize)
         .toArray(),
       db.collection(DAILY).countDocuments(match),
     ]);
+
+    // 海运 membership, joined live from the pinned collection doc rather
+    // than the snapshot's collections array — an item added today badges
+    // (and can be toggled) immediately, not after the next snapshot.
+    try {
+      const sea = await db
+        .collection("productCollections")
+        .findOne({ seaFreight: true }, { projection: { products: 1 } });
+      if (sea && Array.isArray(sea.products) && sea.products.length) {
+        const seaIds = new Set(sea.products.map((p) => String(p.itemId)));
+        for (const r of rows) if (seaIds.has(String(r.itemId))) r.seaFreight = true;
+      }
+    } catch (e) {
+      // The badge is decoration — never fail the list for it.
+    }
 
     return res.json({ success: true, snapshotDate, filter, page, pageSize, total, rows });
   } catch (error) {
@@ -439,6 +558,218 @@ router.get("/item/:itemId/sales", VIEW, async (req, res) => {
       success: false,
       message: "Could not read the sales history from Zoho",
     });
+  }
+});
+
+// ── POST /stock-monitor/item/:itemId/archived ────────────────────────
+// Move an item to the Archive bucket by hand (mode "archived"), or restore
+// it with { restore: true } — restoring writes a "keep" pin when the name
+// criteria would re-catch it, so the item stays live on future runs.
+// Today's snapshot rows are flipped immediately so the pages update now.
+const EDIT = requirePermission("zoho:stock:edit");
+const { isNoiseName, ARCHIVE_COLLECTION } = require("../../utils/stockUniverse");
+
+router.post("/item/:itemId/archived", EDIT, async (req, res, next) => {
+  try {
+    const itemId = String(req.params.itemId || "").trim();
+    if (!/^[0-9]{6,25}$/.test(itemId)) {
+      return res.status(400).json({ success: false, message: "Bad item id" });
+    }
+    const restore = req.body && req.body.restore === true;
+    const db = await connectToDatabase();
+    const snapshotDate = await latestSnapshotDate(db);
+    const row = snapshotDate
+      ? await db.collection(DAILY).findOne(
+          { snapshotDate, itemId },
+          { projection: { sku: 1, name: 1 } },
+        )
+      : null;
+
+    const now = new Date();
+    const by = (req.user && req.user.username) || null;
+    if (restore) {
+      // Out of the bucket. A name the criteria would re-catch gets a
+      // "keep" pin; otherwise the manual mark is simply removed.
+      if (row && isNoiseName(row.name)) {
+        await db.collection(ARCHIVE_COLLECTION).updateOne(
+          { itemId },
+          { $set: { itemId, sku: (row && row.sku) || "", name: (row && row.name) || "", mode: "keep", by, at: now } },
+          { upsert: true },
+        );
+      } else {
+        await db.collection(ARCHIVE_COLLECTION).deleteOne({ itemId });
+      }
+    } else {
+      await db.collection(ARCHIVE_COLLECTION).updateOne(
+        { itemId },
+        { $set: { itemId, sku: (row && row.sku) || "", name: (row && row.name) || "", mode: "archive", by, at: now } },
+        { upsert: true },
+      );
+    }
+    // Flip today's rows so the change shows without waiting for tonight.
+    if (snapshotDate) {
+      await db.collection(DAILY).updateMany(
+        { snapshotDate, itemId },
+        { $set: { archived: !restore, archivedReason: restore ? null : "manual" } },
+      );
+    }
+    return res.json({ success: true, itemId, archived: !restore });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── GET /stock-monitor/item/:itemId/prices ──────────────────────────
+// The four price-list rates for one item, read live from the Analytics
+// prices view — the Price Monitoring page's "check live" button. One call;
+// fresher than the nightly snapshot (Analytics itself syncs from Inventory
+// within a few hours of a price push).
+const PRICES_VIEW_ID = "1404913000003936194";
+const PRICE_LISTS = {
+  platinum: "2591985000001439015",
+  vip: "2591985000000103001",
+  svip: "2591985000078196985",
+  wholesale: "2591985000000103011",
+};
+
+router.get("/item/:itemId/prices", VIEW, async (req, res) => {
+  const itemId = String(req.params.itemId || "").trim();
+  if (!/^[0-9]{6,25}$/.test(itemId)) {
+    return res.status(400).json({ success: false, message: "Bad item id" });
+  }
+  try {
+    const rows = await getViewData(
+      `https://analyticsapi.zoho.com/restapi/v2/workspaces/${ANALYTICS_WORKSPACE_ID}` +
+        `/views/${PRICES_VIEW_ID}/data?CONFIG=` +
+        encodeURIComponent(
+          JSON.stringify({
+            responseFormat: "json",
+            selectedColumns: ["PriceList ID", "Product ID", "PriceList Rate"],
+            criteria: `"Product ID" = '${itemId}'`,
+          }),
+        ),
+    );
+    if (!Array.isArray(rows)) {
+      throw new Error("prices view returned " + JSON.stringify(rows).slice(0, 120));
+    }
+    const money = (raw) => {
+      const n = parseFloat(String(raw == null ? "" : raw).replace(/[^0-9.]/g, ""));
+      return Number.isFinite(n) ? n : null;
+    };
+    const byList = new Map(rows.map((r) => [String(r["PriceList ID"]), r["PriceList Rate"]]));
+    const prices = {};
+    for (const [key, listId] of Object.entries(PRICE_LISTS)) {
+      prices[key] = byList.has(listId) ? money(byList.get(listId)) : null;
+    }
+    return res.json({ success: true, prices });
+  } catch (error) {
+    console.error("Stock monitor live prices error:", error && error.message);
+    return res.status(502).json({
+      success: false,
+      message: "Could not read the price lists from Zoho",
+    });
+  }
+});
+
+// ── PUT /stock-monitor/item/:itemId/price ───────────────────────────
+// Push one price-list rate to Zoho Inventory — via the MERGE endpoint
+// (PUT /pricebooks/{id}/items with an items array), which updates only the
+// named item and never touches the rest of the book. The whole-book PUT
+// REPLACES the book and must never be used here.
+// On success the rate is mirrored into today's snapshot row and the row's
+// price-health flags recomputed, so the page reflects the push immediately
+// (Zoho Analytics — the snapshot's source — lags a price push by hours).
+const PRICE_FIELDS = {
+  platinum: "pricePlatinum",
+  vip: "priceVip",
+  svip: "priceSvip",
+  wholesale: "priceWholesale",
+};
+const PRICE_PLACEHOLDERS = new Set([9999.99, 9000, 8888, 7777, 7000, 6000]);
+const { evaluatePriceRule } = require("../../utils/priceRules");
+
+// Same rule as the snapshot job: SVIP ≤ VIP, WholeSale ≤ VIP, VIP ≤
+// Platinum (SVIP vs WholeSale deliberately unordered), placeholders and
+// missing rates skipped.
+function priceHealthFlags(row) {
+  const real = (v) => (v != null && !PRICE_PLACEHOLDERS.has(v) ? v : null);
+  const rates = [row.priceWholesale, row.priceSvip, row.priceVip, row.pricePlatinum];
+  const realRates = rates.filter((v) => v != null && !PRICE_PLACEHOLDERS.has(v));
+  const s = real(row.priceSvip);
+  const w = real(row.priceWholesale);
+  const v = real(row.priceVip);
+  const p = real(row.pricePlatinum);
+  const lte = (a, b) => a == null || b == null || a <= b + 1e-9;
+  return {
+    priceMissing: rates.some((x) => x == null),
+    pricePlaceholder: rates.some((x) => x != null && PRICE_PLACEHOLDERS.has(x)),
+    priceBelowCost: row.purchasePrice > 0 && realRates.some((x) => x < row.purchasePrice),
+    priceOrderBroken: !(lte(s, v) && lte(w, v) && lte(v, p) && lte(s, p) && lte(w, p)),
+  };
+}
+
+router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (req, res) => {
+  const itemId = String(req.params.itemId || "").trim();
+  if (!/^[0-9]{6,25}$/.test(itemId)) {
+    return res.status(400).json({ success: false, message: "Bad item id" });
+  }
+  const list = String((req.body && req.body.list) || "").toLowerCase();
+  const field = PRICE_FIELDS[list];
+  if (!field) {
+    return res.status(400).json({ success: false, message: "Unknown price list" });
+  }
+  const rate = Number(req.body && req.body.rate);
+  if (!Number.isFinite(rate) || rate < 0 || rate > 1000000) {
+    return res.status(400).json({ success: false, message: "Rate must be 0 or a positive number" });
+  }
+  const rounded = Math.round(rate * 100) / 100;
+
+  try {
+    // Pre-warm the token: a write should not burn its first attempt on
+    // discovering an expired one.
+    await refreshToken();
+    const resp = await handleZohoInventoryPutRequest(
+      `https://www.zohoapis.com/inventory/v1/pricebooks/${PRICE_LISTS[list]}/items` +
+        `?organization_id=${ZOHO_ORG_ID}`,
+      [{ item_id: itemId, pricebook_rate: rounded }],
+    );
+    if (!resp || resp.code !== 0) {
+      return res
+        .status(502)
+        .json({ success: false, message: (resp && resp.message) || "Zoho rejected the price update" });
+    }
+
+    // Mirror into today's snapshot and recompute this row's flags.
+    const db = await connectToDatabase();
+    const snapshotDate = await latestSnapshotDate(db);
+    let flags = null;
+    if (snapshotDate) {
+      const row = await db.collection(DAILY).findOne(
+        { snapshotDate, itemId },
+        {
+          projection: {
+            pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1,
+            name: 1, category: 1, classification: 1, quality: 1,
+          },
+        },
+      );
+      if (row) {
+        row[field] = rounded;
+        flags = {
+          ...priceHealthFlags(row),
+          // The formula verdict moves with the new rate too.
+          priceRuleBroken: evaluatePriceRule(row).broken,
+        };
+        await db.collection(DAILY).updateMany(
+          { snapshotDate, itemId },
+          { $set: { [field]: rounded, ...flags } },
+        );
+      }
+    }
+    return res.json({ success: true, list, rate: rounded, flags });
+  } catch (error) {
+    console.error("Stock monitor price push error:", error && error.message);
+    return res.status(502).json({ success: false, message: "Failed to push the price to Zoho" });
   }
 });
 

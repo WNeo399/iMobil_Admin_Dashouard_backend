@@ -30,6 +30,12 @@ const {
 } = require("../../utils/zohoStock");
 const { getItemCategories } = require("../../utils/itemCategories");
 
+// Items hidden from the Stock Monitoring list by hand (page-level only —
+// the snapshot dashboard, buy lists and Price Monitoring still count
+// them; that stronger cross-page bucket is the Archive). One registry for
+// both scopes, keyed by Zoho item id.
+const STOCK_HIDDEN = "imb_stock_hidden";
+
 router.get("/collectionStocks", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { collection } = req.query;
@@ -74,9 +80,191 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
         item.category = categories.get(String(item.id)) || "";
       }
     }
+
+    // Flag manually hidden items rather than dropping them, so the page
+    // can offer a "N hidden — view" review with unhide.
+    const hiddenDocs = await db
+      .collection(STOCK_HIDDEN)
+      .find({ itemId: { $in: result.map((i) => String(i.id)) } }, { projection: { itemId: 1 } })
+      .toArray();
+    if (hiddenDocs.length) {
+      const hiddenIds = new Set(hiddenDocs.map((h) => h.itemId));
+      for (const item of result) {
+        if (hiddenIds.has(String(item.id))) item.hidden = true;
+      }
+    }
+
+    // 海运 membership badge (spare parts only — the list is a parts concept).
+    if (store === "productCollections") {
+      const sea = await seaFreightDoc(db);
+      const seaIds = new Set((sea.products || []).map((p) => String(p.itemId)));
+      if (seaIds.size) {
+        for (const item of result) {
+          if (seaIds.has(String(item.id))) item.seaFreight = true;
+        }
+      }
+    }
     return res.json(result);
   } catch (error) {
     next(error);
+  }
+});
+
+// ── 海运 (sea freight) list ─────────────────────────────────────────
+// A real productCollections doc (pinned products only, no criteria) so it
+// rides the existing machinery for free: resolveCollectionItemIds reads
+// pinned ids straight from Mongo (instant, no Zoho call, no Analytics
+// lag), and the nightly snapshot stamps its title into every member row's
+// `collections`, which feeds the Dashboard's Collection filter. It is
+// deliberately NOT in any collection group, so it stays out of the
+// category tree — the page pins it as a tab instead.
+const SEA_FREIGHT_TITLE = "海运";
+async function seaFreightDoc(db) {
+  const col = db.collection("productCollections");
+  let doc = await col.findOne({ seaFreight: true });
+  if (!doc) {
+    // Adopt a hand-made collection of the same name rather than shadow it.
+    doc = await col.findOne({ title: SEA_FREIGHT_TITLE });
+    if (doc) await col.updateOne({ _id: doc._id }, { $set: { seaFreight: true } });
+  }
+  if (!doc) {
+    const fresh = {
+      title: SEA_FREIGHT_TITLE,
+      seaFreight: true,
+      note: "Sea-freight list — pinned tab on Stock Monitoring",
+      type: "Selection",
+      status: "active",
+      rules: [],
+      children: [],
+      products: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const r = await col.insertOne(fresh);
+    doc = { _id: r.insertedId, ...fresh };
+  }
+  return doc;
+}
+
+router.get("/seaFreight", requirePermission("zoho:stock:view"), async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const doc = await seaFreightDoc(db);
+    const itemIds = (doc.products || []).map((p) => String(p.itemId)).filter(Boolean);
+    return res.json({ success: true, id: String(doc._id), itemIds });
+  } catch (error) {
+    console.error("seaFreight get error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load the 海运 list" });
+  }
+});
+
+// Bulk add — body { items: [{ id, name, sku }] }. Already-listed items are
+// skipped, so re-adding is a no-op.
+router.post("/seaFreight/items", requirePermission("zoho:stock:view"), async (req, res) => {
+  try {
+    const items = Array.isArray((req.body || {}).items) ? req.body.items : [];
+    const clean = items
+      .map((i) => ({
+        itemId: String((i && i.id) || "").trim(),
+        name: String((i && i.name) || "").trim(),
+        sku: String((i && i.sku) || "").trim(),
+        imageUrl: "",
+      }))
+      .filter((i) => /^\d{5,25}$/.test(i.itemId));
+    if (!clean.length) return res.status(400).json({ success: false, message: "No items to add." });
+    if (clean.length > 500) return res.status(400).json({ success: false, message: "Too many items (max 500)." });
+
+    const db = await connectToDatabase();
+    const doc = await seaFreightDoc(db);
+    const existing = new Set((doc.products || []).map((p) => String(p.itemId)));
+    const fresh = clean.filter((i) => !existing.has(i.itemId));
+    if (fresh.length) {
+      await db.collection("productCollections").updateOne(
+        { _id: doc._id },
+        { $push: { products: { $each: fresh } }, $set: { updatedAt: new Date() } },
+      );
+    }
+    return res.json({ success: true, added: fresh.length, already: clean.length - fresh.length, total: existing.size + fresh.length });
+  } catch (error) {
+    console.error("seaFreight add error:", error);
+    return res.status(500).json({ success: false, message: "Failed to add to 海运" });
+  }
+});
+
+router.delete("/seaFreight/items/:itemId", requirePermission("zoho:stock:view"), async (req, res) => {
+  try {
+    const itemId = String(req.params.itemId || "").trim();
+    if (!/^\d{5,25}$/.test(itemId)) {
+      return res.status(400).json({ success: false, message: "Bad item id" });
+    }
+    const db = await connectToDatabase();
+    const doc = await seaFreightDoc(db);
+    await db.collection("productCollections").updateOne(
+      { _id: doc._id },
+      { $pull: { products: { itemId } }, $set: { updatedAt: new Date() } },
+    );
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("seaFreight remove error:", error);
+    return res.status(500).json({ success: false, message: "Failed to remove from 海运" });
+  }
+});
+
+// ── POST /zoho/stockHidden ──────────────────────────────────────────
+// Hide the given items from the Stock Monitoring list (bulk — the page's
+// row selection). Body: { items: [{ id, name, sku }] }. Upserts, so
+// re-hiding an already hidden item is a no-op.
+router.post("/stockHidden", requirePermission("zoho:stock:view"), async (req, res) => {
+  try {
+    const items = Array.isArray((req.body || {}).items) ? req.body.items : [];
+    const clean = items
+      .map((i) => ({
+        itemId: String((i && i.id) || "").trim(),
+        name: String((i && i.name) || "").trim(),
+        sku: String((i && i.sku) || "").trim(),
+      }))
+      .filter((i) => /^\d{5,25}$/.test(i.itemId));
+    if (!clean.length) {
+      return res.status(400).json({ success: false, message: "No items to hide." });
+    }
+    if (clean.length > 500) {
+      return res.status(400).json({ success: false, message: "Too many items (max 500)." });
+    }
+    const db = await connectToDatabase();
+    const now = new Date();
+    const by = (req.user && req.user.username) || null;
+    await db.collection(STOCK_HIDDEN).bulkWrite(
+      clean.map((i) => ({
+        updateOne: {
+          filter: { itemId: i.itemId },
+          update: {
+            $setOnInsert: { itemId: i.itemId, hiddenAt: now, hiddenBy: by },
+            $set: { name: i.name, sku: i.sku },
+          },
+          upsert: true,
+        },
+      })),
+    );
+    return res.json({ success: true, hidden: clean.length });
+  } catch (error) {
+    console.error("stockHidden hide error:", error);
+    return res.status(500).json({ success: false, message: "Failed to hide the items" });
+  }
+});
+
+// ── DELETE /zoho/stockHidden/:itemId ────────────────────────────────
+router.delete("/stockHidden/:itemId", requirePermission("zoho:stock:view"), async (req, res) => {
+  try {
+    const itemId = String(req.params.itemId || "").trim();
+    if (!/^\d{5,25}$/.test(itemId)) {
+      return res.status(400).json({ success: false, message: "Bad item id" });
+    }
+    const db = await connectToDatabase();
+    await db.collection(STOCK_HIDDEN).deleteOne({ itemId });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("stockHidden unhide error:", error);
+    return res.status(500).json({ success: false, message: "Failed to unhide the item" });
   }
 });
 

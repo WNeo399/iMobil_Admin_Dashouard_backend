@@ -28,6 +28,9 @@ const {
   fetchWindowRows,
   OFFLINE_SALE_REASONS,
 } = require("../utils/zohoStock");
+const { getViewData } = require("../utils/zohoRequest");
+const { isNoiseName, ARCHIVE_COLLECTION } = require("../utils/stockUniverse");
+const { evaluatePriceRule } = require("../utils/priceRules");
 
 const ITEMS_DAILY = "imb_stock_daily";
 const RUNS = "imb_stock_runs";
@@ -36,23 +39,54 @@ const PURCHASE_ORDERS = "imb_purchase_order";
 const COLLECTIONS = "productCollections";
 const COLLECTION_GROUPS = "productCollectionsGroups";
 
-// The universe: anything Zoho says is active and sitting on a shelf. The
-// collections are a tag on these rows, not the boundary of them — they only
-// reach 4,886 of ~11,800, and the items outside them sell more than the ones
-// inside.
-const UNIVERSE = `"Status" = 'Active' AND "Location" IS NOT NULL`;
+// The universe: anything Zoho says is Active (with a SKU). The old
+// "Location IS NOT NULL" requirement was dropped (2026-09-15): an active
+// item without a shelf is still a real SKU in use. Criteria matches (the
+// shared name rules in utils/stockUniverse) are NOT dropped — they are
+// flagged `archived` and live in the Archive bucket, together with items
+// archived by hand; a "keep" override pins an item as never-archived.
+// The collections are a tag on these rows, not the boundary of them — the
+// items outside them sell more than the ones inside.
+const UNIVERSE = `"Status" = 'Active'`;
 
-// Accessories are told apart by Zoho's Classification, which splits them
-// perfectly: no accessory-classified item appears in any parts collection.
-// Everything else — including the ~3,200 items with no classification at
-// all — counts as a spare part.
+// Accessories are told apart three ways (2026-09-15) — Classification is
+// right when present, but ~5,400 items carry none, and accessory products
+// among them (cables, protectors) would otherwise land in parts:
+//   1. Zoho Classification in the set below;
+//   2. membership in any accessoryCollections collection (the accessory
+//      pages' own data set);
+//   3. a Zoho Brand from the accessory-brand list — drawn from the brands
+//      on accessory-classified stock. Deliberately NOT Apple / Samsung,
+//      which brand real parts too.
+// Everything else counts as a spare part.
 const ACCESSORY_CLASSIFICATIONS = new Set([
   "Accessory",
   "Accessory Special Offer",
 ]);
+const ACCESSORY_BRANDS = new Set([
+  "Accessory", "iShield", "Roar", "Ugly Rubber UR", "X.One", "Halosure",
+  "Remax", "JoyRoom", "HOCO", "COTECi", "Rock", "Blue Nation", "Baseus",
+]);
 
 // A PO line still owes us stock until it is received (or cancelled).
 const OPEN_PO_STATUSES = { $nin: ["received", "cancelled"] };
+
+// The four Zoho price lists the Price Monitoring page shows, keyed by the
+// snapshot field suffix. Expected PRICE order (user-confirmed 2026-09-15):
+// SVIP and WholeSale each sit at or below VIP, which sits at or below
+// Platinum — but SVIP vs WholeSale has NO fixed order (either may be the
+// cheaper of the two).
+const PRICE_LISTS = {
+  platinum: "2591985000001439015",
+  vip: "2591985000000103001",
+  svip: "2591985000078196985",
+  wholesale: "2591985000000103011",
+};
+const PRICES_VIEW_URL =
+  "https://analyticsapi.zoho.com/restapi/v2/workspaces/1404913000003936002/views/1404913000003936194/data";
+// Rates that mean "not really priced yet" — pushed as stand-ins during the
+// 2026-09 price update. They render, but the health flags ignore them.
+const PRICE_PLACEHOLDERS = new Set([9999.99, 9000, 8888, 7777, 7000, 6000]);
 
 // Sales buckets, in days. 90 is the outer window and the one actually read;
 // the shorter ones are counted from the same rows.
@@ -108,10 +142,17 @@ async function main() {
   const db = await connectToDatabase();
 
   // ── 1. the universe, with its attributes ──────────────────────────
+  // Criteria matches stay in — they become the Archive bucket at build.
   const attributes = await stage("attributes", () => fetchItemAttributes(UNIVERSE));
   const attrById = new Map(attributes.map((r) => [r["Item ID"], r]));
   const itemIds = [...attrById.keys()];
-  log(`  items:      ${itemIds.length}`);
+  log(`  items:      ${itemIds.length} active`);
+
+  // Manual archive / keep overrides.
+  const overrideByItem = new Map(
+    (await db.collection(ARCHIVE_COLLECTION).find({}).toArray()).map((d) => [String(d.itemId), d.mode]),
+  );
+  log(`  overrides:  ${overrideByItem.size} manual archive/keep entries`);
 
   // ── 2. live stock ─────────────────────────────────────────────────
   const details = await stage("stock", () => fetchItemDetails(itemIds));
@@ -125,7 +166,7 @@ async function main() {
   log(`  stock:      ${details.length}`);
 
   // ── 3. collection tags ────────────────────────────────────────────
-  const { collectionsByItem, groupByCollection } = await stage("collections", async () => {
+  const { collectionsByItem, groupByCollection, accessoryItemIds } = await stage("collections", async () => {
     const groups = await db.collection(COLLECTION_GROUPS).find({}).toArray();
     const groupByCollection = new Map();
     for (const g of groups) {
@@ -141,9 +182,17 @@ async function main() {
         collectionsByItem.get(id).push(c.title);
       }
     }
-    return { collectionsByItem, groupByCollection };
+    // The accessories business keeps its own collection set — membership
+    // there marks an item as an accessory even when its Classification is
+    // blank. Kept separate from collectionsByItem so accessory titles never
+    // leak into the spare-parts Collections filter options.
+    const accessoryItemIds = new Set();
+    for (const c of await db.collection("accessoryCollections").find({}).toArray()) {
+      for (const id of await resolveCollectionItemIds(c)) accessoryItemIds.add(id);
+    }
+    return { collectionsByItem, groupByCollection, accessoryItemIds };
   });
-  log(`  tagged:     ${collectionsByItem.size} items belong to a collection`);
+  log(`  tagged:     ${collectionsByItem.size} items belong to a collection · ${accessoryItemIds.size} in accessory collections`);
 
   // ── 4. sales, one read for every bucket ───────────────────────────
   const sales = await stage("sales", async () => {
@@ -210,6 +259,46 @@ async function main() {
     return { productBySku, poBySku };
   });
 
+  // ── 5b. price-list rates ──────────────────────────────────────────
+  // One whole-view Analytics read for all four lists; getViewData returns
+  // an error BODY (not a throw) on failure, so validate and retry once
+  // after the rate-limit window.
+  const prices = await stage("prices", async () => {
+    const idsIn = Object.values(PRICE_LISTS).map((v) => `'${v}'`).join(",");
+    const url =
+      `${PRICES_VIEW_URL}?CONFIG=` +
+      encodeURIComponent(
+        JSON.stringify({
+          responseFormat: "json",
+          selectedColumns: ["PriceList ID", "Product ID", "PriceList Rate"],
+          criteria: `"PriceList ID" IN (${idsIn})`,
+        }),
+      );
+    let priceRows = await getViewData(url);
+    if (!Array.isArray(priceRows)) {
+      log(`  prices:     first read failed (${JSON.stringify(priceRows).slice(0, 120)}) — waiting 65s`);
+      await new Promise((r) => setTimeout(r, 65000));
+      priceRows = await getViewData(url);
+    }
+    if (!Array.isArray(priceRows)) throw new Error("prices view read failed twice");
+    const keyByList = new Map(Object.entries(PRICE_LISTS).map(([k, v]) => [v, k]));
+    // "AUD 1,234.56" or a bare number — strip to the digits.
+    const money = (raw) => {
+      const n = parseFloat(String(raw == null ? "" : raw).replace(/[^0-9.]/g, ""));
+      return Number.isFinite(n) ? n : null;
+    };
+    const byItem = new Map();
+    for (const r of priceRows) {
+      const k = keyByList.get(String(r["PriceList ID"]));
+      if (!k) continue;
+      const pid = String(r["Product ID"]);
+      if (!byItem.has(pid)) byItem.set(pid, {});
+      byItem.get(pid)[k] = money(r["PriceList Rate"]);
+    }
+    log(`  prices:     ${priceRows.length} list rows → ${byItem.size} items with a rate`);
+    return byItem;
+  });
+
   // ── 6. build the rows ─────────────────────────────────────────────
   const now = startedAt.getTime();
   const rows = [];
@@ -219,6 +308,9 @@ async function main() {
     if (!d) continue;
 
     const sku = String(a.SKU || d.sku || "").trim();
+    // An item with no SKU is not a stock-keeping unit — bookkeeping rows
+    // ("credit", "startrack shipment refund", …) all lack one.
+    if (!sku) continue;
     const key = skuKey(sku);
     const classification = String(a.Classification || "").trim();
     const s = sales.get(id);
@@ -237,14 +329,58 @@ async function main() {
     const openPoQty = po ? po.qty : 0;
 
     const outOfStock = available <= 0;
+
+    // Archive bucket: the shared name criteria, or a manual "archive"
+    // mark; a manual "keep" pins the item live regardless of criteria.
+    const override = overrideByItem.get(id);
+    const archived =
+      override === "archive" ||
+      (override !== "keep" && isNoiseName(a["Item Name"] || d.name));
+
+    // Price health. Placeholder rates are shown but ignored by the flags.
+    // Expected order: SVIP ≤ VIP, WholeSale ≤ VIP, VIP ≤ Platinum (and,
+    // when VIP is absent, SVIP/WholeSale ≤ Platinum directly) — SVIP vs
+    // WholeSale deliberately unordered: either may be the cheaper.
+    const pr = prices.get(id) || {};
+    const purchase = num(a["Purchase Price"]);
+    const rateChain = [pr.wholesale, pr.svip, pr.vip, pr.platinum];
+    const realRates = rateChain.filter((v) => v != null && !PRICE_PLACEHOLDERS.has(v));
+    const priceMissing = rateChain.some((v) => v == null);
+    const pricePlaceholder = rateChain.some((v) => v != null && PRICE_PLACEHOLDERS.has(v));
+    const priceBelowCost = purchase > 0 && realRates.some((v) => v < purchase);
+    const real = (v) => (v != null && !PRICE_PLACEHOLDERS.has(v) ? v : null);
+    const rSvip = real(pr.svip), rWs = real(pr.wholesale), rVip = real(pr.vip), rPlat = real(pr.platinum);
+    const lte = (a2, b2) => a2 == null || b2 == null || a2 <= b2 + 1e-9;
+    const priceOrderBroken = !(
+      lte(rSvip, rVip) && lte(rWs, rVip) && lte(rVip, rPlat) &&
+      lte(rSvip, rPlat) && lte(rWs, rPlat)
+    );
+    // The pricing-formula verdict for cost-priced items (±5% tolerance).
+    const ruleEval = evaluatePriceRule({
+      name: a["Item Name"] || d.name,
+      category: product && product.category ? product.category.name : null,
+      classification,
+      quality: product && product.quality ? product.quality.name : null,
+      purchasePrice: purchase,
+      priceWholesale: pr.wholesale,
+      priceSvip: pr.svip,
+      priceVip: pr.vip,
+      pricePlatinum: pr.platinum,
+    });
     rows.push({
       snapshotDate,
       itemId: id,
       sku,
       name: String(a["Item Name"] || d.name || ""),
       // Accessories and spare parts are separate businesses and get
-      // separate views; blanks fall to parts by default.
-      scope: ACCESSORY_CLASSIFICATIONS.has(classification) ? "accessory" : "parts",
+      // separate views. Classification, accessory-collection membership
+      // and accessory brand all mark an accessory; the rest is parts.
+      scope:
+        ACCESSORY_CLASSIFICATIONS.has(classification) ||
+        accessoryItemIds.has(id) ||
+        ACCESSORY_BRANDS.has(String(a.Brand || "").trim())
+          ? "accessory"
+          : "parts",
       classification,
       location: String(a.Location || itemLocation(d) || ""),
       preferVendor: String(a["Prefer Vendor"] || ""),
@@ -279,15 +415,32 @@ async function main() {
       openPoLines: po ? po.lines : 0,
       earliestPoDate: po ? po.earliest : null,
 
+      // The four price-list rates (null = no entry in that list), and the
+      // health flags the Price Monitoring tiles count.
+      pricePlatinum: pr.platinum == null ? null : pr.platinum,
+      priceVip: pr.vip == null ? null : pr.vip,
+      priceSvip: pr.svip == null ? null : pr.svip,
+      priceWholesale: pr.wholesale == null ? null : pr.wholesale,
+      priceMissing,
+      pricePlaceholder,
+      priceBelowCost,
+      priceOrderBroken,
+      // The formula family, expected rates, and the ±5% verdict — null /
+      // false when the item has no cost price.
+      priceRule: ruleEval.rule,
+      priceExpected: ruleEval.expected,
+      priceRuleBroken: ruleEval.broken,
+
       // The flags the dashboard tiles count.
       outOfStock,
       outOfStockCovered: outOfStock && openPoQty > 0,
       outOfStockUncovered: outOfStock && openPoQty <= 0,
       belowMonthCover: available < units[30],
       stale: units[STALE_DAYS] === 0,
-      // No sales and no stock in the whole window: catalogue noise, hidden
-      // by default rather than deleted.
-      dormant: units[90] === 0 && available <= 0,
+      // The Archive bucket: criteria matches + manual marks (see above).
+      // NOT the old "no sales, no stock" meaning — those stay in All Items.
+      archived,
+      archivedReason: archived ? (override === "archive" ? "manual" : "criteria") : null,
       daysOfCover: rate30 > 0 ? Math.round((available / rate30) * 10) / 10 : null,
     });
   }
@@ -305,7 +458,13 @@ async function main() {
     log(`      ...with NO PO          ${count((r) => r.outOfStockUncovered, list)}`);
     log(`    under a month's cover    ${count((r) => r.belowMonthCover, list)}`);
     log(`    no sales in ${STALE_DAYS} days      ${count((r) => r.stale, list)}`);
-    log(`    dormant (no sales/stock) ${count((r) => r.dormant, list)}`);
+    log(`    archive (criteria)       ${count((r) => r.archivedReason === "criteria", list)}`);
+    log(`    archive (manual)         ${count((r) => r.archivedReason === "manual", list)}`);
+    log(`    price: missing a list    ${count((r) => r.priceMissing, list)}`);
+    log(`    price: placeholder       ${count((r) => r.pricePlaceholder, list)}`);
+    log(`    price: below cost        ${count((r) => r.priceBelowCost, list)}`);
+    log(`    price: order broken      ${count((r) => r.priceOrderBroken, list)}`);
+    log(`    price: off formula ±5%   ${count((r) => r.priceRuleBroken, list)}`);
   }
 
   const durationMs = Date.now() - startedAt.getTime();
