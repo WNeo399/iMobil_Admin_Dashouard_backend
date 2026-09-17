@@ -207,6 +207,9 @@ async function resolveModel(db, modelId) {
   return db.collection("sqt_models").findOne({ _id: new ObjectId(modelId) });
 }
 
+// Roles allowed to use the shop-group filter on /list and /counts.
+const GROUP_FILTER_ROLES = ["admin", "techelite-admin"];
+
 // ── Shop data scoping ────────────────────────────────────────────────────────
 // req.user.accessibleShopIds is null for unscoped roles (Admin / iMobile /
 // TechElite) and an array of ObjectIds for shop roles. When scoped, list/count
@@ -323,6 +326,23 @@ router.get(
         query.shopId = new ObjectId(shopId);
       }
 
+      // Shop-group filter — Admin + TechElite Admin (the group is an
+      // admin-side lens). A specific shopId is narrower and wins. Resolves
+      // the group's member shops and constrains to them; an empty group
+      // matches nothing.
+      if (
+        !query.shopId &&
+        req.user && GROUP_FILTER_ROLES.includes(req.user.role) &&
+        req.query.groupId && ObjectId.isValid(req.query.groupId)
+      ) {
+        const members = await db
+          .collection("sqt_shops")
+          .find({ groupId: new ObjectId(req.query.groupId) })
+          .project({ _id: 1 })
+          .toArray();
+        query.shopId = { $in: members.map((s) => s._id) };
+      }
+
       // Return-tracking rollup filter — drives the BER sub-nodes in the
       // sidebar tree (Return Pending / Returned / No Return). Meaningful on
       // terminal statuses only; other rows have no summaryStatus and simply
@@ -399,6 +419,20 @@ router.get(
       const match = {};
       if (req.query.shopId && ObjectId.isValid(req.query.shopId)) {
         match.shopId = new ObjectId(req.query.shopId);
+      }
+      // Shop-group filter (Admin + TechElite Admin) — same rule as /list,
+      // so the tree counts match exactly what the filtered table shows.
+      if (
+        !match.shopId &&
+        req.user && GROUP_FILTER_ROLES.includes(req.user.role) &&
+        req.query.groupId && ObjectId.isValid(req.query.groupId)
+      ) {
+        const members = await db
+          .collection("sqt_shops")
+          .find({ groupId: new ObjectId(req.query.groupId) })
+          .project({ _id: 1 })
+          .toArray();
+        match.shopId = { $in: members.map((s) => s._id) };
       }
       applyShopScope(req, match);
       // Hide admin-only statuses from shop-scoped users so the totals match
