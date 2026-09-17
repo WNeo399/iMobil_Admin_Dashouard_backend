@@ -316,6 +316,63 @@ router.get("/devices", DEVICE_VIEW, async function (req, res) {
   }
 });
 
+// ── GET /consignment/devices/batches ────────────────────────────────
+// The assignment batches: every Assign stamps one batchId across the
+// devices sent together, so a batch IS a send to a shop. Newest first;
+// shop logins see only their own. EX_DB-era rows without a batchId are
+// simply not listed.
+router.get("/devices/batches", DEVICE_VIEW, async function (req, res) {
+  try {
+    const db = await connectToDatabase();
+    const match = { batchId: { $nin: [null, ""] } };
+    const scope = shopScope(req);
+    if (scope) match.shopId = scope;
+    else if (req.query.shopId) {
+      const sid = oid(req.query.shopId);
+      if (sid) match.shopId = sid;
+    }
+    const rows = await db
+      .collection(DEVICES)
+      .aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: "$batchId",
+            batchNo: { $first: "$batchNo" },
+            shopId: { $first: "$shopId" },
+            count: { $sum: 1 },
+            assignedAt: { $min: "$assignedAt" },
+            assignedBy: { $first: "$assignedBy" },
+          },
+        },
+        { $sort: { assignedAt: -1 } },
+        { $limit: 300 },
+      ])
+      .toArray();
+    const shopIds = [...new Set(rows.map((r) => String(r.shopId)))].map((s) => oid(s)).filter(Boolean);
+    const shops = shopIds.length
+      ? await db.collection(SHOPS).find({ _id: { $in: shopIds } }).project({ name: 1 }).toArray()
+      : [];
+    const shopName = {};
+    for (const s of shops) shopName[String(s._id)] = s.name;
+    return res.json({
+      success: true,
+      batches: rows.map((r) => ({
+        batchId: r._id,
+        batchNo: r.batchNo || "",
+        shopId: String(r.shopId),
+        shopName: shopName[String(r.shopId)] || "",
+        count: r.count,
+        assignedAt: r.assignedAt,
+        assignedBy: r.assignedBy || "",
+      })),
+    });
+  } catch (e) {
+    console.error("consignment batches error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load batches" });
+  }
+});
+
 // Resolve IMEIs / serials against the Refurbished Device stock register
 // (admin). Consignment draws from the same pool a sales order does: our own
 // register, not the ExEngine database — the rule for what may go out is the
@@ -429,6 +486,17 @@ router.post("/devices/assign", ASSIGN, async function (req, res) {
     const now = new Date();
     const by = actorOf(req);
     const batchId = new ObjectId().toHexString();
+    // A human-friendly batch number (CS-10001+), same scheme as supply
+    // batches. Denormalized onto every device doc — batches have no
+    // collection of their own.
+    const lastNo = await db
+      .collection(DEVICES)
+      .find({ batchSeq: { $gt: 0 } })
+      .sort({ batchSeq: -1 })
+      .limit(1)
+      .toArray();
+    const batchSeq = Math.max((lastNo[0] && lastNo[0].batchSeq) || 0, 10000) + 1;
+    const batchNo = `CS-${batchSeq}`;
     const docs = [];
     for (let i = 0; i < list.length; i++) {
       const d = list[i] || {};
@@ -442,7 +510,7 @@ router.post("/devices/assign", ASSIGN, async function (req, res) {
         return res.status(400).json({ success: false, message: `Device ${i + 1} (${stockId}): a valid Shop Price is required.` });
       }
       docs.push({
-        shopId, batchId,
+        shopId, batchId, batchSeq, batchNo,
         stockId,
         imei: String(d.imei || "").trim(),
         // Back-reference to the stock register record the device came
