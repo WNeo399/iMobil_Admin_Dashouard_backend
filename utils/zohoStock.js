@@ -214,6 +214,8 @@ async function fetchItemDetails(
   return batches.flat();
 }
 
+const { imageIdOf, imageUrlFromId } = require("./productImage");
+
 // Read the shelf out of Zoho's custom fields.
 function itemLocation(item) {
   const field = (item.custom_fields || []).find((c) => c.label === "Location");
@@ -243,6 +245,9 @@ async function fetchStockShapedItems(itemIds, options = {}) {
       // Zoho's reorder level — maintained for accessories (the Accessories
       // page shows it as "Reorder Point"); parts don't use it.
       reorderLevel: Number(item.reorder_level || 0),
+      // The main product image, as a public store URL (null = no image).
+      // Comes free with the item details — no per-row image call.
+      imageUrl: imageUrlFromId(imageIdOf(item)),
     }))
     .sort((a, b) => a.productName.localeCompare(b.productName));
 }

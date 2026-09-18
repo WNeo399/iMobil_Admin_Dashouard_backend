@@ -30,6 +30,9 @@ const {
 } = require("../utils/zohoStock");
 const { getViewData } = require("../utils/zohoRequest");
 const { isNoiseName, ARCHIVE_COLLECTION } = require("../utils/stockUniverse");
+// Zoho's id for the item's main image; only the id is stored, routes build
+// the URL when a page reads it. null = the item has no image.
+const { imageIdOf } = require("../utils/productImage");
 const { evaluatePriceRule } = require("../utils/priceRules");
 
 const ITEMS_DAILY = "imb_stock_daily";
@@ -397,6 +400,7 @@ async function main() {
       category: product && product.category ? product.category.name : null,
       quality: product && product.quality ? product.quality.name : null,
       inCatalogue: !!product,
+      imageId: imageIdOf(d),
 
       available,
       stockOnHand: num(d.stock_on_hand),
@@ -483,6 +487,7 @@ async function main() {
       outOfStockUncovered: count((r) => r.outOfStockUncovered),
       belowMonthCover: count((r) => r.belowMonthCover),
       stale: count((r) => r.stale),
+      noImage: count((r) => !r.imageId),
     },
     timings,
     applied: APPLY,

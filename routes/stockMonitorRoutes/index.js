@@ -26,9 +26,11 @@ const {
   getViewData,
   handleZohoInventoryRequest,
   handleZohoInventoryPutRequest,
+  handleZohoInventoryMultipartPostRequest,
   refreshToken,
 } = require("../../utils/zohoRequest");
-const { mapWithLimit } = require("../../utils/zohoStock");
+const { mapWithLimit, fetchItemDetails } = require("../../utils/zohoStock");
+const { imageIdOf, imageUrlFromId } = require("../../utils/productImage");
 
 const DAILY = "imb_stock_daily";
 const RUNS = "imb_stock_runs";
@@ -65,9 +67,19 @@ const FILTERS = {
   priceOrderBroken: { priceOrderBroken: true },
   // Cost-priced items whose rates sit >5% off the pricing formula.
   priceRuleBroken: { priceRuleBroken: true },
+  // Missing product image (the Missing Images page). $type "null" matches an
+  // explicit null only: rows from snapshots written before imageId existed
+  // have no field at all and must not read as "no image".
+  noImage: { imageId: { $type: "null" } },
+  noImageInStock: { imageId: { $type: "null" }, available: { $gt: 0 } },
+  noImageOutOfStock: { imageId: { $type: "null" }, available: { $lte: 0 } },
   // The Archive bucket — criteria matches + manual marks.
   archived: { archived: true },
+  // Its no-image slice: the Missing Images page's "archived — view".
+  noImageArchived: { archived: true, imageId: { $type: "null" } },
 };
+// Filters that look inside the Archive bucket; every other view hides it.
+const ARCHIVE_FILTERS = new Set(["archived", "noImageArchived"]);
 
 const SORTABLE = new Set([
   "sku", "name", "location", "available", "units7", "units14", "units30",
@@ -149,8 +161,8 @@ function buildMatch(req, snapshotDate) {
   Object.assign(match, FILTERS[filter]);
 
   // The Archive bucket (criteria matches + manual marks) is hidden from
-  // every view except its own filter.
-  if (filter !== "archived") match.archived = { $ne: true };
+  // every view except its own filters.
+  if (!ARCHIVE_FILTERS.has(filter)) match.archived = { $ne: true };
 
   return { match, filter };
 }
@@ -239,6 +251,13 @@ router.get("/summary", VIEW, async (req, res, next) => {
             priceRuleBroken: { $sum: { $cond: ["$priceRuleBroken", 1, 0] } },
             priceBelowCost: { $sum: { $cond: ["$priceBelowCost", 1, 0] } },
             priceOrderBroken: { $sum: { $cond: ["$priceOrderBroken", 1, 0] } },
+            noImage: { $sum: { $cond: [{ $eq: [{ $type: "$imageId" }, "null"] }, 1, 0] } },
+            noImageInStock: {
+              $sum: { $cond: [{ $and: [{ $eq: [{ $type: "$imageId" }, "null"] }, { $gt: ["$available", 0] }] }, 1, 0] },
+            },
+            noImageOutOfStock: {
+              $sum: { $cond: [{ $and: [{ $eq: [{ $type: "$imageId" }, "null"] }, { $lte: ["$available", 0] }] }, 1, 0] },
+            },
             unitsOnHand: { $sum: { $cond: [{ $gt: ["$available", 0] }, "$available", 0] } },
           },
         },
@@ -249,7 +268,16 @@ router.get("/summary", VIEW, async (req, res, next) => {
       .collection(DAILY)
       .aggregate([
         { $match: { ...base, ...baseFilterMatch(req) } },
-        { $group: { _id: null, all: { $sum: 1 }, archived: { $sum: { $cond: ["$archived", 1, 0] } } } },
+        {
+          $group: {
+            _id: null,
+            all: { $sum: 1 },
+            archived: { $sum: { $cond: ["$archived", 1, 0] } },
+            noImageArchived: {
+              $sum: { $cond: [{ $and: ["$archived", { $eq: [{ $type: "$imageId" }, "null"] }] }, 1, 0] },
+            },
+          },
+        },
       ])
       .toArray();
 
@@ -299,6 +327,7 @@ router.get("/summary", VIEW, async (req, res, next) => {
         ...stripId(tiles),
         all: (totals && totals.all) || 0,
         archived: (totals && totals.archived) || 0,
+        noImageArchived: (totals && totals.noImageArchived) || 0,
       },
       options: { categories, collections, vendors, qualities },
     });
@@ -336,7 +365,7 @@ router.get("/items", VIEW, async (req, res, next) => {
             daysOfCover: 1, purchasePrice: 1,
             pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1,
             priceMissing: 1, pricePlaceholder: 1, priceBelowCost: 1, priceOrderBroken: 1,
-            priceRule: 1, priceExpected: 1, priceRuleBroken: 1,
+            priceRule: 1, priceExpected: 1, priceRuleBroken: 1, imageId: 1,
           },
         })
         // _id breaks ties so paging can't repeat or skip a row when many
@@ -368,6 +397,9 @@ router.get("/items", VIEW, async (req, res, next) => {
     } catch (e) {
       // The badge is decoration — never fail the list for it.
     }
+
+    // The snapshot stores only the image id; the page gets a usable URL.
+    for (const r of rows) r.imageUrl = imageUrlFromId(r.imageId);
 
     return res.json({ success: true, snapshotDate, filter, page, pageSize, total, rows });
   } catch (error) {
@@ -619,6 +651,138 @@ router.post("/item/:itemId/archived", EDIT, async (req, res, next) => {
   }
 });
 
+// One item's itemdetails record, or null when Zoho says it no longer
+// exists (code 2006 — deleted since the snapshot was taken).
+async function readItemDetail(itemId) {
+  try {
+    const [item] = await fetchItemDetails([itemId]);
+    return item && String(item.item_id) === itemId ? item : null;
+  } catch (e) {
+    if (/Resource does not exist|"code":2006/.test(String(e && e.message))) return null;
+    throw e;
+  }
+}
+const GONE = { success: false, message: "This item no longer exists in Zoho" };
+
+// ── POST /stock-monitor/item/:itemId/image/recheck ──────────────────
+// The Missing Images page's per-row re-check: one Zoho read of the item,
+// its main image id mirrored into today's snapshot so a fixed item leaves
+// the "no image" list now instead of after tonight's run. Same itemdetails
+// endpoint as the nightly job — GET /items/{id} has no image_document_id,
+// and reading it as "no image" would wrongly put items back on the list.
+router.post("/item/:itemId/image/recheck", VIEW, async (req, res) => {
+  const itemId = String(req.params.itemId || "").trim();
+  if (!/^[0-9]{6,25}$/.test(itemId)) {
+    return res.status(400).json({ success: false, message: "Bad item id" });
+  }
+  try {
+    const item = await readItemDetail(itemId);
+    if (!item) return res.status(404).json(GONE);
+    const imageId = imageIdOf(item);
+    const db = await connectToDatabase();
+    const snapshotDate = await latestSnapshotDate(db);
+    if (snapshotDate) {
+      await db.collection(DAILY).updateMany({ snapshotDate, itemId }, { $set: { imageId } });
+    }
+    return res.json({ success: true, itemId, imageId, imageUrl: imageUrlFromId(imageId) });
+  } catch (error) {
+    console.error("Image re-check error:", error.message);
+    return res.status(502).json({ success: false, message: "Could not read the item from Zoho" });
+  }
+});
+
+// ── POST /stock-monitor/item/:itemId/images ─────────────────────────
+// Upload product images to the item in Zoho Inventory (Missing Images
+// page). multipart/form-data, one or more files under "images"; the first
+// file becomes the main image when the item has none yet. Zoho's limits:
+// gif/png/jpeg/bmp/webp, 7 MB each. Three Zoho calls: read the item, the
+// upload, read it back — the new main image id is mirrored into today's
+// snapshot so the page (and the no-image counts) update at once.
+const multer = require("multer");
+const FormData = require("form-data");
+const IMAGE_MIME = /^image\/(gif|png|jpe?g|bmp|webp)$/i;
+const MAX_IMAGE_BYTES = 7 * 1024 * 1024;
+const MAX_IMAGES = 10;
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_IMAGE_BYTES, files: MAX_IMAGES },
+  fileFilter: (req, file, cb) =>
+    IMAGE_MIME.test(file.mimetype)
+      ? cb(null, true)
+      : cb(Object.assign(new Error(`${file.originalname}: only gif, png, jpeg, bmp or webp images`), { badType: true })),
+}).array("images", MAX_IMAGES);
+
+function uploadErrorMessage(err) {
+  if (err.badType) return err.message;
+  if (err.code === "LIMIT_FILE_SIZE") return "Each image must be 7 MB or smaller";
+  if (err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE") {
+    return `Up to ${MAX_IMAGES} images at a time`;
+  }
+  return "Could not read the uploaded images";
+}
+
+router.post(
+  "/item/:itemId/images",
+  EDIT,
+  (req, res, next) =>
+    imageUpload(req, res, (err) =>
+      err ? res.status(400).json({ success: false, message: uploadErrorMessage(err) }) : next(),
+    ),
+  async (req, res) => {
+    const itemId = String(req.params.itemId || "").trim();
+    if (!/^[0-9]{6,25}$/.test(itemId)) {
+      return res.status(400).json({ success: false, message: "Bad item id" });
+    }
+    const files = req.files || [];
+    if (!files.length) {
+      return res.status(400).json({ success: false, message: "No images attached" });
+    }
+    try {
+      // Only claim the main image when the item has none — uploading more
+      // pictures to an item that has one must not replace it.
+      const before = await readItemDetail(itemId);
+      if (!before) return res.status(404).json(GONE);
+      const url =
+        `https://www.zohoapis.com/inventory/v1/items/${encodeURIComponent(itemId)}/images` +
+        `?organization_id=${ZOHO_ORG_ID}` +
+        (imageIdOf(before) ? "" : "&update_primary_image=true");
+      // A builder, not a form: a retry after a token refresh needs a fresh stream.
+      const buildForm = () => {
+        const form = new FormData();
+        for (const f of files) {
+          form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });
+        }
+        return form;
+      };
+      const resp = await handleZohoInventoryMultipartPostRequest(url, buildForm);
+      if (!resp || resp.code !== 0) {
+        return res.status(502).json({
+          success: false,
+          message: `Zoho did not accept the images${resp && resp.message ? `: ${resp.message}` : ""}`,
+        });
+      }
+
+      const after = await readItemDetail(itemId);
+      const imageId = imageIdOf(after);
+      const db = await connectToDatabase();
+      const snapshotDate = await latestSnapshotDate(db);
+      if (snapshotDate) {
+        await db.collection(DAILY).updateMany({ snapshotDate, itemId }, { $set: { imageId } });
+      }
+      return res.json({
+        success: true,
+        itemId,
+        uploaded: files.length,
+        imageId,
+        imageUrl: imageUrlFromId(imageId),
+      });
+    } catch (error) {
+      console.error("Image upload error:", error.message);
+      return res.status(502).json({ success: false, message: "Could not upload the images to Zoho" });
+    }
+  },
+);
+
 // ── GET /stock-monitor/item/:itemId/prices ──────────────────────────
 // The four price-list rates for one item, read live from the Analytics
 // prices view — the Price Monitoring page's "check live" button. One call;
@@ -708,6 +872,24 @@ function priceHealthFlags(row) {
   };
 }
 
+// Per-product lock for the snapshot mirror below. Pushes for the same
+// product go to Zoho in parallel (that call is the slow part); only the
+// quick read → recompute flags → write runs one at a time, or two pushes
+// would each compute flags without the other's new rate. In-process, so it
+// assumes a single backend instance.
+const mirrorLocks = new Map();
+// Increases with every mirror write, so the page can tell which of several
+// in-flight responses carries the newest flags (they can arrive out of order).
+let mirrorSeq = 0;
+function withItemLock(itemId, fn) {
+  const prev = mirrorLocks.get(itemId) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.catch(() => {});
+  mirrorLocks.set(itemId, tail);
+  tail.then(() => { if (mirrorLocks.get(itemId) === tail) mirrorLocks.delete(itemId); });
+  return run;
+}
+
 router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (req, res) => {
   const itemId = String(req.params.itemId || "").trim();
   if (!/^[0-9]{6,25}$/.test(itemId)) {
@@ -742,8 +924,8 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
     // Mirror into today's snapshot and recompute this row's flags.
     const db = await connectToDatabase();
     const snapshotDate = await latestSnapshotDate(db);
-    let flags = null;
-    if (snapshotDate) {
+    const mirrored = await withItemLock(itemId, async () => {
+      if (!snapshotDate) return null;
       const row = await db.collection(DAILY).findOne(
         { snapshotDate, itemId },
         {
@@ -753,20 +935,24 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
           },
         },
       );
-      if (row) {
-        row[field] = rounded;
-        flags = {
-          ...priceHealthFlags(row),
-          // The formula verdict moves with the new rate too.
-          priceRuleBroken: evaluatePriceRule(row).broken,
-        };
-        await db.collection(DAILY).updateMany(
-          { snapshotDate, itemId },
-          { $set: { [field]: rounded, ...flags } },
-        );
-      }
-    }
-    return res.json({ success: true, list, rate: rounded, flags });
+      if (!row) return null;
+      row[field] = rounded;
+      const next = {
+        ...priceHealthFlags(row),
+        // The formula verdict moves with the new rate too.
+        priceRuleBroken: evaluatePriceRule(row).broken,
+      };
+      await db.collection(DAILY).updateMany(
+        { snapshotDate, itemId },
+        { $set: { [field]: rounded, ...next } },
+      );
+      return { flags: next, seq: ++mirrorSeq };
+    });
+    return res.json({
+      success: true, list, rate: rounded,
+      flags: mirrored ? mirrored.flags : null,
+      flagsSeq: mirrored ? mirrored.seq : null,
+    });
   } catch (error) {
     console.error("Stock monitor price push error:", error && error.message);
     return res.status(502).json({ success: false, message: "Failed to push the price to Zoho" });

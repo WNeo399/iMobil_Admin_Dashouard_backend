@@ -295,13 +295,17 @@ async function handleZohoInventoryPostRequest(url, params) {
 // Same token-refresh dance as handleZohoInventoryPostRequest, but POSTs a
 // multipart/form-data body (built with the `form-data` package). Used for
 // endpoints like /salesorders/:id/attachment that accept file uploads.
+//
+// Pass a function that builds the FormData where you can: a form-data body
+// is a stream, spent by the first send, so the retry after a token refresh
+// needs a fresh one. A plain FormData still works for the first attempt.
 async function handleZohoInventoryMultipartPostRequest(url, formData) {
-  const formHeaders =
-    formData && typeof formData.getHeaders === "function"
-      ? formData.getHeaders()
-      : {};
+  const build = typeof formData === "function" ? formData : () => formData;
 
-  const fetchData = async (requestUrl, body) => {
+  const fetchData = async (requestUrl) => {
+    const body = build();
+    const formHeaders =
+      body && typeof body.getHeaders === "function" ? body.getHeaders() : {};
     try {
       const response = await axios.post(requestUrl, body, {
         headers: {
@@ -323,7 +327,7 @@ async function handleZohoInventoryMultipartPostRequest(url, formData) {
   };
 
   try {
-    let data = await fetchData(url, formData);
+    let data = await fetchData(url);
 
     if (isTokenExpired(data)) {
       console.log("Token Expired! Refreshing...");
@@ -331,7 +335,7 @@ async function handleZohoInventoryMultipartPostRequest(url, formData) {
       if (!newAccessToken) {
         throw new Error("Failed to refresh token.");
       }
-      data = await fetchData(url, formData);
+      data = await fetchData(url);
     }
     return data;
   } catch (error) {
