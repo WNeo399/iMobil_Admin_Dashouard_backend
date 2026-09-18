@@ -1,14 +1,13 @@
 // Inbound shipment webhook from Zoho Flow.
 //
 // When a sales order ships, Zoho Flow calls this endpoint with the delivery
-// method + tracking number (plus the SO number and our caseId/ticketId, which
-// it reads from the SO's custom fields). We attach those to the matching
+// method + tracking number (plus the SO number and our caseId, which it
+// reads from the SO's custom fields). We attach those to the matching
 // zohoOrders entry so the SQT case's "Sent Parts" tab can show them.
 //
 // Params (query string OR body — Zoho Flow sends query params):
 //   soNumber        required — the Zoho salesorder_number
 //   caseId          our case id (set as a custom field when we sent the parts)
-//   ticketId        RepairDesk ticket id (fallback match)
 //   shippingMethod  delivery method
 //   trackingNumber  tracking number
 //   shippmentStatus shipment status (Zoho's spelling; "status" also accepted)
@@ -47,7 +46,6 @@ async function handleShipment(req, res) {
 
     const soNumber = pick(req, "soNumber", "salesorder_number");
     const caseId = pick(req, "caseId");
-    const ticketId = pick(req, "ticketId");
     const shippingMethod = pick(req, "shippingMethod", "delivery_method");
     const trackingNumber = pick(req, "trackingNumber", "tracking_number");
     const shipmentStatus = pick(req, "shippmentStatus", "shipmentStatus", "status");
@@ -80,17 +78,16 @@ async function handleShipment(req, res) {
       returnDocument: "after",
     };
 
-    // Prefer the case identified by caseId (a custom field on the SO); fall
-    // back to ticketId; the SO number is globally unique, so if neither lines
-    // up we still match on it alone.
+    // Prefer the case identified by caseId (a custom field on the SO); the SO
+    // number is globally unique, so if that doesn't line up we still match on
+    // it alone.
     const scoped = { ...orderFilter };
     if (caseId) scoped.caseId = caseId;
-    else if (ticketId) scoped.repairDeskTicketId = ticketId;
 
     let result = await col.findOneAndUpdate(scoped, { $set: set }, opts);
     let updated = result ? result.value || result : null;
 
-    if (!updated && (caseId || ticketId)) {
+    if (!updated && caseId) {
       result = await col.findOneAndUpdate(orderFilter, { $set: set }, opts);
       updated = result ? result.value || result : null;
     }

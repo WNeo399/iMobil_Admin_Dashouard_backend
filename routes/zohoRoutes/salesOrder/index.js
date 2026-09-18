@@ -5,7 +5,6 @@
 //
 // Compared to sendParts this endpoint:
 //   - does NOT touch any case / Mongo state
-//   - does NOT sync RepairDesk
 //   - does NOT enforce a particular pricebook/template/customer
 //   - just translates a normalized payload → Zoho's expected shape, hits
 //     the API, and returns Zoho's response.

@@ -79,9 +79,6 @@ var twilioRouter = require('./routes/twilioRoutes/index');
 // JWT); security via CORS allowlist + origin check + rate limit +
 // honeypot, all configured inside the router.
 var widgetRouter = require('./routes/widgetRoutes/index');
-// TEMPORARY: external-integration endpoint (no auth). Remove together with
-// routes/_tempUpdateStatusByTicket.js when the integration is decommissioned.
-var tempIntegrationRouter = require('./routes/_tempUpdateStatusByTicket');
 // Inbound shipment webhook from Zoho Flow — attaches delivery method +
 // tracking number to the matching sales order on an SQT case. Public (Zoho
 // Flow can't carry our JWT); optional shared secret inside the router.
@@ -117,9 +114,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 app.use('/', indexRouter);
 app.use('/auth', authRouter);
-// TEMPORARY: mounted before the auth-protected routers so /integration/* stays
-// open to the external caller. Remove when the integration is gone.
-app.use(tempIntegrationRouter);
 // Zoho Flow shipment webhook — GET/POST /integration/shipment. Public.
 app.use('/integration/shipment', shipmentWebhookRouter);
 // InFlow sales-order ingestion webhook — GET/POST /integration/inflow. Public

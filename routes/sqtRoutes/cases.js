@@ -6,7 +6,6 @@ const sharp = require("sharp");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { handleZohoInventoryPostRequest } = require("../../utils/zohoRequest");
-const { syncCaseStatus } = require("../../utils/repairDesk");
 const { requirePermission } = require("../../middleware/auth");
 const { notifyOnStatusChange } = require("../../utils/notify");
 const {
@@ -52,7 +51,6 @@ const ZOHO_ORG_ID = "746138234";
 const ZOHO_PRICEBOOK_ID_WHOLESALE = "2591985000000103011";
 const ZOHO_TEMPLATE_ID = "2591985000314129187";
 const ZOHO_CUSTOMFIELD_CASE_ID = "2591985000317492543";
-const ZOHO_CUSTOMFIELD_TICKET_ID = "2591985000317627125";
 
 const COLLECTION = "sqt_cases";
 
@@ -118,16 +116,6 @@ function buildCaseDoc(
   }
   if (body.caseId !== undefined) {
     doc.caseId = body.caseId ? String(body.caseId).trim() : null;
-  }
-  if (body.repairDeskTicketId !== undefined) {
-    doc.repairDeskTicketId = body.repairDeskTicketId
-      ? String(body.repairDeskTicketId).trim()
-      : null;
-  }
-  if (body.repairDeskTicketNumber !== undefined) {
-    doc.repairDeskTicketNumber = body.repairDeskTicketNumber
-      ? String(body.repairDeskTicketNumber).trim()
-      : null;
   }
 
   if (shop !== null) {
@@ -365,6 +353,8 @@ router.get(
         query.$or = [
           { serviceRequestId: re },
           { caseId: re },
+          // Historical: cases created before RepairDesk was retired (Jun 2026)
+          // still carry the shop's RepairDesk ticket number.
           { repairDeskTicketNumber: re },
           { "customer.firstName": re },
           { "customer.lastName": re },
@@ -551,20 +541,10 @@ router.post(
       const db = await connectToDatabase();
       const collection = db.collection(COLLECTION);
 
-      // Uniqueness — serviceRequestId always; caseId / repairDesk IDs when provided
+      // Uniqueness — serviceRequestId always; caseId when provided
       const orClauses = [{ serviceRequestId: String(serviceRequestId).trim() }];
       if (req.body.caseId)
         orClauses.push({ caseId: String(req.body.caseId).trim() });
-      if (req.body.repairDeskTicketId)
-        orClauses.push({
-          repairDeskTicketId: String(req.body.repairDeskTicketId).trim(),
-        });
-      if (req.body.repairDeskTicketNumber)
-        orClauses.push({
-          repairDeskTicketNumber: String(
-            req.body.repairDeskTicketNumber,
-          ).trim(),
-        });
 
       const dup = await collection.findOne({ $or: orClauses });
       if (dup) {
@@ -658,12 +638,7 @@ router.put(
           _id: { $ne: new ObjectId(id) },
         });
       };
-      for (const f of [
-        "serviceRequestId",
-        "caseId",
-        "repairDeskTicketId",
-        "repairDeskTicketNumber",
-      ]) {
+      for (const f of ["serviceRequestId", "caseId"]) {
         const dup = await checkDup(f);
         if (dup) {
           return res.status(409).json({
@@ -841,11 +816,6 @@ router.post(
         console.error("status notify error:", notifyErr);
       }
 
-      // TEMP: mirror the status into RepairDesk. Never blocks the response on
-      // RepairDesk being slow/down — syncCaseStatus catches its own errors.
-      // Remove together with utils/repairDesk.js when RepairDesk is dropped.
-      await syncCaseStatus(updated, status);
-
       return res.json({
         success: true,
         message: "Status updated",
@@ -980,12 +950,6 @@ router.post(
           label: "TE Case ID",
           value: theCase.caseId || "",
         },
-        {
-          customfield_id: ZOHO_CUSTOMFIELD_TICKET_ID,
-          index: 4,
-          label: "TE Ticket ID",
-          value: theCase.repairDeskTicketId || "",
-        },
       ];
 
       const requestBody = {
@@ -1084,16 +1048,6 @@ router.post(
         console.error("sendParts notify error:", notifyErr);
       }
 
-      // TEMP: mirror the status into RepairDesk via the shared helper. Uses
-      // the stored repairDeskTicketId if present, otherwise falls back to a
-      // search-by-caseId. Failures here must not roll back the Zoho/case
-      // update — surface the outcome in the response so the frontend can
-      // warn, but the case stays in waiting-for-parts.
-      const rdResult = await syncCaseStatus(updatedCase || theCase, "waiting-for-parts");
-      const repairDesk = rdResult.synced
-        ? { success: true }
-        : { success: false, error: rdResult.reason || "sync failed" };
-
       return res.json({
         success: true,
         message: `Sales order ${so.salesorder_number} created`,
@@ -1101,7 +1055,6 @@ router.post(
           case: updatedCase,
           salesOrderId: so.salesorder_id,
           salesOrderNumber: so.salesorder_number,
-          repairDesk,
         },
       });
     } catch (error) {
@@ -1189,9 +1142,6 @@ router.post(
           .status(404)
           .json({ success: false, message: "Case not found" });
       }
-
-      // TEMP: mirror to RepairDesk. See utils/repairDesk.js comment.
-      await syncCaseStatus(updated, newStatus);
 
       return res.json({
         success: true,
@@ -1292,9 +1242,6 @@ router.post(
           .status(404)
           .json({ success: false, message: "Case not found" });
       }
-
-      // TEMP: mirror to RepairDesk. See utils/repairDesk.js comment.
-      await syncCaseStatus(updated, newStatus);
 
       return res.json({
         success: true,

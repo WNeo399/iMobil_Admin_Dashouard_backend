@@ -1,10 +1,8 @@
 // iMobile Repair endpoints — thin proxy to RepairDesk for the iMobile
 // account, gated by the `repair:*` permission group.
 //
-// Important: uses IMB_REPAIRDESK_API_KEY (the iMobile org's RepairDesk key),
-// NOT the REPAIRDESK_API_KEY used by utils/repairDesk.js (which talks to
-// the TechElite shops' RepairDesk for SQT status sync). The two are
-// different RepairDesk accounts and must stay distinct.
+// Uses IMB_REPAIRDESK_API_KEY — the iMobile org's own RepairDesk account.
+// (The TechElite shops' RepairDesk, used for SQT, was retired in 2026-09.)
 
 var express = require("express");
 var axios = require("axios");

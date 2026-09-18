@@ -28,15 +28,13 @@ function buildShopDoc(body, { isUpdate = false } = {}) {
   }
 
   if (body.externalIds !== undefined) {
-    doc.externalIds = {
-      zohoId: body.externalIds.zohoId ? String(body.externalIds.zohoId) : null,
-      repairDeskId:
-        body.externalIds.repairDeskId !== null &&
-        body.externalIds.repairDeskId !== undefined &&
-        body.externalIds.repairDeskId !== ""
-          ? Number(body.externalIds.repairDeskId)
-          : null,
-    };
+    const zohoId = body.externalIds && body.externalIds.zohoId
+      ? String(body.externalIds.zohoId)
+      : null;
+    // Updates set only the sub-field: replacing the whole object would wipe
+    // a shop's legacy externalIds.repairDeskId on any unrelated save.
+    if (isUpdate) doc["externalIds.zohoId"] = zohoId;
+    else doc.externalIds = { zohoId };
   }
 
   if (body.address !== undefined) {
