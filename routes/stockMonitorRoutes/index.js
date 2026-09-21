@@ -1,19 +1,25 @@
-// Stock Monitoring — reads the daily snapshot bin/stockSnapshot.js writes.
+// Stock Monitoring — reads the stock register, imb_stock_items: one row per
+// Zoho item, refreshed in place by bin/stockSnapshot.js (nightly) and
+// utils/stockItemsSync (hourly). See utils/stockItems for the row's shape.
 //
-// The list, the tiles and the shelves come entirely from imb_stock_daily,
-// so the page loads in milliseconds where the live sweep takes fifty
-// seconds. The trade is freshness: those are "as of" the last run, and the
-// summary says so plainly rather than letting yesterday pass for today.
+// The list, the tiles and the shelves come entirely from the register, so
+// the page loads in milliseconds where the live sweep takes a minute and a
+// half. The trade is freshness: those are "as of" the last refresh, and the
+// summary says so plainly rather than letting yesterday pass for today —
+// while the Stock column is overlaid live for the rows on screen.
 //
-//   GET /stock-monitor/summary         as-of, tile counts, filter options
-//   GET /stock-monitor/items           the working list, filtered and paged
-//   GET /stock-monitor/shelves         shelf rollup for a stock take
-//   GET /stock-monitor/item/:id        one item, with PO lines and history
-//   GET /stock-monitor/item/:id/sales  who bought it, live from Zoho
+//   GET /stock-monitor/summary               as-of, tile counts, filter options
+//   GET /stock-monitor/items                 the working list, filtered and paged
+//   GET /stock-monitor/shelves               shelf rollup for a stock take
+//   GET /stock-monitor/item/:id              one item's row
+//   GET /stock-monitor/live?ids=             live stock for the rows on screen
+//   GET /stock-monitor/item/:id/sales        who bought it, live from Zoho
+//   GET /stock-monitor/item/:id/sales-trend  units per week, live from Analytics
 //
-// The last one is the exception that does hit Zoho: invoice numbers and
-// customer names are not in the register (it stores totals, not lines), and
-// this runs for one item only when someone opens its drawer.
+// The last three are the exceptions that do hit Zoho: current stock,
+// invoice numbers and customer names, and dated sales are not in the
+// register (it stores totals, not lines), and they run only for what is on
+// screen or for one item when someone opens its drawer.
 //
 // Reading needs zoho:stock:view — the same permission as the per-collection
 // Stock Monitoring page.
