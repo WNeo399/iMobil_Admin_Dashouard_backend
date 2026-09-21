@@ -38,6 +38,7 @@ const {
   STATUS_WITH_SUPPLIER,
   LOCATION_SENDING_IMOBILE,
   stockSourceForUser,
+  supplierPriceOf,
 } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:supply:view");
@@ -166,6 +167,12 @@ async function applyDeviceUpdates(db, req, devices, rawUpdates) {
         ? String(u.currency).toUpperCase()
         : d.currency || "AUD";
       set.costPrice = Number(cost);
+      // Entered by the supplier themselves — recorded as what they
+      // charge, so receiving the unit keeps it as their price.
+      if (isSupplierUser) {
+        set.supplierPrice = Number(cost);
+        set.supplierCurrency = currency;
+      }
       set.currency = currency;
       history.push(`Cost set to ${currency} ${Number(cost).toFixed(2)} while boarding a supply batch`);
     }
@@ -293,6 +300,11 @@ router.get("/:id", VIEW, async (req, res) => {
       ? await db.collection(DEVICES).find({ _id: { $in: deviceIds } }).toArray()
       : [];
     const liveById = new Map(liveDevices.map((d) => [String(d._id), d]));
+    // A supplier sees the price THEY charge, never our landed cost: the
+    // line carries `price` and costPrice is dropped. A unit that has left
+    // the register falls back to the snapshot taken when the batch was
+    // confirmed — their charge at the time they sent it.
+    const forSupplier = req.user && req.user.role === "phone-supplier";
     const lines = (batch.lines || []).map((l) => {
       const d = liveById.get(String(l.deviceId));
       const live = d
@@ -307,7 +319,7 @@ router.get("/:id", VIEW, async (req, res) => {
             supplier: d.supplier ? { id: d.supplier.id, name: d.supplier.name } : null,
           }
         : null;
-      return {
+      const row = {
         ...l,
         ...(live || {}),
         // The incoming line's code is the imei as SHIPPED — key the
@@ -315,6 +327,12 @@ router.get("/:id", VIEW, async (req, res) => {
         // finds its line.
         ...(receivedByCode.get(l.imei) || { received: false, receivedAt: null }),
       };
+      if (!forSupplier) return row;
+      const own = d
+        ? supplierPriceOf(d)
+        : { price: l.costPrice == null ? null : l.costPrice, currency: l.currency || "AUD" };
+      const { costPrice, currency, ...rest } = row;
+      return { ...rest, price: own.price, currency: own.currency };
     });
     return res.json({
       success: true,

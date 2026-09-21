@@ -24,6 +24,8 @@ const {
   locationForUser,
   RECEIVE_LOCATIONS,
   STATUS_WITH_SUPPLIER,
+  SUPPLIER_OWNED_STATUSES,
+  supplierPriceOf,
 } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:stock:view");
@@ -45,6 +47,7 @@ function outOfScope(user, device) {
   return src !== null && (!device || device.stockSource !== src);
 }
 const DEVICES = "refurb_devices";
+const SUPPLY_BATCHES = "refurb_supply_batches";
 
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -171,6 +174,31 @@ router.get("/", VIEW, async (req, res) => {
         { storage: rx },
       ];
     }
+    // One supply batch's devices (the Stock page's Supply Batch filter).
+    // The batch's lines are the line-up as sent, so a unit that has since
+    // been received, sold or sent for repair still lists under it.
+    if (req.query.supplyBatchId !== undefined) {
+      const batchId = String(req.query.supplyBatchId || "").trim();
+      if (!ObjectId.isValid(batchId)) {
+        return res.status(400).json({ success: false, message: "Bad supply batch id" });
+      }
+      const batch = await db
+        .collection(SUPPLY_BATCHES)
+        .findOne({ _id: new ObjectId(batchId) }, { projection: { lines: 1, stockSource: 1 } });
+      // A supplier may only ask about their own batches; an unknown batch
+      // reads as one holding nothing rather than as an error.
+      const scoped = supplierSource(req.user);
+      const visible = batch && (scoped === null || batch.stockSource === scoped);
+      const batchDeviceIds = visible
+        ? (batch.lines || [])
+            .map((l) => l.deviceId)
+            .filter((v) => v && ObjectId.isValid(String(v)))
+            .map((v) => new ObjectId(String(v)))
+        : [];
+      match._id = match._id
+        ? { $in: batchDeviceIds.filter((id) => match._id.$in.some((x) => x.equals(id))) }
+        : { $in: batchDeviceIds };
+    }
     if (req.query.grade) match.grade = String(req.query.grade);
     if (req.query.stockSource) match.stockSource = String(req.query.stockSource);
     // Applied after the query params so a crafted stockSource= can't widen
@@ -203,12 +231,13 @@ router.get("/", VIEW, async (req, res) => {
     const sortField = SORTABLE.includes(req.query.sort) ? req.query.sort : "createdAt";
     const sortDir = String(req.query.order).toLowerCase() === "asc" ? 1 : -1;
 
-    // A phone supplier's "cost" is what THEY charge. Once a unit has been
-    // received with our landed cost (supplierPrice recorded), their pages
-    // keep showing the supplier figure — our AUD cost (shipping + FX in)
-    // stays internal, same as consignment hides costPrice from shops.
+    // A phone supplier's "cost" is what THEY charge (supplierPriceOf).
+    // Our AUD landed cost stays internal, same as consignment hides
+    // costPrice from shops — including for a unit they never priced,
+    // where they see nothing rather than our figure.
     const supplierView = req.user && req.user.role === "phone-supplier";
     const hasSupplierPrice = { $gt: ["$supplierPrice", null] };
+    const stillTheirs = { $in: ["$status", SUPPLIER_OWNED_STATUSES] };
     const [total, rows, checkedCount, valueAgg] = await Promise.all([
       db.collection(DEVICES).countDocuments(match),
       db
@@ -237,7 +266,13 @@ router.get("/", VIEW, async (req, res) => {
                 : { $ifNull: ["$currency", DEFAULT_CURRENCY] },
               v: {
                 $sum: supplierView
-                  ? { $cond: [hasSupplierPrice, "$supplierPrice", { $ifNull: ["$costPrice", 0] }] }
+                  ? {
+                      $cond: [
+                        hasSupplierPrice,
+                        "$supplierPrice",
+                        { $cond: [stillTheirs, { $ifNull: ["$costPrice", 0] }, 0] },
+                      ],
+                    }
                   : { $ifNull: ["$costPrice", 0] },
               },
             },
@@ -260,11 +295,10 @@ router.get("/", VIEW, async (req, res) => {
       checkedCount,
       costTotals,
       rows: supplierView
-        ? rows.map((d) =>
-            d.supplierPrice == null
-              ? d
-              : { ...d, costPrice: d.supplierPrice, currency: d.supplierCurrency || DEFAULT_CURRENCY },
-          )
+        ? rows.map((d) => {
+            const own = supplierPriceOf(d);
+            return { ...d, costPrice: own.price, currency: own.currency };
+          })
         : rows,
     });
   } catch (e) {
@@ -290,6 +324,26 @@ router.get("/filters", VIEW, async (req, res) => {
           ])
           .toArray()
       ).map((r) => r._id);
+    // Supply batches to filter by, newest first. Cancelled drafts are
+    // left out — their devices went back where they were.
+    const supplyBatches = (
+      await db
+        .collection(SUPPLY_BATCHES)
+        .find(
+          { status: { $ne: "Cancelled" }, ...(scope !== null ? { stockSource: scope } : {}) },
+          { projection: { batchNo: 1, status: 1, stockSource: 1, createdAt: 1, lines: 1 } },
+        )
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .toArray()
+    ).map((b) => ({
+      id: String(b._id),
+      batchNo: b.batchNo,
+      status: b.status,
+      stockSource: b.stockSource || "",
+      createdAt: b.createdAt,
+      devices: (b.lines || []).length,
+    }));
     const [models, grades, stockSources, storages, colors, locations] = await Promise.all([
       distinct("model"),
       distinct("grade"),
@@ -306,6 +360,7 @@ router.get("/filters", VIEW, async (req, res) => {
       storages,
       colors,
       locations,
+      supplyBatches,
       statuses: ["In Stock", "Sold", "On Consignment"],
     });
   } catch (e) {
@@ -615,9 +670,16 @@ router.post("/", MANAGE, async (req, res) => {
       supplierRef = { id: sup._id, name: sup.name };
     }
     const now = new Date();
+    const built = buildDevice(req.body || {});
+    // A price a supplier records is what they charge us — kept as their
+    // figure from the start, so receiving the unit can't lose it.
+    if (req.user && req.user.role === "phone-supplier" && built.costPrice != null) {
+      built.supplierPrice = built.costPrice;
+      built.supplierCurrency = built.currency || DEFAULT_CURRENCY;
+    }
     const doc = {
       imei,
-      ...buildDevice(req.body || {}),
+      ...built,
       ...(supplierRef ? { supplier: supplierRef } : {}),
       stockSource: stockSourceForUser(req.user),
       location: locationForUser(req.user),
@@ -757,18 +819,23 @@ router.put("/:id", MANAGE, async (req, res) => {
       }
     }
 
-    // Once a unit has been received with our landed cost, the register's
-    // costPrice is OURS. A phone supplier editing "cost" is changing what
-    // THEY charge — routed to supplierPrice so our figure survives (their
-    // pages show the supplier price back to them, so the edit round-trips).
-    if (req.user && req.user.role === "phone-supplier" && existing.supplierPrice != null) {
+    // A phone supplier editing "cost" is setting what THEY charge, so it
+    // is always recorded as their figure — that way it is still theirs
+    // once the unit is received and costPrice becomes our landed cost.
+    // While the unit is still on their shelf the register's costPrice is
+    // that same figure and keeps following it; after receiving, our cost
+    // is not theirs to change.
+    if (req.user && req.user.role === "phone-supplier") {
+      const stillTheirUnit = SUPPLIER_OWNED_STATUSES.includes(existing.status);
       if (set.costPrice !== undefined) {
         set.supplierPrice = set.costPrice;
-        delete set.costPrice;
+        if (!stillTheirUnit) delete set.costPrice;
       }
       if (set.currency !== undefined) {
         set.supplierCurrency = set.currency;
-        delete set.currency;
+        if (!stillTheirUnit) delete set.currency;
+      } else if (set.supplierPrice !== undefined) {
+        set.supplierCurrency = existing.currency || DEFAULT_CURRENCY;
       }
     }
 

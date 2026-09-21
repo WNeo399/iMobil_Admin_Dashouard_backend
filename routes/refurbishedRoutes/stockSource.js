@@ -77,6 +77,26 @@ const DEVICE_STATUSES = [
   STATUS_ON_CONSIGNMENT,
 ];
 
+// A unit that is still the supplier's own: on their shelf, or listed on
+// a shipment that hasn't landed. Until it is received, the register's
+// costPrice is the figure THEY entered.
+const SUPPLIER_OWNED_STATUSES = [STATUS_WITH_SUPPLIER, STATUS_NOT_RECEIVED];
+
+// What a phone supplier is shown as the price of one unit: the figure they
+// charge us. Receiving writes OUR landed cost (AUD, shipping and FX in)
+// into costPrice and moves their figure to supplierPrice, so after that
+// costPrice is never theirs to see. A received unit they never priced has
+// no figure of theirs at all — a dash, never our cost.
+function supplierPriceOf(d) {
+  if (d && d.supplierPrice != null) {
+    return { price: d.supplierPrice, currency: d.supplierCurrency || "AUD" };
+  }
+  if (d && SUPPLIER_OWNED_STATUSES.includes(d.status)) {
+    return { price: d.costPrice == null ? null : d.costPrice, currency: d.currency || "AUD" };
+  }
+  return { price: null, currency: (d && (d.supplierCurrency || d.currency)) || "AUD" };
+}
+
 function normalizeReceiveLocation(v) {
   const s = String(v == null ? "" : v).trim().toLowerCase();
   return RECEIVE_LOCATIONS.find((x) => x.toLowerCase() === s) || LOCATION_IMOBILE;
@@ -91,6 +111,8 @@ module.exports = {
   STATUS_WITH_SUPPLIER,
   STATUS_ON_CONSIGNMENT,
   DEVICE_STATUSES,
+  SUPPLIER_OWNED_STATUSES,
+  supplierPriceOf,
   STOCK_SOURCES,
   DEFAULT_STOCK_SOURCE,
   normalizeStockSource,
