@@ -12,7 +12,7 @@
 //   GET /stock-monitor/item/:id/sales  who bought it, live from Zoho
 //
 // The last one is the exception that does hit Zoho: invoice numbers and
-// customer names are not in the snapshot (it stores totals, not lines), and
+// customer names are not in the register (it stores totals, not lines), and
 // this runs for one item only when someone opens its drawer.
 //
 // Reading needs zoho:stock:view — the same permission as the per-collection
@@ -29,10 +29,13 @@ const {
   handleZohoInventoryMultipartPostRequest,
   refreshToken,
 } = require("../../utils/zohoRequest");
-const { mapWithLimit, fetchItemDetails } = require("../../utils/zohoStock");
+const { mapWithLimit, fetchItemDetails, fetchItemWindowRows, OFFLINE_SALE_SCOPES } = require("../../utils/zohoStock");
 const { imageIdOf, imageUrlFromId } = require("../../utils/productImage");
+// The register: one row per item, numbers under `metrics`, answered flat.
+const { ITEMS, flatten, path: fieldPath, melbourneDate } = require("../../utils/stockItems");
+const { runStockItemsSync, getStockItemsSyncState } = require("../../utils/stockItemsSync");
+const { startFullRefresh, isFullRefreshRunning, onFullRefreshFinished } = require("../../utils/stockRefresh");
 
-const DAILY = "imb_stock_daily";
 const RUNS = "imb_stock_runs";
 
 const VIEW = requirePermission("zoho:stock:view");
@@ -45,17 +48,17 @@ const MAX_PAGE_SIZE = 200;
 // way these dashboards drift is a tile and a list disagreeing.
 const FILTERS = {
   all: {},
-  outOfStock: { outOfStock: true },
+  outOfStock: { "metrics.outOfStock": true },
   // Out of stock with nothing coming: the buy list.
-  uncovered: { outOfStockUncovered: true },
-  onOrder: { outOfStockCovered: true },
-  belowCover: { belowMonthCover: true },
+  uncovered: { "metrics.outOfStockUncovered": true },
+  onOrder: { "metrics.outOfStockCovered": true },
+  belowCover: { "metrics.belowMonthCover": true },
   // "No sales in a fortnight" on its own is most of a long-tail catalogue.
   // Crossed with stock on hand it becomes money sitting on a shelf.
-  sittingStill: { stale: true, available: { $gt: 0 } },
-  negative: { available: { $lt: 0 } },
+  sittingStill: { "metrics.stale": true, "metrics.available": { $gt: 0 } },
+  negative: { "metrics.available": { $lt: 0 } },
   // Sold recently but at zero now — the shortest actionable list there is.
-  sellingAndOut: { outOfStock: true, units90: { $gt: 0 } },
+  sellingAndOut: { "metrics.outOfStock": true, "metrics.units90.total": { $gt: 0 } },
   // Price health (the Price Monitoring page's tiles).
   priceMissing: { priceMissing: true },
   pricePlaceholder: { pricePlaceholder: true },
@@ -68,11 +71,11 @@ const FILTERS = {
   // Cost-priced items whose rates sit >5% off the pricing formula.
   priceRuleBroken: { priceRuleBroken: true },
   // Missing product image (the Missing Images page). $type "null" matches an
-  // explicit null only: rows from snapshots written before imageId existed
+  // explicit null only: rows written before imageId existed
   // have no field at all and must not read as "no image".
   noImage: { imageId: { $type: "null" } },
-  noImageInStock: { imageId: { $type: "null" }, available: { $gt: 0 } },
-  noImageOutOfStock: { imageId: { $type: "null" }, available: { $lte: 0 } },
+  noImageInStock: { imageId: { $type: "null" }, "metrics.available": { $gt: 0 } },
+  noImageOutOfStock: { imageId: { $type: "null" }, "metrics.available": { $lte: 0 } },
   // The Archive bucket — criteria matches + manual marks.
   archived: { archived: true },
   // Its no-image slice: the Missing Images page's "archived — view".
@@ -102,26 +105,32 @@ function escapeRegex(v) {
   return String(v).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// The newest snapshot we hold. Everything else is keyed off it, so a failed
-// overnight run shows yesterday's numbers rather than an empty page — with
-// the date attached so the UI can say how old they are.
-// An indexed sort-and-take-one, NOT a $group over every stored day — and
-// cached for a minute: this runs at the top of every request in the module,
-// the value changes once a night, and the Mongo server is a ~170ms network
+// The newest refresh we hold: when the numbers were taken (metricsAt) and
+// the warehouse day that falls on, which the pages call the snapshot date.
+// A failed run leaves the previous numbers in place, with their own stamp,
+// so the UI can say how old they are. An indexed sort-and-take-one, cached
+// for a minute: this runs at the top of every request in the module, the
+// value changes once a refresh, and the Mongo server is a ~170ms network
 // round trip away.
-let snapshotDateCache = { value: null, at: 0 };
-async function latestSnapshotDate(db) {
-  if (snapshotDateCache.value && Date.now() - snapshotDateCache.at < 60000) {
-    return snapshotDateCache.value;
+let refreshCache = { value: null, at: 0 };
+async function latestRefresh(db) {
+  if (refreshCache.value && Date.now() - refreshCache.at < 60000) {
+    return refreshCache.value;
   }
   const row = await db
-    .collection(DAILY)
-    .find({}, { projection: { _id: 0, snapshotDate: 1 } })
-    .sort({ snapshotDate: -1 })
+    .collection(ITEMS)
+    .find({ active: true }, { projection: { _id: 0, metricsAt: 1 } })
+    .sort({ metricsAt: -1 })
     .limit(1)
     .next();
-  if (row) snapshotDateCache = { value: row.snapshotDate, at: Date.now() };
-  return row ? row.snapshotDate : null;
+  const value =
+    row && row.metricsAt ? { metricsAt: row.metricsAt, snapshotDate: melbourneDate(row.metricsAt) } : null;
+  if (value) refreshCache = { value, at: Date.now() };
+  return value;
+}
+async function latestSnapshotDate(db) {
+  const r = await latestRefresh(db);
+  return r ? r.snapshotDate : null;
 }
 
 // The user-set filters (search box and the dropdowns) as a match fragment.
@@ -153,9 +162,9 @@ function baseFilterMatch(req) {
 // Turn the query string into a match document. Archive rows (criteria
 // matches + manual marks) are excluded from every view except the archive
 // filter itself.
-function buildMatch(req, snapshotDate) {
+function buildMatch(req) {
   const q = req.query || {};
-  const match = { snapshotDate, scope: scopeOf(req), ...baseFilterMatch(req) };
+  const match = { active: true, scope: scopeOf(req), ...baseFilterMatch(req) };
 
   const filter = FILTERS[q.filter] ? q.filter : "all";
   Object.assign(match, FILTERS[filter]);
@@ -168,56 +177,54 @@ function buildMatch(req, snapshotDate) {
 }
 
 // ── POST /stock-monitor/snapshot/run ────────────────────────────────
-// Trigger the daily snapshot on demand (the dashboard's "Update snapshot"
-// button when the overnight job hasn't run). Spawns bin/stockSnapshot.js
-// --apply as a child process — the script is the cron entrypoint and calls
-// process.exit, so it must not run in-process. One run at a time; the
-// dashboard polls GET /snapshot/run until it finishes.
-const { spawn } = require("child_process");
-const path = require("path");
-let snapshotChild = null;
+// The full register refresh on demand (the dashboard's "Update Now"
+// button when the overnight run hasn't happened). utils/stockRefresh
+// spawns bin/stockSnapshot.js --apply, one run at a time, shared with the
+// external trigger; the dashboard polls GET /snapshot/run until it ends.
+// Drop the cached stamp when any run ends, so fresh numbers show at once.
+onFullRefreshFinished(() => {
+  refreshCache = { value: null, at: 0 };
+});
 
 router.post("/snapshot/run", VIEW, (req, res) => {
-  if (snapshotChild) {
-    return res.json({ success: true, running: true, alreadyRunning: true });
+  const r = startFullRefresh((req.user && req.user.username) || "unknown");
+  return res.json({ success: true, running: r.running, ...(r.started ? {} : { alreadyRunning: true }) });
+});
+
+// ── POST /stock-monitor/sync/run ────────────────────────────────────
+// One pass of the hourly sync, now. Seconds, not minutes, so it answers
+// with the result rather than polling.
+router.post("/sync/run", VIEW, async (req, res) => {
+  try {
+    const result = await runStockItemsSync({
+      log: console.log,
+      trigger: `manual:${(req.user && req.user.username) || "unknown"}`,
+    });
+    refreshCache = { value: null, at: 0 };
+    return res.json({ success: true, result });
+  } catch (error) {
+    return res.status(502).json({ success: false, message: error.message || "Sync failed" });
   }
-  const backendRoot = path.join(__dirname, "..", "..");
-  const child = spawn(process.execPath, [path.join(backendRoot, "bin", "stockSnapshot.js"), "--apply"], {
-    cwd: backendRoot,
-    stdio: "ignore",
-  });
-  snapshotChild = child;
-  child.on("exit", (code) => {
-    snapshotChild = null;
-    // Drop the cached date so the fresh snapshot shows immediately.
-    snapshotDateCache = { value: null, at: 0 };
-    console.log(`stock snapshot run finished (exit ${code})`);
-  });
-  child.on("error", (e) => {
-    snapshotChild = null;
-    console.error("stock snapshot spawn error:", e.message);
-  });
-  console.log(`stock snapshot run started by ${(req.user && req.user.username) || "unknown"}`);
-  return res.json({ success: true, running: true });
 });
 
 router.get("/snapshot/run", VIEW, (req, res) => {
-  return res.json({ success: true, running: !!snapshotChild });
+  return res.json({ success: true, running: isFullRefreshRunning() });
 });
 
 // ── GET /stock-monitor/summary ──────────────────────────────────────
 // One aggregation for every tile, plus the values the filter selects
-// offer. Both are derived from the snapshot, so a category with no rows
+// offer. Both are derived from the register, so a category with no rows
 // today simply isn't offered.
 router.get("/summary", VIEW, async (req, res, next) => {
   try {
     const db = await connectToDatabase();
-    const snapshotDate = await latestSnapshotDate(db);
-    if (!snapshotDate) {
-      return res.json({ success: true, snapshotDate: null, run: null, counts: null, options: null });
+    const refresh = await latestRefresh(db);
+    if (!refresh) {
+      return res.json({ success: true, snapshotDate: null, metricsAt: null, run: null, counts: null, options: null });
     }
+    const { snapshotDate, metricsAt } = refresh;
     const scope = scopeOf(req);
-    const base = { snapshotDate, scope };
+    const base = { active: true, scope };
     // The Archive bucket sits outside every tile; its own count rides in
     // counts.archived for the "view archived" link.
     const live = { ...base, archived: { $ne: true } };
@@ -229,21 +236,21 @@ router.get("/summary", VIEW, async (req, res, next) => {
     // applied. Counting a tile over a wider set than its table is how a
     // dashboard ends up quietly lying: click 92 and get 155.
     const [tiles] = await db
-      .collection(DAILY)
+      .collection(ITEMS)
       .aggregate([
         { $match: filtered },
         {
           $group: {
             _id: null,
             items: { $sum: 1 },
-            outOfStock: { $sum: { $cond: ["$outOfStock", 1, 0] } },
-            uncovered: { $sum: { $cond: ["$outOfStockUncovered", 1, 0] } },
-            onOrder: { $sum: { $cond: ["$outOfStockCovered", 1, 0] } },
-            belowCover: { $sum: { $cond: ["$belowMonthCover", 1, 0] } },
-            sittingStill: { $sum: { $cond: [{ $and: ["$stale", { $gt: ["$available", 0] }] }, 1, 0] } },
-            negative: { $sum: { $cond: [{ $lt: ["$available", 0] }, 1, 0] } },
+            outOfStock: { $sum: { $cond: ["$metrics.outOfStock", 1, 0] } },
+            uncovered: { $sum: { $cond: ["$metrics.outOfStockUncovered", 1, 0] } },
+            onOrder: { $sum: { $cond: ["$metrics.outOfStockCovered", 1, 0] } },
+            belowCover: { $sum: { $cond: ["$metrics.belowMonthCover", 1, 0] } },
+            sittingStill: { $sum: { $cond: [{ $and: ["$metrics.stale", { $gt: ["$metrics.available", 0] }] }, 1, 0] } },
+            negative: { $sum: { $cond: [{ $lt: ["$metrics.available", 0] }, 1, 0] } },
             sellingAndOut: {
-              $sum: { $cond: [{ $and: ["$outOfStock", { $gt: ["$units90", 0] }] }, 1, 0] },
+              $sum: { $cond: [{ $and: ["$metrics.outOfStock", { $gt: ["$metrics.units90.total", 0] }] }, 1, 0] },
             },
             priceMissing: { $sum: { $cond: ["$priceMissing", 1, 0] } },
             pricePlaceholder: { $sum: { $cond: ["$pricePlaceholder", 1, 0] } },
@@ -253,19 +260,19 @@ router.get("/summary", VIEW, async (req, res, next) => {
             priceOrderBroken: { $sum: { $cond: ["$priceOrderBroken", 1, 0] } },
             noImage: { $sum: { $cond: [{ $eq: [{ $type: "$imageId" }, "null"] }, 1, 0] } },
             noImageInStock: {
-              $sum: { $cond: [{ $and: [{ $eq: [{ $type: "$imageId" }, "null"] }, { $gt: ["$available", 0] }] }, 1, 0] },
+              $sum: { $cond: [{ $and: [{ $eq: [{ $type: "$imageId" }, "null"] }, { $gt: ["$metrics.available", 0] }] }, 1, 0] },
             },
             noImageOutOfStock: {
-              $sum: { $cond: [{ $and: [{ $eq: [{ $type: "$imageId" }, "null"] }, { $lte: ["$available", 0] }] }, 1, 0] },
+              $sum: { $cond: [{ $and: [{ $eq: [{ $type: "$imageId" }, "null"] }, { $lte: ["$metrics.available", 0] }] }, 1, 0] },
             },
-            unitsOnHand: { $sum: { $cond: [{ $gt: ["$available", 0] }, "$available", 0] } },
+            unitsOnHand: { $sum: { $cond: [{ $gt: ["$metrics.available", 0] }, "$metrics.available", 0] } },
           },
         },
       ])
       .toArray();
 
     const [totals] = await db
-      .collection(DAILY)
+      .collection(ITEMS)
       .aggregate([
         { $match: { ...base, ...baseFilterMatch(req) } },
         {
@@ -297,7 +304,7 @@ router.get("/summary", VIEW, async (req, res, next) => {
         { $group: { _id: `$${field}`, n: { $sum: 1 } } },
         { $sort: { _id: 1 } },
       );
-      const rows = await db.collection(DAILY).aggregate(stages).toArray();
+      const rows = await db.collection(ITEMS).aggregate(stages).toArray();
       return rows.map((r) => ({ value: r._id, count: r.n }));
     };
 
@@ -308,11 +315,15 @@ router.get("/summary", VIEW, async (req, res, next) => {
       optionsOf("quality"),
     ]);
 
-    const run = await db.collection(RUNS).findOne({}, { sort: { startedAt: -1 } });
+    const [run, sync] = await Promise.all([
+      db.collection(RUNS).findOne({}, { sort: { startedAt: -1 } }),
+      getStockItemsSyncState(db),
+    ]);
 
     return res.json({
       success: true,
       snapshotDate,
+      metricsAt,
       run: run
         ? {
             ok: run.ok !== false,
@@ -323,6 +334,8 @@ router.get("/summary", VIEW, async (req, res, next) => {
             error: run.error || null,
           }
         : null,
+      // The hourly sync's last pass, for the "synced N min ago" note.
+      sync,
       counts: {
         ...stripId(tiles),
         all: (totals && totals.all) || 0,
@@ -340,32 +353,30 @@ router.get("/summary", VIEW, async (req, res, next) => {
 router.get("/items", VIEW, async (req, res, next) => {
   try {
     const db = await connectToDatabase();
-    const snapshotDate = await latestSnapshotDate(db);
-    if (!snapshotDate) return res.json({ success: true, snapshotDate: null, rows: [], total: 0 });
+    const refresh = await latestRefresh(db);
+    if (!refresh) return res.json({ success: true, snapshotDate: null, metricsAt: null, rows: [], total: 0 });
+    const { snapshotDate, metricsAt } = refresh;
 
-    const { match, filter } = buildMatch(req, snapshotDate);
+    const { match, filter } = buildMatch(req);
 
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
     const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
     const sortField = SORTABLE.has(String(req.query.sort)) ? String(req.query.sort) : "units90";
     const order = String(req.query.order) === "asc" ? 1 : -1;
 
-    const [rows, total] = await Promise.all([
+    const [stored, total] = await Promise.all([
       db
-        .collection(DAILY)
+        .collection(ITEMS)
         .find(match, {
           projection: {
             _id: 0, itemId: 1, sku: 1, name: 1, location: 1, scope: 1, classification: 1,
             preferVendor: 1, brand: 1, category: 1, quality: 1, collections: 1, inCatalogue: 1,
-            available: 1, stockOnHand: 1, committed: 1,
-            units7: 1, units14: 1, units30: 1, units90: 1, lastSaleAt: 1, daysSinceSale: 1,
-            openPoQty: 1, openPoLines: 1, earliestPoDate: 1,
-            outOfStock: 1, outOfStockCovered: 1, outOfStockUncovered: 1,
-            belowMonthCover: 1, stale: 1, archived: 1, archivedReason: 1,
-            daysOfCover: 1, purchasePrice: 1,
+            archived: 1, archivedReason: 1, purchasePrice: 1,
             pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1,
             priceMissing: 1, pricePlaceholder: 1, priceBelowCost: 1, priceOrderBroken: 1,
             priceRule: 1, priceExpected: 1, priceRuleBroken: 1, imageId: 1,
+            // The numbers, merged into each row below.
+            metrics: 1, metricsAt: 1,
           },
         })
         // _id breaks ties so paging can't repeat or skip a row when many
@@ -374,18 +385,19 @@ router.get("/items", VIEW, async (req, res, next) => {
         // ones before the user's sort applies.
         .sort(
           filter === "priceUnpriced"
-            ? { priceMissing: -1, [sortField]: order, _id: 1 }
-            : { [sortField]: order, _id: 1 },
+            ? { priceMissing: -1, [fieldPath(sortField)]: order, _id: 1 }
+            : { [fieldPath(sortField)]: order, _id: 1 },
         )
         .skip((page - 1) * pageSize)
         .limit(pageSize)
         .toArray(),
-      db.collection(DAILY).countDocuments(match),
+      db.collection(ITEMS).countDocuments(match),
     ]);
+    const rows = stored.map(flatten);
 
     // 海运 membership, joined live from the pinned collection doc rather
-    // than the snapshot's collections array — an item added today badges
-    // (and can be toggled) immediately, not after the next snapshot.
+    // than the row's collections array — an item added today badges
+    // (and can be toggled) immediately, not after the next refresh.
     try {
       const sea = await db
         .collection("productCollections")
@@ -398,10 +410,10 @@ router.get("/items", VIEW, async (req, res, next) => {
       // The badge is decoration — never fail the list for it.
     }
 
-    // The snapshot stores only the image id; the page gets a usable URL.
+    // The register stores only the image id; the page gets a usable URL.
     for (const r of rows) r.imageUrl = imageUrlFromId(r.imageId);
 
-    return res.json({ success: true, snapshotDate, filter, page, pageSize, total, rows });
+    return res.json({ success: true, snapshotDate, metricsAt, filter, page, pageSize, total, rows });
   } catch (error) {
     next(error);
   }
@@ -416,16 +428,16 @@ router.get("/shelves", VIEW, async (req, res, next) => {
     if (!snapshotDate) return res.json({ success: true, snapshotDate: null, shelves: [] });
 
     const shelves = await db
-      .collection(DAILY)
+      .collection(ITEMS)
       .aggregate([
-        { $match: { snapshotDate, scope: scopeOf(req), location: { $nin: [null, ""] } } },
+        { $match: { active: true, scope: scopeOf(req), location: { $nin: [null, ""] } } },
         {
           $group: {
             _id: "$location",
             items: { $sum: 1 },
-            units: { $sum: { $cond: [{ $gt: ["$available", 0] }, "$available", 0] } },
-            outOfStock: { $sum: { $cond: ["$outOfStock", 1, 0] } },
-            negative: { $sum: { $cond: [{ $lt: ["$available", 0] }, 1, 0] } },
+            units: { $sum: { $cond: [{ $gt: ["$metrics.available", 0] }, "$metrics.available", 0] } },
+            outOfStock: { $sum: { $cond: ["$metrics.outOfStock", 1, 0] } },
+            negative: { $sum: { $cond: [{ $lt: ["$metrics.available", 0] }, 1, 0] } },
           },
         },
         { $sort: { _id: 1 } },
@@ -449,40 +461,28 @@ router.get("/shelves", VIEW, async (req, res, next) => {
 });
 
 // ── GET /stock-monitor/item/:itemId ─────────────────────────────────
-// The drawer: today's row, the open POs behind its SKU, and the last few
-// snapshots so stock and demand can be seen moving.
+// The drawer: the item's row from the register. Purchase orders and the
+// sales trend come live from Zoho through their own endpoints, so this one
+// answers from Mongo alone and the drawer paints at once.
 router.get("/item/:itemId", VIEW, async (req, res, next) => {
   try {
     const db = await connectToDatabase();
-    const snapshotDate = await latestSnapshotDate(db);
-    if (!snapshotDate) return res.status(404).json({ success: false, message: "No snapshot yet" });
+    const refresh = await latestRefresh(db);
+    if (!refresh) return res.status(404).json({ success: false, message: "No stock refresh yet" });
+    const { snapshotDate, metricsAt } = refresh;
 
-    const item = await db
-      .collection(DAILY)
-      .findOne({ snapshotDate, itemId: String(req.params.itemId) }, { projection: { _id: 0 } });
-    if (!item) {
-      return res.status(404).json({ success: false, message: "Item not in the latest snapshot" });
+    const stored = await db
+      .collection(ITEMS)
+      .findOne({ itemId: String(req.params.itemId), active: true }, { projection: { _id: 0 } });
+    if (!stored) {
+      return res.status(404).json({ success: false, message: "Item not in the stock register" });
     }
-
-    const history = await db
-      .collection(DAILY)
-      .find(
-        { itemId: item.itemId },
-        { projection: { _id: 0, snapshotDate: 1, available: 1, units30: 1, openPoQty: 1 } },
-      )
-      .sort({ snapshotDate: -1 })
-      .limit(60)
-      .toArray();
+    const item = flatten(stored);
 
     // Purchase orders are NOT returned here: they come from Zoho Inventory
     // via /item/:id/purchase-orders, which is a live read. Keeping them out
     // of this endpoint is what lets the drawer paint immediately.
-    return res.json({
-      success: true,
-      snapshotDate,
-      item,
-      history: history.reverse(),
-    });
+    return res.json({ success: true, snapshotDate, metricsAt, item });
   } catch (error) {
     next(error);
   }
@@ -501,7 +501,8 @@ router.get("/item/:itemId", VIEW, async (req, res, next) => {
 //
 // Counter usage (inventory adjustments) is deliberately not merged in: it
 // has no customer or invoice, and mixing it into a customer list would
-// invent buyers. The item's offlineUnits total covers it.
+// invent buyers. The item's per-scope units (inflow / repair / neto /
+// dashboard) cover it.
 const SALES_VIEW_ID = "1404913000003936103";
 const ANALYTICS_WORKSPACE_ID = "1404913000003936002";
 const ZOHO_ORG_ID = "746138234";
@@ -597,7 +598,7 @@ router.get("/item/:itemId/sales", VIEW, async (req, res) => {
 // Move an item to the Archive bucket by hand (mode "archived"), or restore
 // it with { restore: true } — restoring writes a "keep" pin when the name
 // criteria would re-catch it, so the item stays live on future runs.
-// Today's snapshot rows are flipped immediately so the pages update now.
+// The row is flipped immediately so the pages update now.
 const EDIT = requirePermission("zoho:stock:edit");
 const { isNoiseName, ARCHIVE_COLLECTION } = require("../../utils/stockUniverse");
 
@@ -609,13 +610,7 @@ router.post("/item/:itemId/archived", EDIT, async (req, res, next) => {
     }
     const restore = req.body && req.body.restore === true;
     const db = await connectToDatabase();
-    const snapshotDate = await latestSnapshotDate(db);
-    const row = snapshotDate
-      ? await db.collection(DAILY).findOne(
-          { snapshotDate, itemId },
-          { projection: { sku: 1, name: 1 } },
-        )
-      : null;
+    const row = await db.collection(ITEMS).findOne({ itemId }, { projection: { sku: 1, name: 1 } });
 
     const now = new Date();
     const by = (req.user && req.user.username) || null;
@@ -638,13 +633,11 @@ router.post("/item/:itemId/archived", EDIT, async (req, res, next) => {
         { upsert: true },
       );
     }
-    // Flip today's rows so the change shows without waiting for tonight.
-    if (snapshotDate) {
-      await db.collection(DAILY).updateMany(
-        { snapshotDate, itemId },
-        { $set: { archived: !restore, archivedReason: restore ? null : "manual" } },
-      );
-    }
+    // Flip the row so the change shows without waiting for the next refresh.
+    await db.collection(ITEMS).updateOne(
+      { itemId },
+      { $set: { archived: !restore, archivedReason: restore ? null : "manual" } },
+    );
     return res.json({ success: true, itemId, archived: !restore });
   } catch (error) {
     next(error);
@@ -652,7 +645,7 @@ router.post("/item/:itemId/archived", EDIT, async (req, res, next) => {
 });
 
 // One item's itemdetails record, or null when Zoho says it no longer
-// exists (code 2006 — deleted since the snapshot was taken).
+// exists (code 2006 — deleted since the last refresh).
 async function readItemDetail(itemId) {
   try {
     const [item] = await fetchItemDetails([itemId]);
@@ -666,7 +659,7 @@ const GONE = { success: false, message: "This item no longer exists in Zoho" };
 
 // ── POST /stock-monitor/item/:itemId/image/recheck ──────────────────
 // The Missing Images page's per-row re-check: one Zoho read of the item,
-// its main image id mirrored into today's snapshot so a fixed item leaves
+// its main image id mirrored into the register so a fixed item leaves
 // the "no image" list now instead of after tonight's run. Same itemdetails
 // endpoint as the nightly job — GET /items/{id} has no image_document_id,
 // and reading it as "no image" would wrongly put items back on the list.
@@ -680,10 +673,7 @@ router.post("/item/:itemId/image/recheck", VIEW, async (req, res) => {
     if (!item) return res.status(404).json(GONE);
     const imageId = imageIdOf(item);
     const db = await connectToDatabase();
-    const snapshotDate = await latestSnapshotDate(db);
-    if (snapshotDate) {
-      await db.collection(DAILY).updateMany({ snapshotDate, itemId }, { $set: { imageId } });
-    }
+    await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId } });
     return res.json({ success: true, itemId, imageId, imageUrl: imageUrlFromId(imageId) });
   } catch (error) {
     console.error("Image re-check error:", error.message);
@@ -697,7 +687,7 @@ router.post("/item/:itemId/image/recheck", VIEW, async (req, res) => {
 // file becomes the main image when the item has none yet. Zoho's limits:
 // gif/png/jpeg/bmp/webp, 7 MB each. Three Zoho calls: read the item, the
 // upload, read it back — the new main image id is mirrored into today's
-// snapshot so the page (and the no-image counts) update at once.
+// register so the page (and the no-image counts) update at once.
 const multer = require("multer");
 const FormData = require("form-data");
 const IMAGE_MIME = /^image\/(gif|png|jpe?g|bmp|webp)$/i;
@@ -765,10 +755,7 @@ router.post(
       const after = await readItemDetail(itemId);
       const imageId = imageIdOf(after);
       const db = await connectToDatabase();
-      const snapshotDate = await latestSnapshotDate(db);
-      if (snapshotDate) {
-        await db.collection(DAILY).updateMany({ snapshotDate, itemId }, { $set: { imageId } });
-      }
+      await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId } });
       return res.json({
         success: true,
         itemId,
@@ -783,10 +770,108 @@ router.post(
   },
 );
 
+// ── GET /stock-monitor/live?ids=a,b,c ───────────────────────────────
+// Live stock for the rows on screen, straight from Zoho Inventory — one
+// itemdetails call per 100 ids. The pages overlay it on the stored numbers
+// so what is read is current, while lists, tiles and sorts still come from
+// the register.
+const MAX_LIVE_IDS = 200;
+router.get("/live", VIEW, async (req, res) => {
+  const ids = [
+    ...new Set(
+      String(req.query.ids || "")
+        .split(",")
+        .map((v) => v.trim())
+        .filter((v) => /^[0-9]{6,25}$/.test(v)),
+    ),
+  ].slice(0, MAX_LIVE_IDS);
+  if (!ids.length) return res.json({ success: true, at: new Date(), stock: {} });
+  try {
+    const details = await fetchItemDetails(ids);
+    const stock = {};
+    for (const d of details) {
+      stock[String(d.item_id)] = {
+        available: Number(d.actual_available_for_sale_stock) || 0,
+        stockOnHand: Number(d.stock_on_hand) || 0,
+        committed: Number(d.actual_committed_stock) || 0,
+      };
+    }
+    return res.json({ success: true, at: new Date(), stock });
+  } catch (error) {
+    console.error("Live stock read error:", error.message);
+    return res.status(502).json({ success: false, message: "Could not read live stock from Zoho" });
+  }
+});
+
+// ── GET /stock-monitor/item/:itemId/sales-trend?weeks=12 ────────────
+// Units sold per week for one item, live from Zoho Analytics — the drawer's
+// trend, in place of the stock-by-day history the daily snapshot used to
+// hold (Zoho has no past-date stock, but it has every sale). Online orders
+// plus offline-sale adjustments, in whole weeks counted back from now,
+// oldest first.
+router.get("/item/:itemId/sales-trend", VIEW, async (req, res) => {
+  const itemId = String(req.params.itemId || "").trim();
+  if (!/^[0-9]{6,25}$/.test(itemId)) {
+    return res.status(400).json({ success: false, message: "Bad item id" });
+  }
+  const weeks = Math.min(52, Math.max(4, parseInt(req.query.weeks, 10) || 12));
+  const WEEK = 7 * 86400000;
+  try {
+    const { salesRows, adjustmentRows, reasonByAdjustment } = await fetchItemWindowRows(itemId, weeks * 7);
+    const now = Date.now();
+    const buckets = Array.from({ length: weeks }, (_, i) => ({
+      from: new Date(now - (weeks - i) * WEEK),
+      to: new Date(now - (weeks - i - 1) * WEEK),
+      units: 0,
+      online: 0,
+      offline: 0,
+      scopes: {},
+    }));
+    // Analytics stamps are "2026-08-28 12:32:14"; read as plain timestamps.
+    const add = (when, qty, scope) => {
+      const d = new Date(String(when || "").replace(" ", "T"));
+      if (Number.isNaN(d.getTime()) || !qty) return;
+      const idx = weeks - 1 - Math.floor((now - d.getTime()) / WEEK);
+      if (idx < 0 || idx >= weeks) return;
+      const b = buckets[idx];
+      b.units += qty;
+      if (scope === "online") b.online += qty;
+      else {
+        b.offline += qty;
+        b.scopes[scope] = (b.scopes[scope] || 0) + qty;
+      }
+    };
+    for (const r of salesRows) add(r["Created Time"], Number(r["Quantity"]) || 0, "online");
+    for (const r of adjustmentRows) {
+      const scope = OFFLINE_SALE_SCOPES[reasonByAdjustment.get(r["Inventory Adjustment ID"])];
+      if (!scope) continue;
+      // Stock leaving is a negative adjustment; flip it so sales read positive.
+      add(r["Created Time"], (Number(r["Quantity Adjusted"]) || 0) * -1, scope);
+    }
+    const round = (n) => Math.round(n * 100) / 100;
+    return res.json({
+      success: true,
+      weeks,
+      trend: buckets.map((b) => ({
+        from: b.from,
+        to: b.to,
+        units: round(b.units),
+        online: round(b.online),
+        offline: round(b.offline),
+        // The offline part by scope (inflow / repair / neto / dashboard).
+        scopes: Object.fromEntries(Object.entries(b.scopes).map(([k, v]) => [k, round(v)])),
+      })),
+    });
+  } catch (error) {
+    console.error("Sales trend error:", error.message);
+    return res.status(502).json({ success: false, message: "Could not read the sales trend from Zoho" });
+  }
+});
+
 // ── GET /stock-monitor/item/:itemId/prices ──────────────────────────
 // The four price-list rates for one item, read live from the Analytics
 // prices view — the Price Monitoring page's "check live" button. One call;
-// fresher than the nightly snapshot (Analytics itself syncs from Inventory
+// fresher than the nightly refresh (Analytics itself syncs from Inventory
 // within a few hours of a price push).
 const PRICES_VIEW_ID = "1404913000003936194";
 const PRICE_LISTS = {
@@ -840,9 +925,9 @@ router.get("/item/:itemId/prices", VIEW, async (req, res) => {
 // (PUT /pricebooks/{id}/items with an items array), which updates only the
 // named item and never touches the rest of the book. The whole-book PUT
 // REPLACES the book and must never be used here.
-// On success the rate is mirrored into today's snapshot row and the row's
+// On success the rate is mirrored into the register row and the row's
 // price-health flags recomputed, so the page reflects the push immediately
-// (Zoho Analytics — the snapshot's source — lags a price push by hours).
+// (Zoho Analytics — the refresh's source — lags a price push by hours).
 const PRICE_FIELDS = {
   platinum: "pricePlatinum",
   vip: "priceVip",
@@ -852,7 +937,7 @@ const PRICE_FIELDS = {
 const PRICE_PLACEHOLDERS = new Set([9999.99, 9000, 8888, 7777, 7000, 6000]);
 const { evaluatePriceRule } = require("../../utils/priceRules");
 
-// Same rule as the snapshot job: SVIP ≤ VIP, WholeSale ≤ VIP, VIP ≤
+// Same rule as the refresh job: SVIP ≤ VIP, WholeSale ≤ VIP, VIP ≤
 // Platinum (SVIP vs WholeSale deliberately unordered), placeholders and
 // missing rates skipped.
 function priceHealthFlags(row) {
@@ -872,7 +957,7 @@ function priceHealthFlags(row) {
   };
 }
 
-// Per-product lock for the snapshot mirror below. Pushes for the same
+// Per-product lock for the register mirror below. Pushes for the same
 // product go to Zoho in parallel (that call is the slow part); only the
 // quick read → recompute flags → write runs one at a time, or two pushes
 // would each compute flags without the other's new rate. In-process, so it
@@ -921,13 +1006,11 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
         .json({ success: false, message: (resp && resp.message) || "Zoho rejected the price update" });
     }
 
-    // Mirror into today's snapshot and recompute this row's flags.
+    // Mirror into the register and recompute this row's flags.
     const db = await connectToDatabase();
-    const snapshotDate = await latestSnapshotDate(db);
     const mirrored = await withItemLock(itemId, async () => {
-      if (!snapshotDate) return null;
-      const row = await db.collection(DAILY).findOne(
-        { snapshotDate, itemId },
+      const row = await db.collection(ITEMS).findOne(
+        { itemId },
         {
           projection: {
             pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1,
@@ -942,10 +1025,7 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
         // The formula verdict moves with the new rate too.
         priceRuleBroken: evaluatePriceRule(row).broken,
       };
-      await db.collection(DAILY).updateMany(
-        { snapshotDate, itemId },
-        { $set: { [field]: rounded, ...next } },
-      );
+      await db.collection(ITEMS).updateOne({ itemId }, { $set: { [field]: rounded, ...next } });
       return { flags: next, seq: ++mirrorSeq };
     });
     return res.json({

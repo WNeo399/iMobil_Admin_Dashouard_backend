@@ -1,20 +1,22 @@
-// Daily spare-parts / accessories stock snapshot.
+// Spare-parts / accessories stock register refresh.
 //
-// Reads the whole active + shelved catalogue out of Zoho once — stock,
-// attributes, 90 days of sales — joins it to our own product catalogue and
-// open purchase orders, and writes one row per item per day. The Stock
-// Monitoring dashboard then answers every question from Mongo, with no Zoho
-// call in the request path: the sweep takes about a minute, which is fine
-// once a day and impossible on page load.
+// Reads the whole active catalogue out of Zoho once — stock, attributes,
+// 90 days of sales — joins it to our own product catalogue and open
+// purchase orders, and updates ONE row per item in imb_stock_items
+// (utils/stockItems): catalogue fields at the top level, the numbers under
+// `metrics`. New items are inserted, items Zoho no longer lists are flagged
+// inactive; nothing is duplicated per day. The Stock Monitoring pages then
+// answer every list, tile and sort from Mongo, and read live stock from
+// Zoho only for the rows on screen.
 //
 //   node bin/stockSnapshot.js              dry run — reports, writes nothing
-//   node bin/stockSnapshot.js --apply      writes the snapshot
+//   node bin/stockSnapshot.js --apply      refreshes the register
 //   node bin/stockSnapshot.js --days=180   a deeper sales window (default 90)
 //
-// Re-running for the same day replaces that day's rows, so it is safe to
-// run twice. Designed to be the entrypoint of the Sealos cron container,
-// which is why it takes no arguments it cannot default and exits non-zero
-// on failure.
+// Re-running just refreshes again, so it is safe to run twice. Designed to
+// be the entrypoint of the Sealos cron container (and the dashboard's
+// "Update Now"), which is why it takes no arguments it cannot default and
+// exits non-zero on failure.
 
 require("dotenv").config();
 
@@ -26,7 +28,7 @@ const {
   fetchItemDetails,
   itemLocation,
   fetchWindowRows,
-  OFFLINE_SALE_REASONS,
+  OFFLINE_SALE_SCOPES,
 } = require("../utils/zohoStock");
 const { getViewData } = require("../utils/zohoRequest");
 const { isNoiseName, ARCHIVE_COLLECTION } = require("../utils/stockUniverse");
@@ -35,7 +37,18 @@ const { isNoiseName, ARCHIVE_COLLECTION } = require("../utils/stockUniverse");
 const { imageIdOf } = require("../utils/productImage");
 const { evaluatePriceRule } = require("../utils/priceRules");
 
-const ITEMS_DAILY = "imb_stock_daily";
+const {
+  ITEMS,
+  ACCESSORY_BRANDS,
+  OPEN_PO_STATUSES,
+  skuKey,
+  num,
+  stockFlags,
+  emptySaleUnits,
+  roundSaleUnits,
+  splitRow,
+  ensureIndexes,
+} = require("../utils/stockItems");
 const RUNS = "imb_stock_runs";
 const PRODUCTS = "imb_products";
 const PURCHASE_ORDERS = "imb_purchase_order";
@@ -58,21 +71,13 @@ const UNIVERSE = `"Status" = 'Active'`;
 //   1. Zoho Classification in the set below;
 //   2. membership in any accessoryCollections collection (the accessory
 //      pages' own data set);
-//   3. a Zoho Brand from the accessory-brand list — drawn from the brands
-//      on accessory-classified stock. Deliberately NOT Apple / Samsung,
-//      which brand real parts too.
+//   3. a Zoho Brand from the accessory-brand list (ACCESSORY_BRANDS in
+//      utils/stockItems, shared with the hourly sync).
 // Everything else counts as a spare part.
 const ACCESSORY_CLASSIFICATIONS = new Set([
   "Accessory",
   "Accessory Special Offer",
 ]);
-const ACCESSORY_BRANDS = new Set([
-  "Accessory", "iShield", "Roar", "Ugly Rubber UR", "X.One", "Halosure",
-  "Remax", "JoyRoom", "HOCO", "COTECi", "Rock", "Blue Nation", "Baseus",
-]);
-
-// A PO line still owes us stock until it is received (or cancelled).
-const OPEN_PO_STATUSES = { $nin: ["received", "cancelled"] };
 
 // The four Zoho price lists the Price Monitoring page shows, keyed by the
 // snapshot field suffix. Expected PRICE order (user-confirmed 2026-09-15):
@@ -107,11 +112,6 @@ const DAYS = (() => {
 })();
 
 const log = (...a) => console.log(...a);
-const num = (v) => {
-  const n = Number(String(v == null ? "" : v).replace(/[^0-9.-]/g, ""));
-  return Number.isFinite(n) ? n : 0;
-};
-const skuKey = (v) => String(v == null ? "" : v).trim().toUpperCase();
 
 // Snapshots are keyed by calendar day in Melbourne, because that is the day
 // the warehouse means when it says "yesterday's numbers".
@@ -204,31 +204,34 @@ async function main() {
     const byItem = new Map();
     const at = (id) => {
       if (!byItem.has(id)) {
-        byItem.set(id, { units: {}, online: 0, offline: 0, lastSaleAt: null });
-        for (const b of BUCKETS) byItem.get(id).units[b] = 0;
+        byItem.set(id, { units: {}, lastSaleAt: null });
+        for (const b of BUCKETS) byItem.get(id).units[b] = emptySaleUnits();
       }
       return byItem.get(id);
     };
-    const record = (id, qty, when, offline) => {
+    // Every window counts by scope: orders under `online`, each counted
+    // adjustment reason under its own name, and the total across all.
+    const record = (id, qty, when, scope) => {
       if (!id || !qty) return;
       const e = at(id);
       const d = parseWhen(when);
-      if (d) {
-        const ageDays = (now - d.getTime()) / 86400000;
-        for (const b of BUCKETS) if (ageDays <= b) e.units[b] += qty;
-        if (!e.lastSaleAt || d > e.lastSaleAt) e.lastSaleAt = d;
+      if (!d) return;
+      const ageDays = (now - d.getTime()) / 86400000;
+      for (const b of BUCKETS) {
+        if (ageDays > b) continue;
+        e.units[b].total += qty;
+        e.units[b][scope] += qty;
       }
-      if (offline) e.offline += qty;
-      else e.online += qty;
+      if (!e.lastSaleAt || d > e.lastSaleAt) e.lastSaleAt = d;
     };
     for (const r of salesRows) {
-      record(r["Product ID"], num(r["Quantity"]), r["Created Time"], false);
+      record(r["Product ID"], num(r["Quantity"]), r["Created Time"], "online");
     }
     for (const r of adjustmentRows) {
-      const reason = reasonByAdjustment.get(r["Inventory Adjustment ID"]);
-      if (!OFFLINE_SALE_REASONS.has(reason)) continue;
+      const scope = OFFLINE_SALE_SCOPES[reasonByAdjustment.get(r["Inventory Adjustment ID"])];
+      if (!scope) continue;
       // Stock leaving is a negative adjustment; flip it so sales read positive.
-      record(r["Product ID"], num(r["Quantity Adjusted"]) * -1, r["Created Time"], true);
+      record(r["Product ID"], num(r["Quantity Adjusted"]) * -1, r["Created Time"], scope);
     }
     log(`  sales:      ${salesRows.length} order rows + ${adjustmentRows.length} adjustments` +
       ` → ${byItem.size} items with movement`);
@@ -322,16 +325,11 @@ async function main() {
 
     const available = num(d.actual_available_for_sale_stock);
     const units = {};
-    for (const b of BUCKETS) units[b] = s ? Math.round(s.units[b] * 100) / 100 : 0;
+    for (const b of BUCKETS) units[b] = roundSaleUnits(s ? s.units[b] : null);
     const lastSaleAt = s && s.lastSaleAt ? s.lastSaleAt : null;
     const daysSinceSale = lastSaleAt ? (now - lastSaleAt.getTime()) / 86400000 : null;
 
-    // Demand rate from the 30-day window, which is the horizon the tiles
-    // talk about; cover is how long stock lasts at that rate.
-    const rate30 = units[30] / 30;
     const openPoQty = po ? po.qty : 0;
-
-    const outOfStock = available <= 0;
 
     // Archive bucket: the shared name criteria, or a manual "archive"
     // mark; a manual "keep" pins the item live regardless of criteria.
@@ -406,12 +404,11 @@ async function main() {
       stockOnHand: num(d.stock_on_hand),
       committed: num(d.actual_committed_stock),
 
+      // Each window by scope: { total, online, inflow, repair, neto, dashboard }.
       units7: units[7],
       units14: units[14],
       units30: units[30],
       units90: units[90],
-      onlineUnits: s ? Math.round(s.online * 100) / 100 : 0,
-      offlineUnits: s ? Math.round(s.offline * 100) / 100 : 0,
       lastSaleAt,
       daysSinceSale: daysSinceSale == null ? null : Math.floor(daysSinceSale),
 
@@ -435,17 +432,14 @@ async function main() {
       priceExpected: ruleEval.expected,
       priceRuleBroken: ruleEval.broken,
 
-      // The flags the dashboard tiles count.
-      outOfStock,
-      outOfStockCovered: outOfStock && openPoQty > 0,
-      outOfStockUncovered: outOfStock && openPoQty <= 0,
-      belowMonthCover: available < units[30],
-      stale: units[STALE_DAYS] === 0,
+      // The flags the dashboard tiles count (stockFlags: out of stock /
+      // on order / below cover, and days of cover at the 30-day rate).
+      ...stockFlags({ available, units30: units[30].total, openPoQty }),
+      stale: units[STALE_DAYS].total === 0,
       // The Archive bucket: criteria matches + manual marks (see above).
       // NOT the old "no sales, no stock" meaning — those stay in All Items.
       archived,
       archivedReason: archived ? (override === "archive" ? "manual" : "criteria") : null,
-      daysOfCover: rate30 > 0 ? Math.round((available / rate30) * 10) / 10 : null,
     });
   }
 
@@ -472,10 +466,13 @@ async function main() {
   }
 
   const durationMs = Date.now() - startedAt.getTime();
+  const finishedAt = new Date();
   const run = {
     snapshotDate,
+    // When the numbers were taken — the rows' metricsAt.
+    metricsAt: finishedAt,
     startedAt,
-    finishedAt: new Date(),
+    finishedAt,
     durationMs,
     ok: true,
     salesWindowDays: DAYS,
@@ -498,23 +495,50 @@ async function main() {
 
   if (!APPLY) {
     log("\nDRY RUN — nothing written. Pass --apply to store this snapshot.");
-    log(`  would write ${rows.length} rows to ${ITEMS_DAILY} for ${snapshotDate}`);
+    log(`  would refresh ${rows.length} rows in ${ITEMS}`);
     log(`  sample: ${JSON.stringify(rows.find((r) => r.outOfStockUncovered) || rows[0], null, 2).slice(0, 700)}`);
     return;
   }
 
   // ── 8. write ──────────────────────────────────────────────────────
-  // Replace the day rather than appending, so a re-run corrects rather
-  // than duplicates.
-  await db.collection(ITEMS_DAILY).deleteMany({ snapshotDate });
-  for (let i = 0; i < rows.length; i += 1000) {
-    await db.collection(ITEMS_DAILY).insertMany(rows.slice(i, i + 1000), { ordered: false });
+  // Update in place, one row per item. Every row this run produced gets
+  // its catalogue fields and a whole new `metrics`, stamped with the same
+  // instant; a row the run did NOT touch is an item Zoho no longer lists,
+  // so it is flagged inactive rather than deleted (its manual archive
+  // mark and price history stay readable).
+  const items = db.collection(ITEMS);
+  await ensureIndexes(db);
+  const ops = rows.map((row) => {
+    const { catalogue, metrics } = splitRow(row);
+    return {
+      updateOne: {
+        filter: { itemId: row.itemId },
+        update: {
+          $set: { ...catalogue, metrics, metricsAt: finishedAt, active: true, lastSeenAt: finishedAt, inactiveAt: null },
+          $setOnInsert: { firstSeenAt: finishedAt },
+        },
+        upsert: true,
+      },
+    };
+  });
+  let inserted = 0;
+  for (let i = 0; i < ops.length; i += 1000) {
+    const r = await items.bulkWrite(ops.slice(i, i + 1000), { ordered: false });
+    inserted += r.upsertedCount || 0;
   }
-  await db.collection(ITEMS_DAILY).createIndex({ snapshotDate: 1, itemId: 1 }, { unique: true });
-  await db.collection(ITEMS_DAILY).createIndex({ snapshotDate: 1, scope: 1, sku: 1 });
-  await db.collection(ITEMS_DAILY).createIndex({ snapshotDate: 1, scope: 1, outOfStock: 1 });
+  const gone = await items.updateMany(
+    { active: true, lastSeenAt: { $lt: finishedAt } },
+    { $set: { active: false, inactiveAt: finishedAt } },
+  );
+  run.counts.inserted = inserted;
+  run.counts.inactivated = gone.modifiedCount || 0;
+  // The write is a good share of the run now that rows are upserted one by
+  // one rather than inserted in bulk — count it in the duration.
+  run.timings.write = Date.now() - finishedAt.getTime();
+  run.durationMs = Date.now() - startedAt.getTime();
+  run.finishedAt = new Date();
   await db.collection(RUNS).insertOne(run);
-  log(`\nwrote ${rows.length} rows to ${ITEMS_DAILY} for ${snapshotDate}`);
+  log(`\nrefreshed ${rows.length} rows in ${ITEMS} · ${inserted} new · ${gone.modifiedCount || 0} no longer listed`);
 }
 
 main()

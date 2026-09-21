@@ -254,16 +254,13 @@ async function fetchStockShapedItems(itemIds, options = {}) {
 
 // ── sales ───────────────────────────────────────────────────────────
 
-// Adjustments are how counter trade and workshop usage leave stock, so
-// they count as sales — but only these reasons. Anything else (a stock
-// take correction, a write-off) is not demand.
-const OFFLINE_SALE_REASONS = new Set([
-  "iMobile Repair Team",
-  "Inflow Recurring Adjustment",
-  // Accessories sold through the Neto storefront leave stock as
-  // adjustments with this reason — demand, same as the two above.
-  "Neto Accessories Sold",
-]);
+// Adjustments are how counter trade, workshop usage, the Neto store and
+// dashboard dispatch leave stock, so they count as sales — but only the
+// reasons in OFFLINE_SALE_SCOPES (utils/stockItems), each a sales scope of
+// its own. Anything else (a stock take correction, a write-off) is not
+// demand.
+const { OFFLINE_SALE_SCOPES } = require("./stockItems");
+const OFFLINE_SALE_REASONS = new Set(Object.keys(OFFLINE_SALE_SCOPES));
 
 // Past this many ids, filtering the Analytics views by Product ID costs
 // more requests than simply reading the whole window. Zoho caps Analytics
@@ -347,6 +344,49 @@ async function fetchWindowRows(duration = 30) {
     reasonRows.map((r) => [r["Inventory Adjustment ID"], r.Reason]),
   );
 
+  return { since, salesRows, adjustmentRows, reasonByAdjustment };
+}
+
+// One item's sales and offline-sale adjustments over the last `days`, as
+// raw rows — the item drawer's sales-by-week trend. Filtered in the query,
+// so it is two small Analytics reads (a third for the adjustments' reasons
+// when there are any).
+async function fetchItemWindowRows(itemId, days = 84) {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .split("T")[0];
+  const id = String(itemId).replace(/[^0-9]/g, "");
+  const [salesRows, adjustmentRows] = await Promise.all([
+    analyticsRows(
+      analyticsUrl(SALES_VIEW_ID, {
+        responseFormat: "json",
+        selectedColumns: ["Product ID", "Quantity", "Created Time"],
+        criteria: `("Product ID" = '${id}') AND ("Created Time" >= '${since}')`,
+      }),
+      "item sales rows",
+    ),
+    analyticsRows(
+      analyticsUrl(ADJUSTMENTS_VIEW_ID, {
+        responseFormat: "json",
+        selectedColumns: ["Product ID", "Inventory Adjustment ID", "Quantity Adjusted", "Created Time"],
+        criteria: `("Product ID" = '${id}') AND ("Created Time" >= '${since}')`,
+      }),
+      "item adjustment rows",
+    ),
+  ]);
+  const reasonByAdjustment = new Map();
+  const adjustmentIds = [...new Set(adjustmentRows.map((r) => r["Inventory Adjustment ID"]).filter(Boolean))];
+  if (adjustmentIds.length) {
+    const reasonRows = await analyticsRows(
+      analyticsUrl(ADJUSTMENT_REASONS_VIEW_ID, {
+        responseFormat: "json",
+        selectedColumns: ["Inventory Adjustment ID", "Reason"],
+        criteria: `"Inventory Adjustment ID" IN (${buildInClause(adjustmentIds)})`,
+      }),
+      "item adjustment reasons",
+    );
+    for (const r of reasonRows) reasonByAdjustment.set(r["Inventory Adjustment ID"], r.Reason);
+  }
   return { since, salesRows, adjustmentRows, reasonByAdjustment };
 }
 
@@ -467,9 +507,11 @@ module.exports = {
   getSalesTotals,
   getSalesTotalsForWindow,
   fetchWindowRows,
+  fetchItemWindowRows,
   tallySales,
   WHOLE_WINDOW_THRESHOLD,
   OFFLINE_SALE_REASONS,
+  OFFLINE_SALE_SCOPES,
   ITEM_ATTRIBUTE_COLUMNS,
   fetchItemAttributes,
 };
