@@ -41,6 +41,8 @@ var svpPublicRouter = require('./routes/svpPublicRoutes/index');
 var notificationRouter = require('./routes/notificationRoutes/index');
 // Purchase Order — read-only view over the supplier's Tencent Docs sheet.
 var purchaseOrderRouter = require('./routes/purchaseOrderRoutes/index');
+// Spare Parts Purchase — the in-app purchase process that replaces the sheet.
+var sparePartsPurchaseRouter = require('./routes/sparePartsPurchaseRoutes/index');
 // Refurbished Phones — read-only views over the external scraper MySQL DB.
 var refurbishedRouter = require('./routes/refurbishedRoutes/index');
 // Stock Monitoring — reads the daily snapshot bin/stockSnapshot.js writes,
@@ -174,6 +176,7 @@ app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
 app.use('/svpSerial', authenticate, svpSerialRouter);
 app.use('/notifications', authenticate, notificationRouter);
 app.use('/purchaseOrder', authenticate, purchaseOrderRouter);
+app.use('/sparePartsPurchase', authenticate, sparePartsPurchaseRouter);
 app.use('/refurbished', authenticate, refurbishedRouter);
 app.use('/stock-monitor', authenticate, stockMonitorRouter);
 app.use('/aiQuery', authenticate, aiQueryRouter);

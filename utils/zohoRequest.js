@@ -387,6 +387,31 @@ async function handleZohoInventoryPutRequest(url, params) {
   }
 }
 
+// DELETE with the same token-refresh dance (e.g. removing a purchase order
+// whose batch was cancelled). Resolves to Zoho's reply, or an error shape.
+async function handleZohoInventoryDeleteRequest(url) {
+  const fetchData = async (requestUrl) => {
+    try {
+      const response = await axios.delete(requestUrl, {
+        headers: { Authorization: `Zoho-oauthtoken ${requestToken}` },
+      });
+      return response.data;
+    } catch (error) {
+      console.error("Error deleting:", error?.response?.data || error.message);
+      return error?.response?.data || { success: false, error: error.message };
+    }
+  };
+
+  let data = await fetchData(url);
+  if (isTokenExpired(data)) {
+    console.log("Token Expired! Refreshing...");
+    const newAccessToken = await refreshToken(true);
+    if (!newAccessToken) throw new Error("Failed to refresh token.");
+    data = await fetchData(url);
+  }
+  return data;
+}
+
 module.exports = {
   createExportJob,
   getJobData,
@@ -394,6 +419,7 @@ module.exports = {
   handleZohoInventoryPostRequest,
   handleZohoInventoryMultipartPostRequest,
   handleZohoInventoryPutRequest,
+  handleZohoInventoryDeleteRequest,
   getViewData,
   // Exported so callers that fan out many parallel Zoho requests can
   // proactively refresh once up front, avoiding the per-call reactive

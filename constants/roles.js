@@ -21,6 +21,9 @@ const ROLES = {
   CONSIGNMENT_SHOP: "consignment-shop",
   // Purchasing staff — the Purchase Order page + Special Order triage only.
   IMOBILE_PURCHASE: "imobile-purchase",
+  // The spare-parts purchase partner (buys from the factories, ships the
+  // batches to iMobile) — Spare Parts Purchase only.
+  PARTS_SUPPLIER: "parts-supplier",
 };
 
 const ROLE_LABELS = {
@@ -34,6 +37,7 @@ const ROLE_LABELS = {
   [ROLES.PHONE_SUPPLIER]: "Phone Supplier",
   [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
   [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
+  [ROLES.PARTS_SUPPLIER]: "Parts Supplier",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -64,6 +68,7 @@ const ROLE_GROUP_OF = {
   [ROLES.PHONE_SUPPLIER]: ROLE_GROUPS.IMOBILE,
   [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
   [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
+  [ROLES.PARTS_SUPPLIER]: ROLE_GROUPS.IMOBILE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -94,7 +99,7 @@ const ROLE_PERMISSIONS = {
   // ai:* grant here, so only the Admin role ("*:*:*") sees the orb / can query.
   // Add "ai:query:use" (or "ai:*:*") here to open it up to iMobile Admin later.
   [ROLES.IMOBILE_ADMIN]: [
-    "zoho:*:*", "repair:*:*", "svp:*:*", "po:*:*", "refurb:*:*",
+    "zoho:*:*", "repair:*:*", "svp:*:*", "po:*:*", "refurb:*:*", "spp:*:*",
     "inflow:order:view", "inflow:customer:view",
   ],
   // iMobile Repair Admin: starts with full Repair access so the role is
@@ -132,6 +137,16 @@ const ROLE_PERMISSIONS = {
   // (po:specialOrder:view via the wildcard). Deliberately NOT
   // zoho:salesOrder:create, which would also unlock the Credit Note page.
   [ROLES.IMOBILE_PURCHASE]: ["po:*:*"],
+  // Parts Supplier — Spare Parts Purchase: sees every order, quotes / places
+  // / flags shortages, ships batches. Creating orders and receiving batches
+  // stay with iMobile (spp:order:create / spp:order:receive).
+  [ROLES.PARTS_SUPPLIER]: [
+    "spp:order:view",
+    "spp:order:supply",
+    "spp:batch:view",
+    "spp:batch:create",
+    "spp:batch:manage",
+  ],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
