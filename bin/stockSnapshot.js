@@ -22,11 +22,11 @@ require("dotenv").config();
 
 const { connectToDatabase } = require("../utils/mongodb");
 const {
-  getItemIdsFromCriteria,
-  resolveCollectionItemIds,
   fetchItemAttributes,
   fetchItemDetails,
   itemLocation,
+  itemCatalogueFields,
+  fetchItemListFields,
   fetchWindowRows,
   OFFLINE_SALE_SCOPES,
 } = require("../utils/zohoStock");
@@ -36,9 +36,14 @@ const { isNoiseName, ARCHIVE_COLLECTION } = require("../utils/stockUniverse");
 // the URL when a page reads it. null = the item has no image.
 const { imageIdOf } = require("../utils/productImage");
 const { evaluatePriceRule } = require("../utils/priceRules");
+// A collection is a filter over the register (2026-09-22): its members are
+// found with a Mongo query, so the tags are stamped AFTER the rows are
+// written, from the rows just written.
+const { resolveCollectionItemIds, SCOPE_BY_STORE, TAG_FIELD_BY_STORE } = require("../utils/collectionFilter");
 
 const {
   ITEMS,
+  ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
   OPEN_PO_STATUSES,
   skuKey,
@@ -66,18 +71,15 @@ const COLLECTION_GROUPS = "productCollectionsGroups";
 const UNIVERSE = `"Status" = 'Active'`;
 
 // Accessories are told apart three ways (2026-09-15) — Classification is
-// right when present, but ~5,400 items carry none, and accessory products
-// among them (cables, protectors) would otherwise land in parts:
-//   1. Zoho Classification in the set below;
+// right when present, but items carrying none (cables, protectors among
+// them) would otherwise land in parts:
+//   1. Zoho Classification in ACCESSORY_CLASSIFICATIONS (utils/stockItems,
+//      shared with the hourly sync);
 //   2. membership in any accessoryCollections collection (the accessory
 //      pages' own data set);
-//   3. a Zoho Brand from the accessory-brand list (ACCESSORY_BRANDS in
-//      utils/stockItems, shared with the hourly sync).
+//   3. a Zoho Brand from the accessory-brand list (ACCESSORY_BRANDS, same
+//      module).
 // Everything else counts as a spare part.
-const ACCESSORY_CLASSIFICATIONS = new Set([
-  "Accessory",
-  "Accessory Special Offer",
-]);
 
 // The four Zoho price lists the Price Monitoring page shows, keyed by the
 // snapshot field suffix. Expected PRICE order (user-confirmed 2026-09-15):
@@ -168,34 +170,22 @@ async function main() {
   }
   log(`  stock:      ${details.length}`);
 
+  // ── 2b. the list-only fields ──────────────────────────────────────
+  // Shown in store and Zoho's category live on the items list alone
+  // (fetchItemListFields) — one more pass.
+  const listById = await stage("storefront", () => fetchItemListFields());
+  log(`  storefront: ${[...listById.values()].filter((v) => v.showInStore).length} of ${listById.size} listed items shown in store`);
+
   // ── 3. collection tags ────────────────────────────────────────────
-  const { collectionsByItem, groupByCollection, accessoryItemIds } = await stage("collections", async () => {
-    const groups = await db.collection(COLLECTION_GROUPS).find({}).toArray();
-    const groupByCollection = new Map();
-    for (const g of groups) {
-      for (const c of g.collections || []) {
-        if (c && c.title) groupByCollection.set(c.title, g.title);
-      }
+  // Stamped after the write (step 9): a collection is a filter over the
+  // register, and the rows it should match are the ones about to be
+  // written. Only the folder each collection sits in is known now.
+  const groupByCollection = new Map();
+  for (const g of await db.collection(COLLECTION_GROUPS).find({}).toArray()) {
+    for (const c of g.collections || []) {
+      if (c && c.title) groupByCollection.set(c.title, g.title);
     }
-    const collections = await db.collection(COLLECTIONS).find({}).toArray();
-    const collectionsByItem = new Map();
-    for (const c of collections) {
-      for (const id of await resolveCollectionItemIds(c)) {
-        if (!collectionsByItem.has(id)) collectionsByItem.set(id, []);
-        collectionsByItem.get(id).push(c.title);
-      }
-    }
-    // The accessories business keeps its own collection set — membership
-    // there marks an item as an accessory even when its Classification is
-    // blank. Kept separate from collectionsByItem so accessory titles never
-    // leak into the spare-parts Collections filter options.
-    const accessoryItemIds = new Set();
-    for (const c of await db.collection("accessoryCollections").find({}).toArray()) {
-      for (const id of await resolveCollectionItemIds(c)) accessoryItemIds.add(id);
-    }
-    return { collectionsByItem, groupByCollection, accessoryItemIds };
-  });
-  log(`  tagged:     ${collectionsByItem.size} items belong to a collection · ${accessoryItemIds.size} in accessory collections`);
+  }
 
   // ── 4. sales, one read for every bucket ───────────────────────────
   const sales = await stage("sales", async () => {
@@ -318,7 +308,9 @@ async function main() {
     // ("credit", "startrack shipment refund", …) all lack one.
     if (!sku) continue;
     const key = skuKey(sku);
-    const classification = String(a.Classification || "").trim();
+    // Zoho's catalogue custom fields; the classification decides the scope.
+    const cf = itemCatalogueFields(d);
+    const classification = cf.classification;
     const s = sales.get(id);
     const po = poBySku.get(key);
     const product = productBySku.get(key);
@@ -361,7 +353,7 @@ async function main() {
       name: a["Item Name"] || d.name,
       category: product && product.category ? product.category.name : null,
       classification,
-      quality: product && product.quality ? product.quality.name : null,
+      quality: cf.quality,
       purchasePrice: purchase,
       priceWholesale: pr.wholesale,
       priceSvip: pr.svip,
@@ -374,33 +366,50 @@ async function main() {
       sku,
       name: String(a["Item Name"] || d.name || ""),
       // Accessories and spare parts are separate businesses and get
-      // separate views. Classification, accessory-collection membership
-      // and accessory brand all mark an accessory; the rest is parts.
+      // separate views. Classification and accessory brand mark an
+      // accessory (accessory-collection membership used to as well, but
+      // a collection is now a filter over these very rows, and a filter
+      // cannot decide the scope it is filtered by); the rest is parts.
       scope:
         ACCESSORY_CLASSIFICATIONS.has(classification) ||
-        accessoryItemIds.has(id) ||
         ACCESSORY_BRANDS.has(String(a.Brand || "").trim())
           ? "accessory"
           : "parts",
       classification,
-      location: String(a.Location || itemLocation(d) || ""),
+      subClassification: cf.subClassification,
+      quality: cf.quality,
+      deviceBrand: cf.deviceBrand,
+      deviceSeries: cf.deviceSeries,
+      compatibleModels: cf.compatibleModels,
+      // Zoho's reorder point — the Accessories page edits it inline.
+      reorderLevel: num(d.reorder_level),
+      // The shelf from the item record first: Analytics carries it too but
+      // hours behind a move (the live page showed 4 of 35 iPad screens on a
+      // different shelf from the register on 2026-09-22).
+      location: String(itemLocation(d) || a.Location || ""),
       preferVendor: String(a["Prefer Vendor"] || ""),
       zohoBrand: String(a.Brand || ""),
       purchasePrice: num(a["Purchase Price"]),
 
-      collections: collectionsByItem.get(id) || [],
-      groups: [...new Set((collectionsByItem.get(id) || [])
-        .map((t) => groupByCollection.get(t))
-        .filter(Boolean))],
+      // `collections`, `accessoryCollections` and `groups` are stamped in
+      // step 9, after the rows exist to be matched.
 
-      // From our own catalogue, where the SKU matches.
+      // From the old imb_products catalogue, where the SKU matches — brand
+      // and category only, until Device Brand and Classification replace
+      // them on the pages. Its quality is no longer read: Zoho's Quality
+      // above is the record (the catalogue's "Original" was a default).
       brand: product && product.brand ? product.brand.name : null,
       category: product && product.category ? product.category.name : null,
-      quality: product && product.quality ? product.quality.name : null,
       inCatalogue: !!product,
       imageId: imageIdOf(d),
+      // From the items list: shown in the online store, and Zoho's own
+      // item category (accessories are organised by it; parts are not).
+      showInStore: !!(listById.get(id) || {}).showInStore,
+      zohoCategoryId: (listById.get(id) || {}).categoryId || "",
+      zohoCategory: (listById.get(id) || {}).category || "",
 
       available,
+      accountingStock: num(d.available_for_sale_stock),
       stockOnHand: num(d.stock_on_hand),
       committed: num(d.actual_committed_stock),
 
@@ -532,6 +541,41 @@ async function main() {
   );
   run.counts.inserted = inserted;
   run.counts.inactivated = gone.modifiedCount || 0;
+
+  // ── 9. collection tags ────────────────────────────────────────────
+  // Every collection's filter, run against the rows just written; the
+  // titles (and the folder each one sits in) go on the member rows, and
+  // come off everything else. The dashboard's Collection filter and the
+  // Stock Monitoring branch views read these tags.
+  const tagT = Date.now();
+  let tagged = 0;
+  for (const store of ["productCollections", "accessoryCollections"]) {
+    const field = TAG_FIELD_BY_STORE[store];
+    const byItem = new Map();
+    for (const c of await db.collection(store).find({}).toArray()) {
+      for (const id of await resolveCollectionItemIds(db, c, SCOPE_BY_STORE[store])) {
+        if (!byItem.has(id)) byItem.set(id, []);
+        byItem.get(id).push(c.title);
+      }
+    }
+    const tagOps = [];
+    for (const [id, titles] of byItem) {
+      const set = { [field]: titles };
+      if (store === "productCollections") {
+        set.groups = [...new Set(titles.map((t) => groupByCollection.get(t)).filter(Boolean))];
+      }
+      tagOps.push({ updateOne: { filter: { itemId: id }, update: { $set: set } } });
+    }
+    for (let i = 0; i < tagOps.length; i += 1000) await items.bulkWrite(tagOps.slice(i, i + 1000), { ordered: false });
+    const clear = { [field]: [] };
+    if (store === "productCollections") clear.groups = [];
+    // Inactive rows too — an item that went inactive must not keep its tag.
+    await items.updateMany({ itemId: { $nin: [...byItem.keys()] }, [field]: { $ne: [] } }, { $set: clear });
+    if (store === "productCollections") tagged = byItem.size;
+    log(`  tagged:     ${byItem.size} items in ${store}`);
+  }
+  run.timings.tags = Date.now() - tagT;
+  run.counts.tagged = tagged;
   // The write is a good share of the run now that rows are upserted one by
   // one rather than inserted in bulk — count it in the duration.
   run.timings.write = Date.now() - finishedAt.getTime();

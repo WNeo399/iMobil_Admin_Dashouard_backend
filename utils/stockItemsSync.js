@@ -6,13 +6,16 @@
 // count. Measured 2026-09-21: ~155 items an hour against a 19k catalogue.
 // So each run reads just those (1 list call per 200, 1 details call per
 // 100), and updates their rows in place: name, SKU, shelf, image, purchase
-// price, our catalogue match, the archive rule, and current stock with the
-// stock-dependent flags. New items are inserted; an item gone inactive (or
+// price, Zoho's catalogue custom fields (classification, sub classification,
+// quality, device brand / series / compatible models), reorder level, the
+// shown-in-store flag (which the list row carries), our old catalogue
+// match, the archive rule, and current stock (physical and accounting) with
+// the stock-dependent flags. New items are inserted; an item gone inactive (or
 // left without a SKU) is flagged inactive at once.
 //
 // What it deliberately leaves to the nightly refresh (bin/stockSnapshot.js):
 // the sales windows and everything built on them, price lists and price
-// health, classification and collection tags (all Analytics reads), and
+// health, and collection tags (all Analytics reads), and
 // noticing deleted items (a "modified since" list never shows those). A new
 // item therefore arrives with its Zoho fields and empty demand, and is
 // filled in that night; its scope is guessed from the Zoho brand until then.
@@ -30,10 +33,11 @@
 
 const { connectToDatabase } = require("./mongodb");
 const { handleZohoInventoryRequest } = require("./zohoRequest");
-const { fetchItemDetails, itemLocation, ORGANIZATION_ID } = require("./zohoStock");
+const { fetchItemDetails, itemLocation, itemCatalogueFields, listFields, ORGANIZATION_ID } = require("./zohoStock");
 const {
   ITEMS,
   OPEN_PO_STATUSES,
+  ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
   skuKey,
   num,
@@ -136,6 +140,9 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
 
     const { items: listed, complete } = await listModifiedSince(readFrom);
     const ids = [...new Set(listed.map((i) => String(i.item_id)))];
+    // show_in_storefront and the Zoho category live on the list row, not
+    // the detail record.
+    const listById = new Map(listed.map((i) => [String(i.item_id), listFields(i)]));
     log(`stock sync: ${ids.length} items modified since ${readFrom.toISOString()}${complete ? "" : " (capped — more next run)"}`);
 
     let changed = 0, inserted = 0, inactivated = 0;
@@ -190,6 +197,7 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
         const units30 = u30 && typeof u30 === "object" ? num(u30.total) : num(u30);
         const flags = stockFlags({ available, units30, openPoQty });
         const zohoBrand = String(d.brand || "");
+        const cf = itemCatalogueFields(d);
 
         const set = {
           sku,
@@ -198,9 +206,20 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
           zohoBrand,
           purchasePrice: num(d.purchase_rate),
           imageId: imageIdOf(d),
+          showInStore: !!(listById.get(id) || {}).showInStore,
+          zohoCategoryId: (listById.get(id) || {}).categoryId || "",
+          zohoCategory: (listById.get(id) || {}).category || "",
+          // Zoho's catalogue custom fields and reorder point — an edit in
+          // Zoho shows on the pages within the hour.
+          classification: cf.classification,
+          subClassification: cf.subClassification,
+          quality: cf.quality,
+          deviceBrand: cf.deviceBrand,
+          deviceSeries: cf.deviceSeries,
+          compatibleModels: cf.compatibleModels,
+          reorderLevel: num(d.reorder_level),
           brand: product && product.brand ? product.brand.name : null,
           category: product && product.category ? product.category.name : null,
-          quality: product && product.quality ? product.quality.name : null,
           inCatalogue: !!product,
           archived,
           archivedReason: archived ? (override === "archive" ? "manual" : "criteria") : null,
@@ -209,6 +228,7 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
           lastSeenAt: startedAt,
           stockAt: startedAt,
           "metrics.available": available,
+          "metrics.accountingStock": num(d.available_for_sale_stock),
           "metrics.stockOnHand": num(d.stock_on_hand),
           "metrics.committed": num(d.actual_committed_stock),
           "metrics.openPoQty": openPoQty,
@@ -221,10 +241,10 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
         const setOnInsert = {
           firstSeenAt: startedAt,
           metricsAt,
-          scope: ACCESSORY_BRANDS.has(zohoBrand) ? "accessory" : "parts",
-          classification: "",
+          scope: ACCESSORY_CLASSIFICATIONS.has(cf.classification) || ACCESSORY_BRANDS.has(zohoBrand) ? "accessory" : "parts",
           preferVendor: "",
           collections: [],
+          accessoryCollections: [],
           groups: [],
           pricePlatinum: null,
           priceVip: null,

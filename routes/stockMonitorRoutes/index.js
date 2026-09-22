@@ -10,6 +10,7 @@
 //
 //   GET /stock-monitor/summary               as-of, tile counts, filter options
 //   GET /stock-monitor/items                 the working list, filtered and paged
+//   GET /stock-monitor/collection-items      a collection's rows (the Stock Monitoring list)
 //   GET /stock-monitor/shelves               shelf rollup for a stock take
 //   GET /stock-monitor/item/:id              one item's row
 //   GET /stock-monitor/live?ids=             live stock for the rows on screen
@@ -26,6 +27,7 @@
 
 var express = require("express");
 var router = express.Router();
+const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const {
@@ -41,6 +43,9 @@ const { imageIdOf, imageUrlFromId } = require("../../utils/productImage");
 const { ITEMS, flatten, path: fieldPath, melbourneDate } = require("../../utils/stockItems");
 const { runStockItemsSync, getStockItemsSyncState } = require("../../utils/stockItemsSync");
 const { startFullRefresh, isFullRefreshRunning, onFullRefreshFinished } = require("../../utils/stockRefresh");
+// A collection is a filter over the register — evaluated here on every
+// read, so the list is always current.
+const { collectionMatch, SCOPE_BY_STORE } = require("../../utils/collectionFilter");
 
 const RUNS = "imb_stock_runs";
 
@@ -381,6 +386,7 @@ router.get("/items", VIEW, async (req, res, next) => {
             pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1,
             priceMissing: 1, pricePlaceholder: 1, priceBelowCost: 1, priceOrderBroken: 1,
             priceRule: 1, priceExpected: 1, priceRuleBroken: 1, imageId: 1,
+            subClassification: 1, deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, reorderLevel: 1, showInStore: 1,
             // The numbers, merged into each row below.
             metrics: 1, metricsAt: 1,
           },
@@ -420,6 +426,121 @@ router.get("/items", VIEW, async (req, res, next) => {
     for (const r of rows) r.imageUrl = imageUrlFromId(r.imageId);
 
     return res.json({ success: true, snapshotDate, metricsAt, filter, page, pageSize, total, rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── GET /stock-monitor/collection-items?collection=<id>[,<id>] ──────
+// The Stock Monitoring list: every register row tagged with the named
+// collection(s). A comma-list is a branch (every collection under iPhone →
+// Screen at once), and each row then says which of them it came from
+// (memberOf) so the page's sub-category filter works. Rows carry the four
+// sales windows split online / offline, the shelf, the image and the
+// hidden / 海运 marks the page shows.
+//
+// Replaces GET /zoho/collectionStocks for spare parts (2026-09-22): that
+// one asked Analytics for the members and Inventory for every row's stock
+// on each click — a minute for a big branch. This answers from the register
+// in milliseconds; the page then overlays live stock on the rows it shows
+// through /live. Each collection's filter is run here, on every read, so
+// a rule saved a second ago and an item the hourly sync inserted a minute
+// ago both show at once. scope=accessories reads the accessories set.
+const HIDDEN = "imb_stock_hidden";
+router.get("/collection-items", VIEW, async (req, res, next) => {
+  try {
+    const raw = Array.isArray(req.query.collection) ? req.query.collection.join(",") : String(req.query.collection || "");
+    const ids = [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
+    if (!ids.length || ids.some((id) => !ObjectId.isValid(id))) {
+      return res.status(400).json({ success: false, message: "Invalid collection id" });
+    }
+    const accessories = String(req.query.scope || "") === "accessories";
+    const store = accessories ? "accessoryCollections" : "productCollections";
+    const scope = SCOPE_BY_STORE[store];
+
+    const db = await connectToDatabase();
+    const docs = await db
+      .collection(store)
+      .find({ _id: { $in: ids.map((id) => new ObjectId(id)) } }, { projection: { title: 1, filter: 1, products: 1 } })
+      .toArray();
+    if (!docs.length) return res.status(404).json({ success: false, message: "Collection not found" });
+    const refresh = await latestRefresh(db);
+
+    // Each collection's filter, run now. A branch unions them and notes
+    // which collection(s) each item came from.
+    const memberOf = new Map();
+    for (const doc of docs) {
+      const members = await db
+        .collection(ITEMS)
+        .find(collectionMatch(doc, scope), { projection: { _id: 0, itemId: 1 } })
+        .toArray();
+      for (const m of members) {
+        if (!memberOf.has(m.itemId)) memberOf.set(m.itemId, []);
+        memberOf.get(m.itemId).push(String(doc._id));
+      }
+    }
+    const stored = await db
+      .collection(ITEMS)
+      .find(
+        { itemId: { $in: [...memberOf.keys()] } },
+        {
+          projection: {
+            _id: 0, itemId: 1, sku: 1, name: 1, location: 1, imageId: 1, reorderLevel: 1,
+            classification: 1, subClassification: 1, quality: 1,
+            deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, showInStore: 1, metrics: 1,
+          },
+        },
+      )
+      .toArray();
+
+    const [hiddenDocs, sea] = await Promise.all([
+      db.collection(HIDDEN).find({ itemId: { $in: stored.map((r) => r.itemId) } }, { projection: { itemId: 1 } }).toArray(),
+      // 海运 membership badge — a parts concept.
+      accessories ? null : db.collection("productCollections").findOne({ seaFreight: true }, { projection: { products: 1 } }),
+    ]);
+    const hidden = new Set(hiddenDocs.map((h) => String(h.itemId)));
+    const seaIds = new Set(((sea && sea.products) || []).map((p) => String(p.itemId)));
+
+    // Units sold in a window, and how many of those were online orders
+    // (the rest: counter, workshop, Neto, dispatch).
+    const window = (u) => ({ total: (u && u.total) || 0, online: (u && u.online) || 0 });
+    const rows = stored
+      .map((r) => {
+        const m = r.metrics || {};
+        const row = {
+          id: r.itemId,
+          itemId: r.itemId,
+          sku: r.sku,
+          productName: r.name,
+          location: r.location || "",
+          stock: m.available || 0,
+          accountingStock: m.accountingStock || 0,
+          stockOnHand: m.stockOnHand || 0,
+          committed: m.committed || 0,
+          reorderLevel: r.reorderLevel || 0,
+          imageUrl: imageUrlFromId(r.imageId),
+          classification: r.classification || "",
+          subClassification: r.subClassification || "",
+          quality: r.quality || "",
+          deviceBrand: r.deviceBrand || "",
+          deviceSeries: r.deviceSeries || "",
+          compatibleModels: r.compatibleModels || [],
+          showInStore: !!r.showInStore,
+          sales: { 7: window(m.units7), 14: window(m.units14), 30: window(m.units30), 90: window(m.units90) },
+        };
+        if (docs.length > 1) row.memberOf = memberOf.get(r.itemId) || [];
+        if (hidden.has(r.itemId)) row.hidden = true;
+        if (seaIds.has(r.itemId)) row.seaFreight = true;
+        return row;
+      })
+      .sort((a, b) => a.productName.localeCompare(b.productName));
+
+    return res.json({
+      success: true,
+      snapshotDate: refresh ? refresh.snapshotDate : null,
+      metricsAt: refresh ? refresh.metricsAt : null,
+      rows,
+    });
   } catch (error) {
     next(error);
   }
@@ -780,7 +901,9 @@ router.post(
 // Live stock for the rows on screen, straight from Zoho Inventory — one
 // itemdetails call per 100 ids. The pages overlay it on the stored numbers
 // so what is read is current, while lists, tiles and sorts still come from
-// the register.
+// the register. `available` is the physical for-sale figure (shipments);
+// `accountingStock` the invoice-driven one the Accessories page shows
+// beside it.
 const MAX_LIVE_IDS = 200;
 router.get("/live", VIEW, async (req, res) => {
   const ids = [
@@ -798,6 +921,7 @@ router.get("/live", VIEW, async (req, res) => {
     for (const d of details) {
       stock[String(d.item_id)] = {
         available: Number(d.actual_available_for_sale_stock) || 0,
+        accountingStock: Number(d.available_for_sale_stock) || 0,
         stockOnHand: Number(d.stock_on_hand) || 0,
         committed: Number(d.actual_committed_stock) || 0,
       };

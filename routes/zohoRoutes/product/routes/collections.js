@@ -2,6 +2,13 @@ var express = require("express");
 var axios = require("axios");
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../../../utils/mongodb");
+// A saved collection re-stamps its members in the stock register at once,
+// so the Stock Monitoring list (which reads membership from the register)
+// shows the change without waiting for the next refresh.
+const { restampCollection } = require("../../../../utils/collectionStamp");
+// The rule vocabulary, its validation, the builder's value options and
+// the "matches N items" preview all live in one place.
+const { sanitizeRows, filterOptions, previewRows, SCOPE_BY_STORE } = require("../../../../utils/collectionFilter");
 
 // This module exports a ROUTER FACTORY rather than a router: the same
 // collection-management endpoints serve both the Spare Parts set
@@ -38,12 +45,51 @@ function sanitizeProducts(input) {
   return out;
 }
 
+// The stored form of a collection's rule: { rows } validated against the
+// vocabulary. A bad row is a 400 to the caller, never a stored mystery.
+function sanitizeFilter(input) {
+  const rows = input && typeof input === "object" ? input.rows : input;
+  return { rows: sanitizeRows(Array.isArray(rows) ? rows : []) };
+}
+
 function createCollectionsRouter({ collectionsName, groupsName }) {
   const router = express.Router();
+  const scope = SCOPE_BY_STORE[collectionsName];
+
+  // ── GET /filter-options ─────────────────────────────────────────
+  // What the criteria builder offers: fields, conditions, and the
+  // register's current values for the pick lists (this business only).
+  router.get("/filter-options", async function (req, res) {
+    try {
+      const db = await connectToDatabase();
+      return res.json({ success: true, data: await filterOptions(db, scope) });
+    } catch (error) {
+      console.error("Filter options error:", error);
+      return res.status(500).json({ success: false, message: "Failed to load the filter options" });
+    }
+  });
+
+  // ── POST /filter-preview  { rows } ──────────────────────────────
+  // How many register items the rule catches, with a few names.
+  router.post("/filter-preview", async function (req, res) {
+    try {
+      let rows;
+      try {
+        rows = sanitizeRows((req.body && req.body.rows) || []);
+      } catch (e) {
+        return res.status(400).json({ success: false, message: e.message });
+      }
+      const db = await connectToDatabase();
+      return res.json({ success: true, data: await previewRows(db, rows, scope) });
+    } catch (error) {
+      console.error("Filter preview error:", error);
+      return res.status(500).json({ success: false, message: "Failed to preview the filter" });
+    }
+  });
 
 router.post("/create", async function (req, res, next) {
   try {
-    const { title, type, rules, children, note, status, products } = req.body;
+    const { title, type, filter, children, note, status, products } = req.body;
 
     // basic validation
     if (!title) {
@@ -51,6 +97,12 @@ router.post("/create", async function (req, res, next) {
         success: false,
         message: "Title is required",
       });
+    }
+    let cleanFilter;
+    try {
+      cleanFilter = sanitizeFilter(filter);
+    } catch (e) {
+      return res.status(400).json({ success: false, message: e.message });
     }
 
     const db = await connectToDatabase();
@@ -62,7 +114,8 @@ router.post("/create", async function (req, res, next) {
       note,
       type: type || "Selection",
       status: status || "draft",
-      rules: rules || [],
+      // The rule: rows over the stock register (utils/collectionFilter).
+      filter: cleanFilter,
       children: children || [],
       // Selection-type collections store the picked products inline. Each
       // entry carries the Zoho Inventory item_id (the source of truth for
@@ -74,6 +127,7 @@ router.post("/create", async function (req, res, next) {
     };
 
     const result = await collection.insertOne(newCollection);
+    await restampCollection(collectionsName, { _id: result.insertedId, ...newCollection });
 
     return res.status(201).json({
       success: true,
@@ -120,6 +174,7 @@ router.post("/copy/:id", async function (req, res, next) {
     // status tag colouring use.
     const copy = { ...rest, title, status: "Draft", createdAt: now, updatedAt: now };
     const result = await collection.insertOne(copy);
+    await restampCollection(collectionsName, { _id: result.insertedId, ...copy });
     return res.status(201).json({
       success: true,
       message: `Copied to "${title}" (draft)`,
@@ -134,12 +189,20 @@ router.post("/copy/:id", async function (req, res, next) {
 router.put("/update/:id", async function (req, res, next) {
   try {
     const { id } = req.params;
-    const { title, type, rules, children, status, note, products } = req.body;
+    const { title, type, filter, children, status, note, products } = req.body;
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
         message: "Invalid collection id",
       });
+    }
+    let cleanFilter;
+    if (filter !== undefined) {
+      try {
+        cleanFilter = sanitizeFilter(filter);
+      } catch (e) {
+        return res.status(400).json({ success: false, message: e.message });
+      }
     }
 
     const db = await connectToDatabase();
@@ -154,16 +217,21 @@ router.put("/update/:id", async function (req, res, next) {
     if (title !== undefined) updateData.title = title;
     if (note !== undefined) updateData.note = note;
     if (type !== undefined) updateData.type = type;
-    if (rules !== undefined) updateData.rules = rules;
+    if (cleanFilter !== undefined) updateData.filter = cleanFilter;
     if (children !== undefined) updateData.children = children;
     // Bug fix: this previously wrote `status` into the `children` field,
     // which silently dropped status edits and corrupted the children array.
     if (status !== undefined) updateData.status = status;
     if (products !== undefined) updateData.products = sanitizeProducts(products);
+    // The title before this save — a rename must drop the old tag.
+    const before = await collection.findOne({ _id: new ObjectId(id) }, { projection: { title: 1 } });
     const result = await collection.updateOne(
       { _id: new ObjectId(id) },
       {
         $set: updateData,
+        // The pre-2026-09-22 Analytics criteria string, if this document
+        // still carried one, is superseded by the filter.
+        ...(cleanFilter !== undefined ? { $unset: { rules: "" } } : {}),
       },
     );
 
@@ -177,6 +245,7 @@ router.put("/update/:id", async function (req, res, next) {
     const updatedCollection = await collection.findOne({
       _id: new ObjectId(id),
     });
+    await restampCollection(collectionsName, updatedCollection, before && before.title);
 
     return res.status(200).json({
       success: true,
@@ -373,6 +442,7 @@ router.post("/delete", async function (req, res, next) {
 
     const collection = db.collection(collectionsName);
 
+    const before = await collection.findOne({ _id: new ObjectId(id) }, { projection: { title: 1 } });
     const result = await collection.deleteOne({
       _id: new ObjectId(id),
     });
@@ -383,6 +453,8 @@ router.post("/delete", async function (req, res, next) {
         message: "Collection not found",
       });
     }
+    // Its tag comes off every row now rather than at the next refresh.
+    if (before) await restampCollection(collectionsName, null, before.title);
 
     return res.status(200).json({
       success: true,

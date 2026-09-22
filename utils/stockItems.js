@@ -2,9 +2,19 @@
 // place (2026-09-21, replacing the one-row-per-item-per-day imb_stock_daily).
 //
 // A row has two halves:
-//   · the catalogue — SKU, name, scope, classification, shelf, vendor,
-//     collections, our own brand/category/quality, image, price lists and
-//     the price-health flags, archive state. Changes rarely.
+//   · the catalogue — SKU, name, scope, shelf, vendor, collection tags
+//     (`collections` / `accessoryCollections`, titles), image, price lists
+//     and the price-health flags, archive state; Zoho's own Classification /
+//     Sub Classification / Quality / Device Brand / Device Series /
+//     Compatible Model (custom fields on the item — the catalogue of record
+//     since 2026-09-22), its reorder level, whether it is shown in the
+//     online store (`showInStore`, Zoho's show_in_storefront) and Zoho's
+//     own item category (`zohoCategory` / `zohoCategoryId`) — the last
+//     three read from the items list; and brand/category from the old
+//     imb_products catalogue while it lasts. Changes rarely. Collections
+//     are filters over these rows (utils/collectionFilter); the tag
+//     fields (`collections`, `accessoryCollections`, `groups`) are what
+//     the refresh and a collection save stamp from those filters.
 //   · `metrics` — stock, the sales windows, open POs, cover and the tile
 //     flags. Rewritten whole on every refresh, stamped `metricsAt`.
 //
@@ -24,7 +34,11 @@ const ITEMS = "imb_stock_items";
 
 // The numbers. Everything else the job produces is catalogue.
 const METRIC_KEYS = [
+  // Physical for-sale stock (shipment-driven) …
   "available",
+  // … and the invoice-driven figure Zoho keeps beside it; both come from
+  // the same item record, so both are stored (2026-09-22).
+  "accountingStock",
   "stockOnHand",
   "committed",
   "units7",
@@ -77,11 +91,13 @@ function roundSaleUnits(u) {
 
 // The universe's edges, shared by the nightly refresh and the hourly sync.
 //
-// Accessories are told apart three ways — Classification (Analytics),
-// accessory-collection membership, or a Zoho Brand from this list, drawn
+// Accessories are told apart three ways — Zoho's Classification (a custom
+// field on the item, in the set below), accessory-collection membership, or
+// a Zoho Brand from the list after it, drawn
 // from the brands on accessory-classified stock. Deliberately NOT Apple /
 // Samsung, which brand real parts too. The sync only has the brand to go
 // on for a brand-new item; the night's run settles it.
+const ACCESSORY_CLASSIFICATIONS = new Set(["Accessory", "Accessory Special Offer"]);
 const ACCESSORY_BRANDS = new Set([
   "Accessory", "iShield", "Roar", "Ugly Rubber UR", "X.One", "Halosure",
   "Remax", "JoyRoom", "HOCO", "COTECi", "Rock", "Blue Nation", "Baseus",
@@ -165,6 +181,9 @@ async function ensureIndexes(db) {
   await c.createIndex({ active: 1, scope: 1, archived: 1, "metrics.outOfStock": 1 });
   await c.createIndex({ active: 1, scope: 1, location: 1 });
   await c.createIndex({ active: 1, metricsAt: -1 });
+  // The Stock Monitoring list asks for a collection's rows by its title.
+  await c.createIndex({ active: 1, collections: 1 });
+  await c.createIndex({ active: 1, accessoryCollections: 1 });
 }
 
 module.exports = {
@@ -174,6 +193,7 @@ module.exports = {
   SALE_SCOPES,
   emptySaleUnits,
   roundSaleUnits,
+  ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
   OPEN_PO_STATUSES,
   skuKey,

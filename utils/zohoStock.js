@@ -6,7 +6,6 @@
 // needs the same answers from a plain script, so they live here now and
 // the routes are thin wrappers:
 //
-//   resolveCollectionItemIds(collection)  which Zoho items a collection holds
 //   fetchStockShapedItems(itemIds)        their SKU, shelf and for-sale stock
 //   getSalesTotals(itemIds, duration)     units sold per item over N days
 //
@@ -135,40 +134,21 @@ async function getItemIdsFromCriteria(criteria) {
   return [...new Set(viewData.map((r) => r["Item ID"]).filter(Boolean))];
 }
 
-// A collection can carry BOTH a criteria expression AND manually picked
-// products; the item set is the union of the two, deduped. Resolution is
-// content-driven rather than type-driven — the stored `type` field is a
-// display label only, and legacy docs work unchanged because they only
-// ever have one source populated.
-async function resolveCollectionItemIds(collection) {
-  if (!collection) return [];
-  const criteria =
-    collection.rules &&
-    collection.rules[0] &&
-    collection.rules[0].criteria &&
-    collection.rules[0].criteria.equals;
-
-  const criteriaIds =
-    criteria && String(criteria).trim()
-      ? await getItemIdsFromCriteria(criteria)
-      : [];
-  const selectedIds = (collection.products || [])
-    .map((p) => p && p.itemId)
-    .filter(Boolean);
-
-  return [...new Set([...criteriaIds, ...selectedIds])];
-}
+// (Collection membership used to be resolved here through an Analytics
+// criteria string; since 2026-09-22 a collection is a filter over the
+// stock register — utils/collectionFilter.)
 
 // ── item attributes ─────────────────────────────────────────────────
 
 // Attributes the Inventory item record doesn't carry, read from the
-// Analytics items view in one call. Classification is what separates
-// accessories from spare parts.
+// Analytics items view in one call. (Classification was read here too
+// until 2026-09-22; it and the other catalogue custom fields now come from
+// the item record itself — itemCatalogueFields below — which is current the
+// moment an item is edited, where Analytics lags by hours.)
 const ITEM_ATTRIBUTE_COLUMNS = [
   "Item ID",
   "SKU",
   "Item Name",
-  "Classification",
   "Prefer Vendor",
   "Brand",
   "Location",
@@ -220,6 +200,79 @@ const { imageIdOf, imageUrlFromId } = require("./productImage");
 function itemLocation(item) {
   const field = (item.custom_fields || []).find((c) => c.label === "Location");
   return (field && field.value) || "";
+}
+
+// One custom field by its label ("Sub Classification"), matched with case
+// and punctuation ignored so "CF.Sub Classification" reads the same. "" when
+// the item has no such field.
+const normLabel = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+function itemCustomField(item, label) {
+  const want = normLabel(label);
+  const field = (item.custom_fields || []).find((c) => normLabel(c.label) === want);
+  const v = field ? field.value : "";
+  return v == null ? "" : String(v).trim();
+}
+
+// The catalogue fields kept on the Zoho item as custom fields (imported
+// 2026-09-22 from the classification review — Zoho is the catalogue of
+// record for these): what the part is, its grade, and the devices it fits.
+// Compatible Model is one multi-line text field of "; "-separated model
+// names, split into a list here.
+function itemCatalogueFields(item) {
+  return {
+    classification: itemCustomField(item, "Classification"),
+    subClassification: itemCustomField(item, "Sub Classification"),
+    quality: itemCustomField(item, "Quality"),
+    deviceBrand: itemCustomField(item, "Device Brand"),
+    deviceSeries: itemCustomField(item, "Device Series"),
+    compatibleModels: itemCustomField(item, "Compatible Model")
+      .split(/\s*;\s*/)
+      .map((s) => s.trim())
+      .filter(Boolean),
+  };
+}
+
+// The fields only the items LIST carries — not the bulk itemdetails record
+// the refresh reads: whether the item is shown in the online store
+// (`show_in_storefront`; the single-item record only shows it as a "Zoho
+// Commerce" entry under sales_channels) and Zoho's own item category. One
+// pass over the active list, 200 items a page (~100 calls for the
+// catalogue). A page that never comes back throws, so a refresh fails
+// loudly rather than storing wrong values. Returns
+// Map(itemId → { showInStore, categoryId, category }).
+async function fetchItemListFields() {
+  const flags = new Map();
+  for (let page = 1; page <= 500; page++) {
+    const url =
+      `https://www.zohoapis.com/inventory/v1/items?organization_id=${ORGANIZATION_ID}` +
+      `&filter_by=Status.Active&per_page=200&page=${page}`;
+    let resp = null;
+    let lastSeen;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      const r = await handleZohoInventoryRequest(url);
+      if (r && Array.isArray(r.items)) { resp = r; break; }
+      lastSeen = r;
+      if (attempt < MAX_ATTEMPTS) await sleep(500 * 2 ** (attempt - 1));
+    }
+    if (!resp) {
+      throw new Error(
+        `Zoho Inventory items list page ${page} failed after ${MAX_ATTEMPTS} attempts` +
+          (lastSeen ? ` (last response: ${JSON.stringify(lastSeen).slice(0, 200)})` : ""),
+      );
+    }
+    for (const it of resp.items) flags.set(String(it.item_id), listFields(it));
+    if (!(resp.page_context && resp.page_context.has_more_page)) break;
+  }
+  return flags;
+}
+// The same three fields off one list row (the hourly sync reads the list
+// too, for what changed).
+function listFields(row) {
+  return {
+    showInStore: row.show_in_storefront === true,
+    categoryId: String(row.category_id || ""),
+    category: String(row.category_name || "").trim(),
+  };
 }
 
 // The `{ id, sku, productName, location, stock }` shape Stock Monitoring
@@ -500,9 +553,12 @@ module.exports = {
   chunkArray,
   mapWithLimit,
   getItemIdsFromCriteria,
-  resolveCollectionItemIds,
   fetchItemDetails,
   itemLocation,
+  itemCustomField,
+  itemCatalogueFields,
+  fetchItemListFields,
+  listFields,
   fetchStockShapedItems,
   getSalesTotals,
   getSalesTotalsForWindow,

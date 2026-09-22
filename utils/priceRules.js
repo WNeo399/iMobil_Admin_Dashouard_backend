@@ -16,9 +16,9 @@ const PRICE_PLACEHOLDERS = new Set([9999.99, 9000, 8888, 7777, 7000, 6000]);
 const DEVIATION = 0.05;
 const r2 = (v) => Math.round(v * 100) / 100;
 
-// Which formula family an item belongs to, from the signals the snapshot
-// row carries: our catalogue category, Zoho classification, catalogue
-// quality, and the item name as the fallback.
+// Which formula family an item belongs to, from the signals the register
+// row carries: Zoho's Classification and Quality (the custom fields), our
+// old catalogue category, and the item name as the fallback.
 function priceRuleFamily(row) {
   const n = String(row.name || "").toLowerCase();
   const q = String(row.quality || "").toLowerCase();
@@ -26,9 +26,11 @@ function priceRuleFamily(row) {
   const cat = String(row.category || "").toLowerCase();
   const cls = String(row.classification || "").toLowerCase();
   if (
+    // Zoho's Classification since the 2026-09-22 clean-up …
+    ["screen", "housing", "backcover", "battery"].includes(cls) ||
+    // … the old catalogue category and the pre-clean-up Zoho values …
     ["screen", "battery", "back cover glass", "frame"].includes(cat) ||
     cls.includes("lcd") ||
-    cls === "battery" ||
     /housing|back ?cover|backcover|lcd|digitizer|\bscreen\b|battery/.test(n)
   ) {
     return "major-part";

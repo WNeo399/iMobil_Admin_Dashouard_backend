@@ -24,11 +24,12 @@ router.use("/location", locationRouter);
 // utils/zohoStock.js, so the daily snapshot job can ask the same questions
 // without going through HTTP. Both routes below are thin wrappers over it.
 const {
-  resolveCollectionItemIds,
   fetchStockShapedItems,
   getSalesTotals,
 } = require("../../utils/zohoStock");
 const { getItemCategories } = require("../../utils/itemCategories");
+// Collection membership is a filter over the stock register (2026-09-22).
+const { resolveCollectionItemIds, SCOPE_BY_STORE } = require("../../utils/collectionFilter");
 
 // Items hidden from the Stock Monitoring list by hand (page-level only —
 // the snapshot dashboard, buy lists and Price Monitoring still count
@@ -65,12 +66,10 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
       return res.status(404).json({ success: false, message: "Collection not found" });
     }
 
-    // Union of every requested collection. Resolved sequentially — each
-    // criteria collection is one Analytics query, and Analytics punishes
-    // fan-out harder than it rewards it.
+    // Union of every requested collection — each one a register query.
     const memberOf = new Map();
     for (const doc of docs) {
-      for (const id of await resolveCollectionItemIds(doc)) {
+      for (const id of await resolveCollectionItemIds(db, doc, SCOPE_BY_STORE[store])) {
         if (!memberOf.has(id)) memberOf.set(id, []);
         memberOf.get(id).push(String(doc._id));
       }
