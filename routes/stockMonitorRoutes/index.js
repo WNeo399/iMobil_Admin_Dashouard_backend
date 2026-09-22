@@ -1496,6 +1496,91 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
   }
 });
 
+// ── PUT /stock-monitor/prices/bulk ──────────────────────────────────
+// Many price changes in one go. Zoho turns requests away once about five
+// pricebook writes are in flight, so the page queues its edits and sends
+// them here together; this handler talks to Zoho ONE call at a time: the
+// changes are grouped by price list (one pricebook each) and written in
+// chunks with the pricebook items endpoint, which takes an array. A chunk
+// Zoho refuses is retried item by item so one bad rate does not sink the
+// rest. Each accepted rate is mirrored into the register exactly like the
+// single-item route above.
+//   body  { changes: [{ itemId, list, rate }] }   (max 500; last wins per item+list)
+//   reply { results: [{ itemId, list, rate, ok, message, flags, flagsSeq }] }
+const BULK_PRICE_CHUNK = 25;
+router.put("/prices/bulk", requirePermission("zoho:stock:edit"), async (req, res) => {
+  const raw = Array.isArray(req.body && req.body.changes) ? req.body.changes : [];
+  if (!raw.length) return res.status(400).json({ success: false, message: "No changes" });
+  if (raw.length > 500) return res.status(400).json({ success: false, message: "Too many changes (max 500)" });
+
+  // Validate; the last entry for an item + list wins.
+  const byKey = new Map();
+  for (const c of raw) {
+    const itemId = String((c && c.itemId) || "").trim();
+    const list = String((c && c.list) || "").toLowerCase();
+    const rate = Number(c && c.rate);
+    if (!/^[0-9]{6,25}$/.test(itemId) || !PRICE_FIELDS[list] || !Number.isFinite(rate) || rate < 0 || rate > 1000000) {
+      return res.status(400).json({ success: false, message: `Bad change for item ${itemId || "?"} / ${list || "?"}` });
+    }
+    byKey.set(`${itemId}|${list}`, { itemId, list, rate: Math.round(rate * 100) / 100 });
+  }
+  const changes = [...byKey.values()];
+
+  const db = await connectToDatabase();
+  // Mirror one accepted rate into the register (flags recomputed), same as
+  // the single-item route.
+  const mirror = async ({ itemId, list, rate }) =>
+    withItemLock(itemId, async () => {
+      const field = PRICE_FIELDS[list];
+      const row = await db.collection(ITEMS).findOne(
+        { itemId },
+        { projection: { pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1, name: 1, category: 1, classification: 1, quality: 1 } },
+      );
+      if (!row) return null;
+      row[field] = rate;
+      const next = { ...priceHealthFlags(row), priceRuleBroken: evaluatePriceRule(row).broken };
+      await db.collection(ITEMS).updateOne({ itemId }, { $set: { [field]: rate, ...next } });
+      return { flags: next, seq: ++mirrorSeq };
+    });
+  const zohoUrl = (list) => `https://www.zohoapis.com/inventory/v1/pricebooks/${PRICE_LISTS[list]}/items?organization_id=${ZOHO_ORG_ID}`;
+
+  const results = [];
+  try {
+    await refreshToken();
+    for (const list of Object.keys(PRICE_LISTS)) {
+      const mine = changes.filter((c) => c.list === list);
+      for (let i = 0; i < mine.length; i += BULK_PRICE_CHUNK) {
+        const chunk = mine.slice(i, i + BULK_PRICE_CHUNK);
+        const resp = await handleZohoInventoryPutRequest(zohoUrl(list), chunk.map((c) => ({ item_id: c.itemId, pricebook_rate: c.rate })));
+        if (resp && resp.code === 0) {
+          for (const c of chunk) {
+            const m = await mirror(c);
+            results.push({ ...c, ok: true, flags: m ? m.flags : null, flagsSeq: m ? m.seq : null });
+          }
+          continue;
+        }
+        // The chunk was refused: find the culprit(s) one by one, still serially.
+        for (const c of chunk) {
+          const one = await handleZohoInventoryPutRequest(zohoUrl(list), [{ item_id: c.itemId, pricebook_rate: c.rate }]);
+          if (one && one.code === 0) {
+            const m = await mirror(c);
+            results.push({ ...c, ok: true, flags: m ? m.flags : null, flagsSeq: m ? m.seq : null });
+          } else {
+            results.push({ ...c, ok: false, message: (one && (one.message || (one.error && one.error.message))) || (resp && resp.message) || "Zoho rejected the price" });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Stock monitor bulk price push error:", error && error.message);
+    // Whatever did not get a verdict is reported as not pushed, so the page keeps it queued.
+    const seen = new Set(results.map((r) => `${r.itemId}|${r.list}`));
+    for (const c of changes) if (!seen.has(`${c.itemId}|${c.list}`)) results.push({ ...c, ok: false, message: "Push interrupted — try again" });
+  }
+  const pushed = results.filter((r) => r.ok).length;
+  return res.json({ success: true, pushed, failed: results.length - pushed, results });
+});
+
 // ── GET /stock-monitor/item/:itemId/purchase-orders ─────────────────
 // What we have actually ordered, from Zoho Inventory — the system POs are
 // raised in.

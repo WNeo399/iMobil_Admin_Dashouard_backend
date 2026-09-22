@@ -46,6 +46,9 @@ const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, ZOHO_VENDORS, vend
 
 const ORDERS = "imb_spp_orders";
 const BATCHES = "imb_spp_batches";
+// 下单批次: a set of pending lines placed with one supplier at once (OB-10001+);
+// the supplier's quoted prices come back onto its lines from here.
+const ORDER_BATCHES = "imb_spp_order_batches";
 const COUNTERS = "imb_spp_counters";
 const ITEMS = "imb_stock_items";
 
@@ -212,13 +215,13 @@ router.get("/orders", VIEW, async (req, res, next) => {
       col.find(match, { projection: { history: 0 } }).sort({ createdAt: dir, _id: dir }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
       col.countDocuments(match),
       col.aggregate([{ $match: base }, { $group: { _id: "$status", n: { $sum: 1 } } }]).toArray(),
-      col.aggregate([{ $group: { _id: "$category", total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } } } }]).toArray(),
+      col.aggregate([{ $group: { _id: "$category", total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } } } }]).toArray(),
       supplierOptions(db),
     ]);
     const byStatus = {};
     for (const s of statusAgg) byStatus[s._id] = s.n;
     const byCategory = {};
-    for (const c of catAgg) byCategory[c._id || ""] = { total: c.total, open: c.open };
+    for (const c of catAgg) byCategory[c._id || ""] = { total: c.total, open: c.open, pending: c.pending };
     // the fixed tree, plus any value a line somehow still carries
     const categories = [...new Set([...CATEGORIES, ...catAgg.map((c) => c._id).filter(Boolean)])];
     return res.json({ success: true, page, pageSize, total, rows, byStatus, byCategory, categories, suppliers });
@@ -455,6 +458,158 @@ router.post("/orders/:id/place", SUPPLY, (req, res, next) =>
     },
   }),
 );
+
+// ── Order batches (下单批次) ─────────────────────────────────────────
+// Pending / shortage lines placed with one supplier in one go. The batch
+// keeps the list that was sent to the supplier; when the quote comes back
+// the prices are keyed in here and written onto the lines.
+router.get("/order-batches", VIEW, async (req, res, next) => {
+  try {
+    const q = req.query || {};
+    const page = Math.max(1, parseInt(q.page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 20));
+    const match = {};
+    if (q.supplier) match.supplier = str(q.supplier);
+    const search = str(q.search);
+    if (search) {
+      const rx = new RegExp(escapeRegex(search), "i");
+      match.$or = [{ batchNo: rx }, { supplier: rx }, { note: rx }, { "lines.sku": rx }, { "lines.productName": rx }];
+    }
+    const db = await connectToDatabase();
+    const col = db.collection(ORDER_BATCHES);
+    const [rows, total] = await Promise.all([
+      col.find(match).sort({ seq: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      col.countDocuments(match),
+    ]);
+    return res.json({ success: true, page, pageSize, total, rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/order-batches/:id", VIEW, async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    const db = await connectToDatabase();
+    const batch = await db.collection(ORDER_BATCHES).findOne({ _id });
+    if (!batch) return res.status(404).json({ success: false, message: "Order batch not found" });
+    // the lines' current state rides along (status, price, shipment)
+    const orders = await db.collection(ORDERS).find({ _id: { $in: batch.lines.map((l) => l.orderId) } }, { projection: { history: 0 } }).toArray();
+    const byId = new Map(orders.map((o) => [String(o._id), o]));
+    batch.lines = batch.lines.map((l) => {
+      const o = byId.get(String(l.orderId));
+      return { ...l, status: o ? o.status : "missing", currentPrice: o ? o.unitPrice : null, batchNo: o ? o.batchNo : "", shippedQty: o ? o.shippedQty : null };
+    });
+    return res.json({ success: true, batch });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Place the selected lines with a supplier as one batch.
+router.post("/order-batches", SUPPLY, async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const ids = (Array.isArray(b.orderIds) ? b.orderIds : []).map(oid).filter(Boolean);
+    if (!ids.length) return bad(res, "No lines selected");
+    if (ids.length > 300) return bad(res, "Too many lines (max 300)");
+    const supplier = str(b.supplier);
+    if (!supplier) return bad(res, "Supplier is required");
+    const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
+    const recs = await col.find({ _id: { $in: ids } }, { projection: { history: 0 } }).toArray();
+    const placeable = recs.filter((r) => r.status === "pending" || r.status === "shortage");
+    if (!placeable.length) return bad(res, "None of the selected lines is still pending");
+    const skipped = recs.filter((r) => !placeable.includes(r)).map((r) => ({ orderNo: r.orderNo, sku: r.sku, status: r.status }));
+
+    const by = actor(req);
+    const now = new Date();
+    const { seq, no: batchNo } = await nextNo(db, "orderBatch", "OB", 10001, ORDER_BATCHES);
+    const batchId = new ObjectId();
+    for (const rec of placeable) {
+      await col.updateOne(
+        { _id: rec._id },
+        {
+          $set: { supplier, orderedAt: now, orderedBy: by, shortageNote: "", status: "ordered", orderBatchId: batchId, orderBatchNo: batchNo, updatedAt: now },
+          $push: { history: hist("ordered", by, { supplier, orderBatch: batchNo }) },
+        },
+      );
+    }
+    const lines = placeable.map((r) => ({
+      orderId: r._id,
+      orderNo: r.orderNo,
+      itemId: r.itemId || null,
+      sku: r.sku || "",
+      productName: r.productName || "",
+      category: r.category || "",
+      orderQty: r.orderQty,
+      note: r.note || "",
+      unitPrice: null,
+    }));
+    const batch = {
+      _id: batchId,
+      batchNo,
+      seq,
+      supplier,
+      note: str(b.note),
+      lines,
+      lineCount: lines.length,
+      totalQty: lines.reduce((t, l) => t + (l.orderQty || 0), 0),
+      pricedCount: 0,
+      createdAt: now,
+      createdBy: by,
+      updatedAt: now,
+    };
+    await db.collection(ORDER_BATCHES).insertOne(batch);
+    return res.json({ success: true, batch, skipped });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// The supplier's prices, back onto the lines. A line that has already
+// shipped keeps the price it shipped with (its Zoho PO carries it).
+router.put("/order-batches/:id/prices", SUPPLY, async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    const given = Array.isArray(req.body && req.body.lines) ? req.body.lines : [];
+    const db = await connectToDatabase();
+    const batch = await db.collection(ORDER_BATCHES).findOne({ _id });
+    if (!batch) return res.status(404).json({ success: false, message: "Order batch not found" });
+    const wanted = new Map();
+    for (const g of given) {
+      if (!hasVal(g.unitPrice)) continue;
+      const price = num(g.unitPrice);
+      if (price == null || price < 0) return bad(res, "Unit price must be 0 or more");
+      wanted.set(String(g.orderId), round2(price));
+    }
+    const col = db.collection(ORDERS);
+    const by = actor(req);
+    const now = new Date();
+    let updated = 0;
+    const skipped = [];
+    for (const l of batch.lines) {
+      const key = String(l.orderId);
+      if (!wanted.has(key)) continue;
+      const price = wanted.get(key);
+      const rec = await col.findOne({ _id: l.orderId }, { projection: { status: 1, orderQty: 1, unitPrice: 1, orderNo: 1, sku: 1 } });
+      if (!rec) { skipped.push({ orderNo: l.orderNo, reason: "line missing" }); continue; }
+      if (rec.status !== "ordered" && rec.status !== "pending" && rec.status !== "shortage") { skipped.push({ orderNo: rec.orderNo, sku: rec.sku, reason: rec.status }); continue; }
+      if (rec.unitPrice !== price) {
+        await col.updateOne({ _id: l.orderId }, { $set: { unitPrice: price, lineTotal: round2(rec.orderQty * price), updatedAt: now }, $push: { history: hist("priced", by, { unitPrice: price, orderBatch: batch.batchNo }) } });
+      }
+      l.unitPrice = price;
+      updated++;
+    }
+    const pricedCount = batch.lines.filter((l) => l.unitPrice != null).length;
+    await db.collection(ORDER_BATCHES).updateOne({ _id }, { $set: { lines: batch.lines, pricedCount, pricedAt: now, pricedBy: by, updatedAt: now } });
+    return res.json({ success: true, updated, skipped, pricedCount });
+  } catch (error) {
+    next(error);
+  }
+});
 
 router.post("/orders/:id/shortage", SUPPLY, (req, res, next) =>
   transition(req, res, next, {
@@ -730,6 +885,9 @@ async function shipBatch(db, req, b, draft) {
       return { error: `${rec.sku || rec.orderNo} is ${rec.status}; only ordered or pending lines can ship` };
     }
     if (rec.status === "pending" && !p.supplier && !rec.supplier) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
+    // The price may be left off when placing, but every shipped line must
+    // carry one — from the batch form or already on the line.
+    if (p.price == null && rec.unitPrice == null) return { error: `${rec.sku || rec.orderNo}: unit price is required to ship` };
   }
 
   {
