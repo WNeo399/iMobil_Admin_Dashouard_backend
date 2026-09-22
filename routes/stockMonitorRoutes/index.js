@@ -11,6 +11,8 @@
 //   GET /stock-monitor/summary               as-of, tile counts, filter options
 //   GET /stock-monitor/items                 the working list, filtered and paged
 //   GET /stock-monitor/collection-items      a collection's rows (the Stock Monitoring list)
+//   GET /stock-monitor/browse-tree           the catalogue as Brand → Series → Classification, with counts
+//   GET /stock-monitor/browse-items          one node of that tree: tile counts + a page of rows
 //   GET /stock-monitor/shelves               shelf rollup for a stock take
 //   GET /stock-monitor/item/:id              one item's row
 //   GET /stock-monitor/live?ids=             live stock for the rows on screen
@@ -447,6 +449,47 @@ router.get("/items", VIEW, async (req, res, next) => {
 // a rule saved a second ago and an item the hourly sync inserted a minute
 // ago both show at once. scope=accessories reads the accessories set.
 const HIDDEN = "imb_stock_hidden";
+
+// What the Stock Monitoring lists read of a register row.
+const LIST_PROJECTION = {
+  _id: 0, itemId: 1, sku: 1, name: 1, location: 1, imageId: 1, reorderLevel: 1,
+  classification: 1, subClassification: 1, quality: 1,
+  deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, showInStore: 1, metrics: 1,
+};
+// Units sold in a window, and how many of those were online orders (the
+// rest: counter, workshop, Neto, dispatch).
+const salesWindow = (u) => ({ total: (u && u.total) || 0, online: (u && u.online) || 0 });
+// A register row → the row the Stock Monitoring table renders.
+function shapeListRow(r, { hidden, seaIds, memberOf }) {
+  const m = r.metrics || {};
+  const row = {
+    id: r.itemId,
+    itemId: r.itemId,
+    sku: r.sku,
+    productName: r.name,
+    location: r.location || "",
+    stock: m.available || 0,
+    accountingStock: m.accountingStock || 0,
+    stockOnHand: m.stockOnHand || 0,
+    committed: m.committed || 0,
+    reorderLevel: r.reorderLevel || 0,
+    imageUrl: imageUrlFromId(r.imageId),
+    classification: r.classification || "",
+    subClassification: r.subClassification || "",
+    quality: r.quality || "",
+    deviceBrand: r.deviceBrand || "",
+    deviceSeries: r.deviceSeries || "",
+    compatibleModels: r.compatibleModels || [],
+    showInStore: !!r.showInStore,
+    sales: { 7: salesWindow(m.units7), 14: salesWindow(m.units14), 30: salesWindow(m.units30), 90: salesWindow(m.units90) },
+  };
+  if (memberOf) row.memberOf = memberOf.get(r.itemId) || [];
+  if (hidden && hidden.has(r.itemId)) row.hidden = true;
+  if (seaIds && seaIds.has(r.itemId)) row.seaFreight = true;
+  return row;
+}
+const byName = (a, b) => a.productName.localeCompare(b.productName);
+
 router.get("/collection-items", VIEW, async (req, res, next) => {
   try {
     const raw = Array.isArray(req.query.collection) ? req.query.collection.join(",") : String(req.query.collection || "");
@@ -481,16 +524,7 @@ router.get("/collection-items", VIEW, async (req, res, next) => {
     }
     const stored = await db
       .collection(ITEMS)
-      .find(
-        { itemId: { $in: [...memberOf.keys()] } },
-        {
-          projection: {
-            _id: 0, itemId: 1, sku: 1, name: 1, location: 1, imageId: 1, reorderLevel: 1,
-            classification: 1, subClassification: 1, quality: 1,
-            deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, showInStore: 1, metrics: 1,
-          },
-        },
-      )
+      .find({ itemId: { $in: [...memberOf.keys()] } }, { projection: LIST_PROJECTION })
       .toArray();
 
     const [hiddenDocs, sea] = await Promise.all([
@@ -501,45 +535,338 @@ router.get("/collection-items", VIEW, async (req, res, next) => {
     const hidden = new Set(hiddenDocs.map((h) => String(h.itemId)));
     const seaIds = new Set(((sea && sea.products) || []).map((p) => String(p.itemId)));
 
-    // Units sold in a window, and how many of those were online orders
-    // (the rest: counter, workshop, Neto, dispatch).
-    const window = (u) => ({ total: (u && u.total) || 0, online: (u && u.online) || 0 });
     const rows = stored
-      .map((r) => {
-        const m = r.metrics || {};
-        const row = {
-          id: r.itemId,
-          itemId: r.itemId,
-          sku: r.sku,
-          productName: r.name,
-          location: r.location || "",
-          stock: m.available || 0,
-          accountingStock: m.accountingStock || 0,
-          stockOnHand: m.stockOnHand || 0,
-          committed: m.committed || 0,
-          reorderLevel: r.reorderLevel || 0,
-          imageUrl: imageUrlFromId(r.imageId),
-          classification: r.classification || "",
-          subClassification: r.subClassification || "",
-          quality: r.quality || "",
-          deviceBrand: r.deviceBrand || "",
-          deviceSeries: r.deviceSeries || "",
-          compatibleModels: r.compatibleModels || [],
-          showInStore: !!r.showInStore,
-          sales: { 7: window(m.units7), 14: window(m.units14), 30: window(m.units30), 90: window(m.units90) },
-        };
-        if (docs.length > 1) row.memberOf = memberOf.get(r.itemId) || [];
-        if (hidden.has(r.itemId)) row.hidden = true;
-        if (seaIds.has(r.itemId)) row.seaFreight = true;
-        return row;
-      })
-      .sort((a, b) => a.productName.localeCompare(b.productName));
+      .map((r) => shapeListRow(r, { hidden, seaIds, memberOf: docs.length > 1 ? memberOf : null }))
+      .sort(byName);
 
     return res.json({
       success: true,
       snapshotDate: refresh ? refresh.snapshotDate : null,
       metricsAt: refresh ? refresh.metricsAt : null,
       rows,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── Browse: the catalogue as a tree of its own fields ────────────────
+// Device Brand → Device Series → Classification → Sub Classification,
+// counted from the register, so every active item has a place without a
+// collection being written for it (2026-09-22; the Category tree of hand
+// made collections stays beside it). An item has ONE brand; its series
+// cell may hold several ("Nova Series; P Series") — it then counts under
+// each series but once under the brand. Small makers sit under the brand
+// "Other" with the maker as the series (Vivo, Nintendo …); OnePlus and
+// Realme are series of OPPO (the user's rules, 2026-09-22).
+//
+// A node is a selection { brand, series, classification, sub }; a level
+// left out means "all". NONE stands for a blank value at that level (a
+// brand with no series, an unclassified part). TOOL is the "Tool" bucket:
+// tools need no device, so brand-less Tools items get their own top-level
+// node (straight to sub classification) instead of sitting in "No device".
+const NONE = "__none__";
+const TOOL = "__tool__";
+const CLASS_ORDER = ["Screen", "Housing", "BackCover", "Battery", "Small Parts", "Tools", "Other", "Accessory"];
+const nodeLabel = (v, blank) => (v ? v : blank);
+const multiSplit = (field) => ({ $split: [{ $ifNull: [`$${field}`, ""] }, "; "] });
+// the brand an item files under: its brand, or TOOL for a brand-less tool
+const BRAND_EXPR = {
+  $let: {
+    vars: { b: { $ifNull: ["$deviceBrand", ""] } },
+    in: { $cond: [{ $and: [{ $eq: ["$$b", ""] }, { $eq: ["$classification", "Tools"] }] }, TOOL, "$$b"] },
+  },
+};
+
+function buildBrowseTree(groups) {
+  // brand → series → classification → sub, each with a count
+  const brands = new Map();
+  for (const g of groups) {
+    const { b, s, c, u } = g._id;
+    const B = brands.get(b) || brands.set(b, { count: 0, series: new Map() }).get(b);
+    B.count += g.n;
+    const S = B.series.get(s) || B.series.set(s, { count: 0, classes: new Map() }).get(s);
+    S.count += g.n;
+    const C = S.classes.get(c) || S.classes.set(c, { count: 0, subs: new Map() }).get(c);
+    C.count += g.n;
+    if (u) C.subs.set(u, (C.subs.get(u) || 0) + g.n);
+  }
+  const classRank = (c) => { const i = CLASS_ORDER.indexOf(c); return i < 0 ? (c ? CLASS_ORDER.length : CLASS_ORDER.length + 1) : i; };
+  const node = (label, count, sel, path, key) => ({ key, label, count, sel, path, browse: true, value: key, children: [] });
+  const classNodes = (classes, sel, path, keyBase) =>
+    [...classes.entries()]
+      .sort((a, b) => classRank(a[0]) - classRank(b[0]) || a[0].localeCompare(b[0]))
+      .map(([c, C]) => {
+        const label = nodeLabel(c, "Unclassified");
+        const n = node(label, C.count, { ...sel, classification: c || NONE }, [...path, label], `${keyBase}|c:${c || NONE}`);
+        n.children = [...C.subs.entries()]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([u, cnt]) => node(u, cnt, { ...n.sel, sub: u }, [...n.path, u], `${n.key}|u:${u}`));
+        return n;
+      });
+  // biggest brands first, then Other, Tool and the brand-less bucket
+  const brandRank = (b) => (b === "" ? 3 : b === TOOL ? 2 : b === "Other" ? 1 : 0);
+  const tree = [...brands.entries()]
+    .sort((a, b) => brandRank(a[0]) - brandRank(b[0]) || b[1].count - a[1].count || a[0].localeCompare(b[0]))
+    .map(([b, B]) => {
+      const label = b === TOOL ? "Tool" : nodeLabel(b, "No device");
+      const sel = { brand: b || NONE };
+      const n = node(label, B.count, sel, [label], `b:${b || NONE}`);
+      if (b === TOOL) {
+        // Tools: straight to the sub classification (Hand Tools, Soldering …)
+        const subs = new Map();
+        for (const S of B.series.values()) for (const C of S.classes.values()) for (const [u, cnt] of C.subs) subs.set(u, (subs.get(u) || 0) + cnt);
+        n.children = [...subs.entries()].sort((a, b2) => a[0].localeCompare(b2[0])).map(([u, cnt]) => node(u, cnt, { ...sel, sub: u }, [...n.path, u], `${n.key}|u:${u}`));
+        return n;
+      }
+      const named = [...B.series.keys()].filter(Boolean);
+      if (!named.length) {
+        // No series for this brand (Nokia, HTC …): classifications directly.
+        n.children = classNodes(B.series.get("").classes, sel, n.path, n.key);
+        return n;
+      }
+      n.children = [...B.series.entries()]
+        .sort((a, b2) => (a[0] === "" ? 1 : b2[0] === "" ? -1 : b2[1].count - a[1].count || a[0].localeCompare(b2[0])))
+        .map(([s, S]) => {
+          const sl = nodeLabel(s, "No series");
+          const sn = node(sl, S.count, { ...sel, series: s || NONE }, [...n.path, sl], `${n.key}|s:${s || NONE}`);
+          sn.children = classNodes(S.classes, sn.sel, sn.path, sn.key);
+          return sn;
+        });
+      return n;
+    });
+  return tree;
+}
+
+router.get("/browse-tree", VIEW, async (req, res, next) => {
+  try {
+    const db = await connectToDatabase();
+    const groups = await db
+      .collection(ITEMS)
+      .aggregate([
+        { $match: { active: true, scope: scopeOf(req), archived: { $ne: true } } },
+        {
+          $project: {
+            b: BRAND_EXPR,
+            series: multiSplit("deviceSeries"),
+            c: { $ifNull: ["$classification", ""] },
+            u: { $ifNull: ["$subClassification", ""] },
+          },
+        },
+        { $unwind: "$series" },
+        { $group: { _id: { b: "$b", s: "$series", c: "$c", u: "$u" }, n: { $sum: 1 } } },
+      ])
+      .toArray();
+    // An item with two series ("Nova Series; P Series") sits under both
+    // series but is one item of its brand — count brands without the unwind.
+    const brandTotals = await db
+      .collection(ITEMS)
+      .aggregate([
+        { $match: { active: true, scope: scopeOf(req), archived: { $ne: true } } },
+        { $group: { _id: BRAND_EXPR, n: { $sum: 1 } } },
+      ])
+      .toArray();
+    const tree = buildBrowseTree(groups);
+    const totalByBrand = new Map(brandTotals.map((b) => [b._id, b.n]));
+    for (const n of tree) n.count = totalByBrand.get(n.sel.brand === NONE ? "" : n.sel.brand) || n.count;
+    const refresh = await latestRefresh(db);
+    return res.json({ success: true, metricsAt: refresh ? refresh.metricsAt : null, tree });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// The node's rows. Server-paged: the tile counts, the quality breakdown
+// (for the Quality filter) and one page of rows come back from a single
+// aggregation, under the same match, so tiles and table always agree.
+//   brand / series / classification / sub   the node (NONE = blank at that level, brand TOOL = the Tool bucket)
+//   quality, seriesIn[], models[], search   the filters above the table (series / model picks: any of them)
+//   tile                                    zero | noOnOrder | onOrder | underMonth
+//   hidden=1                                the hidden-items review instead
+//   days                                    the sales window (7/14/30/90) — Under a Month uses it
+//   sort=name|sku|stock|sales, order, page, pageSize; all=1 returns every row (export, capped)
+const BROWSE_DAYS = new Set([7, 14, 30, 90]);
+const EXPORT_CAP = 5000;
+// a series cell can hold several values: match one of them
+const oneOf = (field, v) =>
+  v === NONE ? { [field]: { $in: ["", null] } } : { [field]: new RegExp(`(^|; )${escapeRegex(v)}(;|$)`) };
+const oneOfAny = (field, list) => ({ [field]: new RegExp(`(^|; )(${list.map(escapeRegex).join("|")})(;|$)`) });
+// a repeatable query param (models[]=a&models[]=b, or a single value)
+const listParam = (v) => (v === undefined ? [] : (Array.isArray(v) ? v : [v]).map((x) => String(x).trim()).filter(Boolean));
+// The picked tree node.
+function nodeMatch(q) {
+  const m = {};
+  if (q.brand === TOOL) { m.deviceBrand = { $in: ["", null] }; m.classification = "Tools"; }
+  else if (q.brand === NONE) { m.deviceBrand = { $in: ["", null] }; m.classification = { $ne: "Tools" }; }
+  else if (q.brand !== undefined) m.deviceBrand = String(q.brand);
+  if (q.series !== undefined) Object.assign(m, oneOf("deviceSeries", String(q.series)));
+  if (q.classification !== undefined) m.classification = q.classification === NONE ? { $in: ["", null] } : String(q.classification);
+  if (q.sub !== undefined) m.subClassification = String(q.sub);
+  return m;
+}
+// The filters above the table: quality, the series / model picks (one
+// cascader — a whole series or single models, any of them matches) and
+// the search box. Kept apart from the node so the filter options can be
+// counted over the whole node while the list is narrowed.
+function filterMatch(q) {
+  const m = {};
+  if (q.quality) m.quality = q.quality === NONE ? { $in: ["", null] } : new RegExp(`^${escapeRegex(q.quality)}$`, "i");
+  const ands = [];
+  const seriesIn = listParam(q.seriesIn), models = listParam(q.models);
+  if (seriesIn.length || models.length) {
+    const or = [];
+    const named = seriesIn.filter((s) => s !== NONE);
+    if (named.length) or.push(oneOfAny("deviceSeries", named));
+    if (seriesIn.includes(NONE)) or.push({ deviceSeries: { $in: ["", null] } });
+    if (models.length) or.push({ compatibleModels: { $in: models } });
+    ands.push({ $or: or });
+  }
+  const search = String(q.search || "").trim();
+  if (search) { const re = new RegExp(escapeRegex(search), "i"); ands.push({ $or: [{ sku: re }, { name: re }] }); }
+  if (ands.length) m.$and = ands;
+  return m;
+}
+const browseMatch = (q) => ({ ...nodeMatch(q), ...filterMatch(q) });
+// Series → compatible models for the cascader filter, counted over the
+// node. A model is filed under ONE series: the one its name carries
+// ("Huawei Nova 3e" → Nova, "Galaxy Tab S7" → Tab over S), else the series
+// most of its items have, else the bigger series. A "Nova 3e / P20 Lite"
+// part lists both models under both series — the name rule keeps each
+// where it belongs. Brands without series get a flat model list.
+function buildSeriesModels(pairs, modelCounts) {
+  const counts = new Map(modelCounts.map((x) => [x._id, x.n]));
+  const seriesSize = new Map();
+  const perModel = new Map(); // model → Map(series → items)
+  for (const g of pairs) {
+    const { s, m } = g._id;
+    seriesSize.set(s, (seriesSize.get(s) || 0) + g.n);
+    const bag = perModel.get(m) || perModel.set(m, new Map()).get(m);
+    bag.set(s, (bag.get(s) || 0) + g.n);
+  }
+  // how much of the series name the model name carries (0 = none):
+  // a one-letter series wants its letter before a digit (P20, A52, S21)
+  const stemLen = (m, s) => {
+    const stem = s.replace(/ Series$/, "");
+    if (!stem) return 0;
+    const re = stem.length === 1 ? new RegExp(`\\b${escapeRegex(stem)}\\d`) : new RegExp(`\\b${escapeRegex(stem)}\\b`, "i");
+    return re.test(m) ? stem.length : 0;
+  };
+  const bySeries = new Map();
+  for (const [m, bag] of perModel) {
+    const s = [...bag.keys()].sort((a, b) =>
+      stemLen(m, b) - stemLen(m, a) || bag.get(b) - bag.get(a) || seriesSize.get(b) - seriesSize.get(a) || a.localeCompare(b))[0];
+    const list = bySeries.get(s) || bySeries.set(s, []).get(s);
+    const n = counts.get(m) || bag.get(s);
+    list.push({ value: m, label: `${m} (${n})`, count: n });
+  }
+  const natural = (a, b) => a.value.localeCompare(b.value, undefined, { numeric: true });
+  const series = [...bySeries.entries()].sort((a, b) => (a[0] === "" ? 1 : b[0] === "" ? -1 : a[0].localeCompare(b[0])));
+  if (series.length === 1 && series[0][0] === "") return series[0][1].sort(natural);
+  return series.map(([s, models]) => {
+    const n = models.reduce((t, x) => t + x.count, 0);
+    return { value: s || NONE, label: `${s || "No series"} (${n})`, count: n, children: models.sort(natural) };
+  });
+}
+const tileMatch = (tile, days) => {
+  const units = `$metrics.units${days}.total`;
+  switch (tile) {
+    case "zero": return { "metrics.available": { $lte: 0 } };
+    case "onOrder": return { "metrics.openPoQty": { $gt: 0 } };
+    case "noOnOrder": return { "metrics.available": { $lte: 0 }, "metrics.openPoQty": { $not: { $gt: 0 } } };
+    case "underMonth": return { $expr: { $and: [{ $gt: [{ $ifNull: [units, 0] }, 0] }, { $lt: [{ $ifNull: ["$metrics.available", 0] }, { $multiply: [{ $ifNull: [units, 0] }, 30 / days] }] }] } };
+    default: return {};
+  }
+};
+
+router.get("/browse-items", VIEW, async (req, res, next) => {
+  try {
+    const q = req.query || {};
+    const scope = scopeOf(req);
+    const days = BROWSE_DAYS.has(Number(q.days)) ? Number(q.days) : 30;
+    const page = Math.max(1, parseInt(q.page, 10) || 1);
+    const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(q.pageSize, 10) || 20));
+    const wantAll = String(q.all || "") === "1";
+    const SORTS = { name: "name", sku: "sku", stock: "metrics.available", sales: `metrics.units${days}.total` };
+    const sortField = SORTS[String(q.sort)] || "name";
+    const order = String(q.order) === "desc" ? -1 : 1;
+    const sort = { [sortField]: order, itemId: 1 };
+
+    const db = await connectToDatabase();
+    const refresh = await latestRefresh(db);
+    const hiddenIds = (await db.collection(HIDDEN).find({}, { projection: { itemId: 1 } }).toArray()).map((h) => String(h.itemId));
+    const showHidden = String(q.hidden || "") === "1";
+    const filters = filterMatch(q);
+    const node = { active: true, scope, archived: { $ne: true }, ...nodeMatch(q) };
+    // Hidden items are out of the list and its counts — or ARE the list.
+    const nodeBase = { ...node, itemId: showHidden ? { $in: hiddenIds } : { $nin: hiddenIds } };
+    const base = { ...nodeBase, ...filters };
+    const tile = tileMatch(String(q.tile || ""), days);
+    const sea = await db.collection("productCollections").findOne({ seaFreight: true }, { projection: { products: 1 } });
+    const seaIds = new Set(((sea && sea.products) || []).map((p) => String(p.itemId)));
+    const shape = (r) => shapeListRow(r, { hidden: showHidden ? new Set([r.itemId]) : null, seaIds, memberOf: null });
+
+    if (wantAll) {
+      const rows = await db.collection(ITEMS).find({ ...base, ...tile }, { projection: LIST_PROJECTION }).sort(sort).limit(EXPORT_CAP).toArray();
+      return res.json({ success: true, total: rows.length, capped: rows.length === EXPORT_CAP, rows: rows.map(shape) });
+    }
+
+    const units = { $ifNull: [`$metrics.units${days}.total`, 0] };
+    const avail = { $ifNull: ["$metrics.available", 0] };
+    const onOrder = { $gt: [{ $ifNull: ["$metrics.openPoQty", 0] }, 0] };
+    const count = (cond) => ({ $sum: { $cond: [cond, 1, 0] } });
+    // One pass over the node: the filter options (quality, series → model)
+    // are counted over the whole node; tiles, total and rows apply the
+    // filters — so picking a model never empties the other choices.
+    const [out] = await db
+      .collection(ITEMS)
+      .aggregate([
+        { $match: nodeBase },
+        {
+          $facet: {
+            tiles: [
+              { $match: filters },
+              {
+                $group: {
+                  _id: null,
+                  all: { $sum: 1 },
+                  zero: count({ $lte: [avail, 0] }),
+                  onOrder: count(onOrder),
+                  noOnOrder: count({ $and: [{ $lte: [avail, 0] }, { $not: [onOrder] }] }),
+                  underMonth: count({ $and: [{ $gt: [units, 0] }, { $lt: [avail, { $multiply: [units, 30 / days] }] }] }),
+                },
+              },
+            ],
+            qualities: [{ $group: { _id: { $ifNull: ["$quality", ""] }, n: { $sum: 1 } } }, { $sort: { n: -1, _id: 1 } }],
+            seriesModels: [
+              { $project: { series: multiSplit("deviceSeries"), models: { $ifNull: ["$compatibleModels", []] } } },
+              { $unwind: "$models" },
+              { $unwind: "$series" },
+              { $group: { _id: { s: "$series", m: "$models" }, n: { $sum: 1 } } },
+            ],
+            modelCounts: [{ $unwind: "$compatibleModels" }, { $group: { _id: "$compatibleModels", n: { $sum: 1 } } }],
+            total: [{ $match: filters }, { $match: tile }, { $count: "n" }],
+            rows: [{ $match: filters }, { $match: tile }, { $sort: sort }, { $skip: (page - 1) * pageSize }, { $limit: pageSize }, { $project: LIST_PROJECTION }],
+          },
+        },
+      ])
+      .toArray();
+    const t = (out.tiles && out.tiles[0]) || { all: 0, zero: 0, onOrder: 0, noOnOrder: 0, underMonth: 0 };
+    delete t._id;
+    // How many of this node's items are hidden — the "N hidden — view" link.
+    const hiddenCount = showHidden ? t.all : hiddenIds.length ? await db.collection(ITEMS).countDocuments({ ...node, ...filters, itemId: { $in: hiddenIds } }) : 0;
+    return res.json({
+      success: true,
+      snapshotDate: refresh ? refresh.snapshotDate : null,
+      metricsAt: refresh ? refresh.metricsAt : null,
+      days,
+      tiles: t,
+      hiddenCount,
+      qualities: (out.qualities || []).map((x) => ({ value: x._id, count: x.n })),
+      seriesModels: buildSeriesModels(out.seriesModels || [], out.modelCounts || []),
+      total: (out.total && out.total[0] && out.total[0].n) || 0,
+      page,
+      pageSize,
+      rows: (out.rows || []).map(shape),
     });
   } catch (error) {
     next(error);
