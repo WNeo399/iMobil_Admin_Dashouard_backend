@@ -34,11 +34,17 @@ const FIELDS = [
   { key: "deviceBrand", label: "Device Brand", type: "pick", path: "deviceBrand" },
   { key: "deviceSeries", label: "Device Series", type: "pick", path: "deviceSeries" },
   { key: "compatibleModels", label: "Compatible Model", type: "list", path: "compatibleModels" },
-  { key: "zohoBrand", label: "Brand (Zoho)", type: "pick", path: "zohoBrand" },
-  { key: "zohoCategory", label: "Category (Zoho)", type: "pick", path: "zohoCategory" },
+  // Hidden from the dialog's field list (the user dropped them, 2026-09-23);
+  // still understood, because some Accessories collections are built on them.
+  { key: "zohoBrand", label: "Brand (Zoho)", type: "pick", path: "zohoBrand", hidden: true },
+  { key: "zohoCategory", label: "Category (Zoho)", type: "pick", path: "zohoCategory", hidden: true },
   { key: "preferVendor", label: "Prefer Vendor", type: "pick", path: "preferVendor" },
   { key: "location", label: "Shelf", type: "text", path: "location" },
   { key: "showInStore", label: "Shown in Store", type: "bool", path: "showInStore" },
+  // Not a filter row: the dialog's "Include archived items" checkbox, stored
+  // as { field: "archived", op: "include" }. Archived items are left out of
+  // every rule unless it is there. See collectionMatch.
+  { key: "archived", label: "Archived", type: "archive", path: "archived", hidden: true },
 ];
 const FIELD_BY_KEY = new Map(FIELDS.map((f) => [f.key, f]));
 
@@ -74,6 +80,9 @@ const OPS = {
   bool: [
     { key: "yes", label: "is yes", value: "none" },
     { key: "no", label: "is no", value: "none" },
+  ],
+  archive: [
+    { key: "include", label: "include archived items", value: "none" },
   ],
 };
 
@@ -141,10 +150,18 @@ function clause(row) {
   }
 }
 
+// "include" when the rule asks for archived items too, else "exclude" (the
+// default: archived items stay hidden).
+function archiveMode(rows) {
+  const row = sanitizeRows(rows).filter((r) => r.field === "archived").pop();
+  return row ? row.op : "exclude";
+}
+
 // Validated rows → a Mongo predicate, or null when there are no rows (a
 // collection with no rule matches nothing by rule — only its pinned items).
+// The Archived row is not a predicate (collectionMatch applies it).
 function compileRows(rows) {
-  const clean = sanitizeRows(rows);
+  const clean = sanitizeRows(rows).filter((r) => r.field !== "archived");
   if (!clean.length) return null;
   const groups = [[]];
   clean.forEach((r, i) => {
@@ -156,12 +173,15 @@ function compileRows(rows) {
 }
 
 // The register rows a collection holds: its rule within its own business
-// (parts or accessories, never the Archive bucket), plus whatever was
-// pinned by hand — pinned items count wherever they sit.
+// (parts or accessories; archived items only when the collection includes
+// them), plus whatever was pinned by hand — pinned items count wherever
+// they sit.
 function collectionMatch(doc, scope) {
-  const rule = compileRows(doc && doc.filter && doc.filter.rows);
+  const rows = doc && doc.filter && doc.filter.rows;
+  const rule = compileRows(rows);
+  const archivedCond = archiveMode(rows) === "include" ? {} : { archived: { $ne: true } };
   const pinned = ((doc && doc.products) || []).map((p) => String(p && p.itemId)).filter(Boolean);
-  const ruleMatch = rule ? { scope, archived: { $ne: true }, ...rule } : null;
+  const ruleMatch = rule ? { scope, ...archivedCond, ...rule } : null;
   const pinMatch = pinned.length ? { itemId: { $in: pinned } } : null;
   if (ruleMatch && pinMatch) return { active: true, $or: [ruleMatch, pinMatch] };
   if (ruleMatch) return { active: true, ...ruleMatch };
@@ -194,7 +214,9 @@ async function filterOptions(db, scope) {
       .filter((v) => typeof v === "string" && v.trim())
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   }
-  const value = { fields: FIELDS.map(({ key, label, type }) => ({ key, label, type })), ops: OPS, options };
+  // `hidden` fields stay in the list so an existing rule that uses one
+  // still shows its label; the dialog does not offer them for new rows.
+  const value = { fields: FIELDS.map(({ key, label, type, hidden }) => ({ key, label, type, ...(hidden ? { hidden: true } : {}) })), ops: OPS, options };
   optionsCache.set(scope, { at: Date.now(), value });
   return value;
 }
@@ -219,6 +241,7 @@ module.exports = {
   TAG_FIELD_BY_STORE,
   sanitizeRows,
   compileRows,
+  archiveMode,
   collectionMatch,
   resolveCollectionItemIds,
   filterOptions,

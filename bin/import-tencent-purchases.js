@@ -13,7 +13,8 @@
 //   --report <file.xlsx>    where the report goes (default: next to the repos)
 //
 // Scope: rows not yet received whose 订货日期 is on/after --since. Cancelled
-// rows, and rows whose 供应商 cell says 取消 / 太贵不要, are skipped. A 供应商
+// rows, rows whose 供应商 cell says 取消 / 太贵不要, and duplicate rows (same
+// item, tab, date and qty — the most advanced one is kept) are skipped. A 供应商
 // cell that says 没货 / 缺货 becomes a Shortage line. Shipped rows are grouped
 // by DHL tracking into one shipment batch each (no Zoho PO is raised for them:
 // those shipments had their Zoho PO made by hand in the sheet era).
@@ -105,10 +106,42 @@ async function nextNo(db, key, prefix, start, coll) {
   const itemById = new Map(items.map((i) => [String(i.itemId), i]));
   const already = new Set((await db.collection(ORDERS).find({ "tencent.recId": { $in: rows.map((r) => String(r._id)) } }, { projection: { "tencent.recId": 1 } }).toArray()).map((o) => o.tencent.recId));
 
-  // ── 3. the plan: one entry per row ──
-  const dupKey = (r) => [r.category, clean(r.sku), ymd(r.orderDate), r.orderQty].join("|");
-  const dupCount = new Map();
-  for (const r of rows) dupCount.set(dupKey(r), (dupCount.get(dupKey(r)) || 0) + 1);
+  // ── 3. duplicates (the user's rule: delete them) ──
+  // The same item, tab, order date and quantity more than once — a sheet row
+  // the mirror kept a stale copy of after an edit, or a dashboard PO that
+  // also came back from the sheet. One row per group is imported: the one
+  // furthest along (shipped > ordered > shortage > pending; a sheet row over
+  // a dashboard-only copy). A second SHIPPED row in a different shipment is a
+  // real second shipment and is imported too. The rest are skipped.
+  const STAGE = { shipped: 4, ordered: 3, shortage: 2, pending: 1 };
+  const eligible = (r) =>
+    !already.has(String(r._id)) && !r.cancelled && r.status !== "cancelled" &&
+    !CANCEL_WORDS.includes(clean(r.supplier)) && Math.round(num(r.orderQty) || 0) > 0 && itemById.has(clean(r.zoho_id));
+  const dupKey = (r) => [clean(r.category), clean(r.zoho_id), ymd(r.orderDate), Math.round(num(r.orderQty) || 0)].join("|");
+  const groups = new Map();
+  for (const r of rows) {
+    if (!eligible(r)) continue;
+    const k = dupKey(r);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
+  }
+  const dupOf = new Map(); // sheet record id → the row kept instead
+  for (const g of groups.values()) {
+    if (g.length < 2) continue;
+    const ranked = g.slice().sort((a, b) =>
+      (STAGE[b.status] || 0) - (STAGE[a.status] || 0) ||
+      Number(b.sourceRow != null) - Number(a.sourceRow != null) ||
+      String(a._id).localeCompare(String(b._id)));
+    const kept = [ranked[0]];
+    for (const r of ranked.slice(1)) {
+      const own = clean(r.dhlTracking);
+      const separateShipment = r.status === "shipped" && own && kept.every((k) => k.status !== "shipped" || clean(k.dhlTracking) !== own);
+      if (separateShipment) kept.push(r);
+      else dupOf.set(String(r._id), ranked[0]);
+    }
+  }
+
+  // ── 4. the plan: one entry per row ──
 
   const plan = [];
   for (const r of rows) {
@@ -129,6 +162,14 @@ async function nextNo(db, key, prefix, start, coll) {
       const why = !skuRaw ? "SKU cell is empty" : SKU_PLACEHOLDERS.has(skuRaw.toLowerCase()) ? `SKU cell is "${skuRaw}" (a placeholder)` : clean(r.zoho_id) ? "Zoho item id not in the register" : `SKU ${skuRaw} not found in Zoho`;
       if (INCLUDE_UNMATCHED) issue("check", "no-catalogue-item", `${why} — imported with NO item link (Stock Monitoring will not see it)`);
       else { p.action = "skip"; p.skip = "no catalogue item"; issue("block", "no-catalogue-item", `${why} — add the item to Zoho / put its SKU in the sheet, then re-run (or --include-unmatched)`); plan.push(p); continue; }
+    }
+    if (dupOf.has(String(r._id))) {
+      const k = dupOf.get(String(r._id));
+      p.action = "skip";
+      p.skip = "duplicate";
+      p.skipDetail = `same item, date and qty as ${k.sourceRow != null ? "sheet row " + k.sourceRow : "a dashboard PO"} (${k.status}), which is imported`;
+      plan.push(p);
+      continue;
     }
 
     // target line
@@ -159,16 +200,18 @@ async function nextNo(db, key, prefix, start, coll) {
       } else {
         shippedQty = Math.round(shippedQty);
         trackingKey = clean(r.dhlTracking) || "(none)";
-        if (trackingKey === "(none)") issue("check", "shipped-no-tracking", "shipped without a tracking number — goes into a batch of its own");
-        else if (!looksLikeTracking(trackingKey)) issue("check", "tracking-is-note", `DHL cell "${trackingKey}" is not a tracking number — kept as the batch note`);
+        // No tracking is acceptable (the user's call): such lines share one
+        // batch without a tracking number.
+        if (trackingKey !== "(none)" && !looksLikeTracking(trackingKey)) issue("check", "tracking-is-note", `DHL cell "${trackingKey}" is not a tracking number — kept as the batch note`);
         if (!ymd(r.shippedDate)) issue("check", "shipped-no-date", "shipped without 发货日期 — the batch date falls back to the order date");
-        if (shippedQty < orderQty) issue("check", "short-shipment", `shipped ${shippedQty} of ${orderQty} — the remainder (${orderQty - shippedQty}) is NOT re-created; raise a new line if still wanted`);
+        // A short shipment is acceptable as it stands (the user's call): the
+        // remainder is not re-created.
         if (shippedQty > orderQty) issue("check", "over-shipment", `shipped ${shippedQty} but ordered ${orderQty}`);
-        if (unitPrice == null) issue("info", "shipped-no-price", "shipped without a unit price (the packing list shows none)");
+        // A shipped line without a unit price is fine for these sheet-era
+        // shipments (the user's call) — not reported.
       }
     }
-    if (status === "ordered" && !supplier) issue("check", "ordered-no-supplier", "ordered (下单时间 / price present) but 供应商 is empty");
-    if (dupCount.get(dupKey(r)) > 1) issue("check", "duplicate-row", `${dupCount.get(dupKey(r))} identical rows in this tab (same SKU, date, qty) — real repeat orders, or a double entry?`);
+    // An ordered line without a supplier is acceptable (the user's call).
 
     const category = CHANNEL_TABS[tab] || (item ? (CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other") : TAB_CATEGORY[tab] || "Other");
     p.t = {
@@ -193,7 +236,7 @@ async function nextNo(db, key, prefix, start, coll) {
   }
 
   const imports = plan.filter((p) => p.action === "import");
-  // ── 4. shipment batches: one per tracking number ──
+  // ── 5. shipment batches: one per tracking number ──
   const batchMap = new Map();
   for (const p of imports.filter((p) => p.t.status === "shipped")) {
     const k = p.t.trackingKey;
@@ -213,7 +256,7 @@ async function nextNo(db, key, prefix, start, coll) {
     };
   }).sort((a, b) => a.shippedDate.localeCompare(b.shippedDate));
 
-  // ── 5. apply ──
+  // ── 6. apply ──
   let created = 0;
   let createdBatches = 0;
   if (APPLY) {
@@ -333,7 +376,7 @@ async function nextNo(db, key, prefix, start, coll) {
     }
   }
 
-  // ── 6. the report ──
+  // ── 7. the report ──
   const count = (arr, f) => { const m = {}; for (const x of arr) { const k = String(f(x)); m[k] = (m[k] || 0) + 1; } return m; };
   const kv = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(", ");
   const skipped = plan.filter((p) => p.action === "skip");
@@ -380,7 +423,7 @@ async function nextNo(db, key, prefix, start, coll) {
   for (const b of batches) batchRows.push([b.trackingKey, b.shippedDate, b.lines.length, b.totalQty, b.suppliers.join(", "), b.note, ...(APPLY ? [b.lines[0].batchNo || ""] : [])]);
   const exclRows = [["Why", "Tab", "Sheet row", "订货日期", "SKU", "Product", "Qty", "Sheet status", "供应商", "DHL", "发货数量"]];
   for (const r of undated) exclRows.push(["no 订货日期", clean(r.category), r.sourceRow == null ? "" : r.sourceRow, clean(r.orderDate), clean(r.sku), clean(r.productName), r.orderQty, r.status, clean(r.supplier), clean(r.dhlTracking), r.shippedQty == null ? "" : r.shippedQty]);
-  for (const p of skipped) { const r = p.row; exclRows.push([`skipped: ${p.skip}`, clean(r.category), r.sourceRow == null ? "" : r.sourceRow, clean(r.orderDate), clean(r.sku), clean(r.productName), r.orderQty, r.status, clean(r.supplier), clean(r.dhlTracking), r.shippedQty == null ? "" : r.shippedQty]); }
+  for (const p of skipped) { const r = p.row; exclRows.push([`skipped: ${p.skip}${p.skipDetail ? " — " + p.skipDetail : ""}`, clean(r.category), r.sourceRow == null ? "" : r.sourceRow, clean(r.orderDate), clean(r.sku), clean(r.productName), r.orderQty, r.status, clean(r.supplier), clean(r.dhlTracking), r.shippedQty == null ? "" : r.shippedQty]); }
 
   const wb = XLSX.utils.book_new();
   const addSheet = (name, aoa, widths) => {
@@ -400,7 +443,7 @@ async function nextNo(db, key, prefix, start, coll) {
   addSheet("Excluded", exclRows, [30, 14, 9, 11, 12, 60, 6, 10, 12, 16, 8]);
   XLSX.writeFile(wb, REPORT);
 
-  // ── 7. console summary ──
+  // ── 8. console summary ──
   for (const [k, v] of summary) if (k) console.log(String(k).padEnd(46), v == null ? "" : v);
   console.log("\nreport:", REPORT);
   process.exit(0);
