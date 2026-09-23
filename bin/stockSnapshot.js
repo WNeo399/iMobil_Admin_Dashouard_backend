@@ -45,7 +45,7 @@ const {
   ITEMS,
   ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
-  OPEN_PO_STATUSES,
+  openPurchasesBySku,
   skuKey,
   num,
   stockFlags,
@@ -56,7 +56,6 @@ const {
 } = require("../utils/stockItems");
 const RUNS = "imb_stock_runs";
 const PRODUCTS = "imb_products";
-const PURCHASE_ORDERS = "imb_purchase_order";
 const COLLECTIONS = "productCollections";
 const COLLECTION_GROUPS = "productCollectionsGroups";
 
@@ -228,30 +227,17 @@ async function main() {
     return byItem;
   });
 
-  // ── 5. our own catalogue and open POs, by SKU ─────────────────────
+  // ── 5. our own catalogue and open purchase lines, by SKU ──────────
   const { productBySku, poBySku } = await stage("joins", async () => {
     const products = await db.collection(PRODUCTS)
       .find({}, { projection: { sku: 1, brand: 1, category: 1, quality: 1 } })
       .toArray();
     const productBySku = new Map(products.map((p) => [skuKey(p.sku), p]));
 
-    const poLines = await db.collection(PURCHASE_ORDERS)
-      .find({ status: OPEN_PO_STATUSES },
-        { projection: { sku: 1, orderQty: 1, shippedQty: 1, orderDate: 1, status: 1 } })
-      .toArray();
-    const poBySku = new Map();
-    for (const l of poLines) {
-      const k = skuKey(l.sku);
-      if (!k) continue;
-      if (!poBySku.has(k)) poBySku.set(k, { qty: 0, lines: 0, earliest: null });
-      const e = poBySku.get(k);
-      e.qty += num(l.orderQty);
-      e.lines += 1;
-      // orderDate is a loose "YYYY-M-D" string from the supplier sheet.
-      const d = l.orderDate ? new Date(String(l.orderDate).replace(/-/g, "/")) : null;
-      if (d && !Number.isNaN(d.getTime()) && (!e.earliest || d < e.earliest)) e.earliest = d;
-    }
-    log(`  joins:      ${productBySku.size} catalogue SKUs · ${poBySku.size} SKUs on open PO`);
+    // Spare Parts Purchase lines not yet received (the Tencent sheet until
+    // 2026-09-23).
+    const poBySku = await openPurchasesBySku(db);
+    log(`  joins:      ${productBySku.size} catalogue SKUs · ${poBySku.size} SKUs on open purchase lines`);
     return { productBySku, poBySku };
   });
 

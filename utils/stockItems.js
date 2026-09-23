@@ -102,8 +102,12 @@ const ACCESSORY_BRANDS = new Set([
   "Accessory", "iShield", "Roar", "Ugly Rubber UR", "X.One", "Halosure",
   "Remax", "JoyRoom", "HOCO", "COTECi", "Rock", "Blue Nation", "Baseus",
 ]);
-// A PO line still owes us stock until it is received (or cancelled).
-const OPEN_PO_STATUSES = { $nin: ["received", "cancelled"] };
+// What is still coming from the supplier: the Spare Parts Purchase lines
+// not yet received or cancelled. (Until 2026-09-23 this was the Tencent
+// supplier sheet, imb_purchase_order — retired once its open rows were
+// imported into the module.)
+const PURCHASE_LINES = "imb_spp_orders";
+const OPEN_PURCHASE_STATUSES = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
 
 const skuKey = (v) => String(v == null ? "" : v).trim().toUpperCase();
 const num = (v) => {
@@ -125,6 +129,56 @@ function stockFlags({ available, units30, openPoQty }) {
     belowMonthCover: available < (units30 || 0),
     daysOfCover: rate30 > 0 ? Math.round((available / rate30) * 10) / 10 : null,
   };
+}
+
+// Open purchase lines by SKU → { qty, lines, earliest }. A shipped line
+// counts what was shipped (it closes at that), the others what was ordered —
+// the same figure as the Stock Monitoring On order column.
+async function openPurchasesBySku(db) {
+  const lines = await db.collection(PURCHASE_LINES)
+    .find({ status: { $in: OPEN_PURCHASE_STATUSES } },
+      { projection: { sku: 1, status: 1, orderQty: 1, shippedQty: 1, createdAt: 1 } })
+    .toArray();
+  const bySku = new Map();
+  for (const l of lines) {
+    const k = skuKey(l.sku);
+    if (!k) continue;
+    if (!bySku.has(k)) bySku.set(k, { qty: 0, lines: 0, earliest: null });
+    const e = bySku.get(k);
+    e.qty += num(l.status === "shipped" ? l.shippedQty : l.orderQty);
+    e.lines += 1;
+    const d = l.createdAt ? new Date(l.createdAt) : null;
+    if (d && !Number.isNaN(d.getTime()) && (!e.earliest || d < e.earliest)) e.earliest = d;
+  }
+  return bySku;
+}
+
+// Re-stamp every active item's on-order figures (and the flags that hang on
+// them) from the purchase lines — Mongo only, no Zoho call. The hourly sync
+// runs it: a line raised, shipped or received changes an item Zoho did not.
+async function refreshOnOrder(db, poBySku) {
+  const bySku = poBySku || (await openPurchasesBySku(db));
+  const col = db.collection(ITEMS);
+  const rows = await col.find({ active: true }, {
+    projection: { sku: 1, "metrics.available": 1, "metrics.units30": 1, "metrics.openPoQty": 1, "metrics.openPoLines": 1, "metrics.earliestPoDate": 1 },
+  }).toArray();
+  const time = (d) => (d ? new Date(d).getTime() : null);
+  const ops = [];
+  for (const r of rows) {
+    const m = r.metrics || {};
+    const po = bySku.get(skuKey(r.sku));
+    const qty = po ? po.qty : 0;
+    const lines = po ? po.lines : 0;
+    const earliest = po ? po.earliest : null;
+    if (num(m.openPoQty) === qty && num(m.openPoLines) === lines && time(m.earliestPoDate) === time(earliest)) continue;
+    const u30 = m.units30;
+    const units30 = u30 && typeof u30 === "object" ? num(u30.total) : num(u30);
+    const set = { "metrics.openPoQty": qty, "metrics.openPoLines": lines, "metrics.earliestPoDate": earliest };
+    for (const [k, v] of Object.entries(stockFlags({ available: num(m.available), units30, openPoQty: qty }))) set[`metrics.${k}`] = v;
+    ops.push({ updateOne: { filter: { _id: r._id }, update: { $set: set } } });
+  }
+  for (let i = 0; i < ops.length; i += 500) await col.bulkWrite(ops.slice(i, i + 500), { ordered: false });
+  return ops.length;
 }
 
 // A flat job row → { catalogue, metrics }.
@@ -195,7 +249,8 @@ module.exports = {
   roundSaleUnits,
   ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
-  OPEN_PO_STATUSES,
+  openPurchasesBySku,
+  refreshOnOrder,
   skuKey,
   num,
   stockFlags,

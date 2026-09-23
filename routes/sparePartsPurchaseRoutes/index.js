@@ -73,16 +73,18 @@ const OPEN = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
 // Where a line files in the tree: the register classification of its item
 // (set automatically on create, 2026-09-22), or one of the two channels the
 // team keeps apart — sea-freight orders (海运) and customer special orders.
-const CLASSIFICATIONS = ["Screen", "Housing", "BackCover", "Battery", "Small Parts", "Tools", "Other"];
-const CHANNELS = ["海运", "Special Order"];
+const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "Tools", "Other"];
+const CHANNELS = ["海运", "Special Order", "New Product"];
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
 // The classification of an item as the register has it, "Other" when blank.
-async function classificationOf(db, itemId) {
-  if (!itemId) return "Other";
-  const it = await db.collection(ITEMS).findOne({ itemId: String(itemId) }, { projection: { _id: 0, classification: 1 } });
+// The register's say on a line's item: its classification as a module
+// category (blank / unknown → Other) and its image id.
+async function registerFacts(db, itemId) {
+  if (!itemId) return { category: "Other", imageId: null };
+  const it = await db.collection(ITEMS).findOne({ itemId: String(itemId) }, { projection: { _id: 0, classification: 1, imageId: 1 } });
   const c = it && it.classification;
-  return CLASSIFICATIONS.includes(c) ? c : "Other";
+  return { category: CLASSIFICATIONS.includes(c) ? c : "Other", imageId: (it && it.imageId) || null };
 }
 
 const actor = (req) => (req.user && (req.user.username || req.user.email)) || null;
@@ -321,14 +323,15 @@ router.post("/orders", CREATE, async (req, res, next) => {
       const orderQty = Math.round(num(l.orderQty));
       const itemId = str(l.itemId) || null;
       const asked = str(l.category);
-      const category = isChannel(asked) ? asked : itemId ? await classificationOf(db, itemId) : CLASSIFICATIONS.includes(asked) ? asked : "Other";
+      const reg = itemId ? await registerFacts(db, itemId) : null;
+      const category = isChannel(asked) ? asked : reg ? reg.category : CLASSIFICATIONS.includes(asked) ? asked : "Other";
       docs.push({
         orderNo: no,
         seq,
         itemId,
         sku: str(l.sku),
         productName: str(l.productName),
-        imageId: str(l.imageId) || null,
+        imageId: str(l.imageId) || (reg && reg.imageId) || null,
         category,
         orderQty,
         note: str(l.note),

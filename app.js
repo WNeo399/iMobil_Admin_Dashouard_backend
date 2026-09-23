@@ -39,8 +39,6 @@ var svpPublicRouter = require('./routes/svpPublicRoutes/index');
 // Per-user in-app notifications (bell + toast). Scoped to the caller inside
 // the router, so it only needs `authenticate` — no per-permission gate.
 var notificationRouter = require('./routes/notificationRoutes/index');
-// Purchase Order — read-only view over the supplier's Tencent Docs sheet.
-var purchaseOrderRouter = require('./routes/purchaseOrderRoutes/index');
 // Spare Parts Purchase — the in-app purchase process that replaces the sheet.
 var sparePartsPurchaseRouter = require('./routes/sparePartsPurchaseRoutes/index');
 // Refurbished Phones — read-only views over the external scraper MySQL DB.
@@ -126,7 +124,7 @@ app.use('/integration/shipment', shipmentWebhookRouter);
 // (optional INFLOW_WEBHOOK_SECRET shared secret inside the router).
 app.use('/integration/inflow', inflowWebhookRouter);
 // Purchase Order daily update sync — GET/POST /integration/purchaseOrderSync.
-// Public; protected by the PO_SYNC_SECRET shared secret inside the router.
+// Retired with the Tencent sheet (2026-09-23): answers "retired", syncs nothing.
 app.use('/integration/purchaseOrderSync', purchaseOrderSyncRouter);
 app.use('/integration/stockSync', stockSyncRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
@@ -175,7 +173,9 @@ app.use('/catalogue', authenticate, catalogueRouter);
 app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
 app.use('/svpSerial', authenticate, svpSerialRouter);
 app.use('/notifications', authenticate, notificationRouter);
-app.use('/purchaseOrder', authenticate, purchaseOrderRouter);
+// (/purchaseOrder — the Tencent-sheet Purchase Order page's API — was
+// unmounted on 2026-09-23 when the sheet was retired; its records stay in
+// imb_purchase_order as history.)
 app.use('/sparePartsPurchase', authenticate, sparePartsPurchaseRouter);
 app.use('/refurbished', authenticate, refurbishedRouter);
 app.use('/stock-monitor', authenticate, stockMonitorRouter);

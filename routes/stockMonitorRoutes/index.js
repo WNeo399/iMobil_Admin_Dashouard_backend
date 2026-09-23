@@ -567,7 +567,7 @@ router.get("/collection-items", VIEW, async (req, res, next) => {
 // node (straight to sub classification) instead of sitting in "No device".
 const NONE = "__none__";
 const TOOL = "__tool__";
-const CLASS_ORDER = ["Screen", "Housing", "BackCover", "Battery", "Small Parts", "Tools", "Other", "Accessory"];
+const CLASS_ORDER = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "Tools", "Other", "Accessory"];
 const nodeLabel = (v, blank) => (v ? v : blank);
 const multiSplit = (field) => ({ $split: [{ $ifNull: [`$${field}`, ""] }, "; "] });
 // the brand an item files under: its brand, or TOOL for a brand-less tool

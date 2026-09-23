@@ -133,10 +133,11 @@ const ROLE_PERMISSIONS = {
     "consign:device:sell",
     "consign:device:return",
   ],
-  // iMobile Purchase — Purchase Order (po:order:view et al) + Special Order
-  // (po:specialOrder:view via the wildcard). Deliberately NOT
+  // iMobile Purchase — Spare Parts Purchase (the whole module: the Tencent
+  // sheet's Purchase Order page it used was retired 2026-09-23) + Special
+  // Order (po:specialOrder:view via the wildcard). Deliberately NOT
   // zoho:salesOrder:create, which would also unlock the Credit Note page.
-  [ROLES.IMOBILE_PURCHASE]: ["po:*:*"],
+  [ROLES.IMOBILE_PURCHASE]: ["po:*:*", "spp:*:*"],
   // Parts Supplier — Spare Parts Purchase: sees every order, quotes / places
   // / flags shortages, ships batches. Creating orders and receiving batches
   // stay with iMobile (spp:order:create / spp:order:receive).

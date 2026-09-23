@@ -36,7 +36,8 @@ const { handleZohoInventoryRequest } = require("./zohoRequest");
 const { fetchItemDetails, itemLocation, itemCatalogueFields, listFields, ORGANIZATION_ID } = require("./zohoStock");
 const {
   ITEMS,
-  OPEN_PO_STATUSES,
+  openPurchasesBySku,
+  refreshOnOrder,
   ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
   skuKey,
@@ -50,7 +51,6 @@ const { isNoiseName, ARCHIVE_COLLECTION } = require("./stockUniverse");
 const STATE = "imb_sync_state";
 const STATE_ID = "stockItems";
 const PRODUCTS = "imb_products";
-const PURCHASE_ORDERS = "imb_purchase_order";
 
 const PAGE = 200;
 // 25 pages = 5,000 changed items in one pass — far above an hour's worth.
@@ -147,30 +147,18 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
 
     let changed = 0, inserted = 0, inactivated = 0;
     if (ids.length) {
-      const [details, existingRows, overrides, products, poLines] = await Promise.all([
+      const [details, existingRows, overrides, products, poBySku] = await Promise.all([
         fetchItemDetails(ids),
         items.find({ itemId: { $in: ids } }, { projection: { itemId: 1, active: 1, scope: 1, "metrics.units30": 1 } }).toArray(),
         db.collection(ARCHIVE_COLLECTION).find({ itemId: { $in: ids } }, { projection: { itemId: 1, mode: 1 } }).toArray(),
-        // Same joins as the nightly run: our catalogue, and open POs, by SKU.
+        // Same joins as the nightly run: our catalogue, and open purchase
+        // lines (Spare Parts Purchase), by SKU.
         db.collection(PRODUCTS).find({}, { projection: { sku: 1, brand: 1, category: 1, quality: 1 } }).toArray(),
-        db.collection(PURCHASE_ORDERS)
-          .find({ status: OPEN_PO_STATUSES }, { projection: { sku: 1, orderQty: 1, orderDate: 1 } })
-          .toArray(),
+        openPurchasesBySku(db),
       ]);
       const existingById = new Map(existingRows.map((r) => [r.itemId, r]));
       const overrideById = new Map(overrides.map((o) => [String(o.itemId), o.mode]));
       const productBySku = new Map(products.map((p) => [skuKey(p.sku), p]));
-      const poBySku = new Map();
-      for (const l of poLines) {
-        const k = skuKey(l.sku);
-        if (!k) continue;
-        if (!poBySku.has(k)) poBySku.set(k, { qty: 0, lines: 0, earliest: null });
-        const e = poBySku.get(k);
-        e.qty += num(l.orderQty);
-        e.lines += 1;
-        const d = l.orderDate ? new Date(String(l.orderDate).replace(/-/g, "/")) : null;
-        if (d && !Number.isNaN(d.getTime()) && (!e.earliest || d < e.earliest)) e.earliest = d;
-      }
 
       const ops = [];
       for (const d of details) {
@@ -274,6 +262,10 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
       }
     }
 
+    // On order for every item, not just the ones Zoho changed: purchase
+    // lines move without Zoho knowing.
+    const onOrderRestamped = await refreshOnOrder(db);
+
     // Advance the watermark: to the start of this run when everything was
     // read, else only as far as the newest item actually processed.
     let nextSince = startedAt;
@@ -289,13 +281,14 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
       changed,
       inserted,
       inactivated,
+      onOrderRestamped,
       complete,
     };
     await state.updateOne(
       { _id: STATE_ID },
       { $set: { running: false, since: nextSince, lastRunAt: startedAt, lastResult: result, lastError: null } },
     );
-    log(`stock sync: ${changed} updated · ${inserted} new · ${inactivated} inactivated · ${result.ms}ms`);
+    log(`stock sync: ${changed} updated · ${inserted} new · ${inactivated} inactivated · ${onOrderRestamped} on-order restamped · ${result.ms}ms`);
     return result;
   } catch (error) {
     await state.updateOne(
