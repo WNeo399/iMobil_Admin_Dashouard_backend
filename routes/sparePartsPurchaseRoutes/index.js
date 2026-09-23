@@ -67,9 +67,9 @@ const requireAny = (...perms) => (req, res, next) => {
 };
 const CREATE_OR_SUPPLY = requireAny("spp:order:create", "spp:order:supply");
 
-const STATUSES = ["pending", "ordered", "shipped", "received", "shortage", "cancelled"];
+const STATUSES = ["pending", "toConfirm", "ordered", "shipped", "received", "shortage", "cancelled"];
 // "open" = still to arrive
-const OPEN = ["pending", "ordered", "shipped", "shortage"];
+const OPEN = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
 // Where a line files in the tree: the register classification of its item
 // (set automatically on create, 2026-09-22), or one of the two channels the
 // team keeps apart — sea-freight orders (海运) and customer special orders.
@@ -414,24 +414,78 @@ async function transition(req, res, next, { from, to, action, build }) {
     const built = build ? build(rec, req.body || {}, by) : {};
     if (built && built.error) return bad(res, built.error);
     const set = { ...((built && built.set) || {}), updatedAt: new Date() };
-    if (to) set.status = to;
+    // `to` may depend on the record (a confirmed line goes back where it came from)
+    const target = typeof to === "function" ? to(rec, req.body || {}) : to;
+    if (target) set.status = target;
     await col.updateOne({ _id }, { $set: set, $push: { history: hist(action, by, (built && built.detail) || null) } });
-    return res.json({ success: true, status: to || rec.status, ...((built && built.reply) || {}) });
+    return res.json({ success: true, status: target || rec.status, ...((built && built.reply) || {}) });
   } catch (error) {
     next(error);
   }
 }
 
-// A quote — the price the supplier can get it for. Does not move the line.
+// A quote — the price the supplier can get it for. Does not move the line,
+// unless asked to park it in To Confirm with the quote (a price iMobile has
+// to agree to first).
 router.post("/orders/:id/quote", SUPPLY, (req, res, next) =>
   transition(req, res, next, {
-    from: ["pending", "shortage", "ordered"],
-    to: null,
+    from: ["pending", "shortage", "ordered", "toConfirm"],
+    to: (rec, b) => (b.toConfirm && rec.status !== "toConfirm" ? "toConfirm" : null),
     action: "quoted",
     build: (rec, b) => {
       const price = num(b.unitPrice);
       if (price == null || price < 0) return { error: "Unit price must be 0 or more" };
-      return { set: { quotedPrice: round2(price) }, detail: { quotedPrice: round2(price) }, reply: { quotedPrice: round2(price) } };
+      const set = { quotedPrice: round2(price) };
+      const detail = { quotedPrice: round2(price) };
+      if (b.toConfirm && rec.status !== "toConfirm") {
+        const note = str(b.note);
+        set.confirmFrom = rec.status;
+        set.confirmNote = note;
+        detail.toConfirm = true;
+        if (note) detail.note = note;
+      }
+      return { set, detail, reply: { quotedPrice: round2(price) } };
+    },
+  }),
+);
+
+// 待确认: parked for a decision (a special order, a doubtful price…) before
+// it is placed or shipped. The note says what needs confirming. Either side
+// can park a line; either side can confirm it.
+router.post("/orders/:id/to-confirm", CREATE_OR_SUPPLY, (req, res, next) =>
+  transition(req, res, next, {
+    from: ["pending", "ordered", "shortage"],
+    to: "toConfirm",
+    action: "toConfirm",
+    build: (rec, b) => {
+      const note = str(b.note);
+      if (!note) return { error: "Say what needs confirming" };
+      // parked again: an earlier Confirmed mark no longer applies
+      return { set: { confirmFrom: rec.status, confirmNote: note, confirmed: null }, detail: { from: rec.status, note } };
+    },
+  }),
+);
+
+// Confirmed: back to Pending (the user's rule — it is placed afresh), and the
+// line carries a "Confirmed" mark from then on: what was asked, what was
+// answered, when and by whom.
+router.post("/orders/:id/confirm", CREATE_OR_SUPPLY, (req, res, next) =>
+  transition(req, res, next, {
+    from: ["toConfirm"],
+    to: "pending",
+    action: "confirmed",
+    build: (rec, b, by) => {
+      const note = str(b.note);
+      return {
+        set: {
+          confirmFrom: null,
+          confirmNote: "",
+          orderedAt: null,
+          orderedBy: null,
+          confirmed: { at: new Date(), by, question: rec.confirmNote || "", answer: note },
+        },
+        detail: { to: "pending", ...(rec.confirmNote ? { question: rec.confirmNote } : {}), ...(note ? { note } : {}) },
+      };
     },
   }),
 );
@@ -622,10 +676,10 @@ router.post("/orders/:id/shortage", SUPPLY, (req, res, next) =>
 
 router.post("/orders/:id/cancel", CREATE_OR_SUPPLY, (req, res, next) =>
   transition(req, res, next, {
-    from: ["pending", "shortage"],
+    from: ["pending", "shortage", "toConfirm"],
     to: "cancelled",
     action: "cancelled",
-    build: (rec, b) => ({ set: { cancelNote: str(b.note) }, detail: str(b.note) ? { note: str(b.note) } : null }),
+    build: (rec, b) => ({ set: { cancelNote: str(b.note), confirmFrom: null, confirmNote: "" }, detail: str(b.note) ? { note: str(b.note) } : null }),
   }),
 );
 
@@ -658,6 +712,7 @@ router.post("/byItemIds", VIEW, async (req, res, next) => {
             orderQty: { $sum: { $ifNull: ["$orderQty", 0] } },
             shippedQty: { $sum: { $ifNull: ["$shippedQty", 0] } },
             pending: qtyIf("pending", "$orderQty"),
+            toConfirm: qtyIf("toConfirm", "$orderQty"),
             ordered: qtyIf("ordered", "$orderQty"),
             shipped: qtyIf("shipped", "$shippedQty"),
             shortage: qtyIf("shortage", "$orderQty"),
@@ -675,6 +730,7 @@ router.post("/byItemIds", VIEW, async (req, res, next) => {
         orderQty: r.orderQty || 0,
         shippedQty: r.shippedQty || 0,
         pending: r.pending || 0,
+        toConfirm: r.toConfirm || 0,
         ordered: r.ordered || 0,
         shipped: r.shipped || 0,
         shortage: r.shortage || 0,

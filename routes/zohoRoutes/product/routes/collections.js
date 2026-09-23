@@ -405,6 +405,22 @@ router.post("/updateGroup", async function (req, res, next) {
       });
     }
 
+    // A folder that a drag dropped into a collections list goes back to the
+    // sub-categories, so the tree never treats a folder id as a collection id.
+    const isFolder = (x) => !!x && typeof x === "object" && (String(x._id || "").startsWith("cat-") || (Array.isArray(x.collections) && !x.type && !x.filter && !x.rules));
+    const normalise = (cat) => {
+      if (!cat || typeof cat !== "object") return cat;
+      const cols = Array.isArray(cat.collections) ? cat.collections : [];
+      const stray = cols.filter(isFolder);
+      if (stray.length) {
+        cat.collections = cols.filter((c) => !isFolder(c));
+        cat.children = [...stray, ...(Array.isArray(cat.children) ? cat.children : [])];
+      }
+      if (Array.isArray(cat.children)) cat.children = cat.children.map(normalise);
+      return cat;
+    };
+    data.forEach(normalise);
+
     // clear all existing records
     await collection.deleteMany({});
 
