@@ -42,7 +42,7 @@ const {
 const { mapWithLimit, fetchItemDetails, fetchItemWindowRows, OFFLINE_SALE_SCOPES } = require("../../utils/zohoStock");
 const { imageIdOf, imageUrlFromId } = require("../../utils/productImage");
 // The register: one row per item, numbers under `metrics`, answered flat.
-const { ITEMS, flatten, path: fieldPath, melbourneDate } = require("../../utils/stockItems");
+const { ITEMS, flatten, path: fieldPath, melbourneDate, SALE_SCOPES } = require("../../utils/stockItems");
 const { runStockItemsSync, getStockItemsSyncState } = require("../../utils/stockItemsSync");
 const { startFullRefresh, isFullRefreshRunning, onFullRefreshFinished } = require("../../utils/stockRefresh");
 // A collection is a filter over the register — evaluated here on every
@@ -454,11 +454,12 @@ const HIDDEN = "imb_stock_hidden";
 const LIST_PROJECTION = {
   _id: 0, itemId: 1, sku: 1, name: 1, location: 1, imageId: 1, reorderLevel: 1,
   classification: 1, subClassification: 1, quality: 1,
-  deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, showInStore: 1, metrics: 1,
+  deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, showInStore: 1, archived: 1, metrics: 1,
 };
-// Units sold in a window, and how many of those were online orders (the
-// rest: counter, workshop, Neto, dispatch).
-const salesWindow = (u) => ({ total: (u && u.total) || 0, online: (u && u.online) || 0 });
+// Units sold in a window, by reason: online = Zoho invoices; inflow / repair /
+// neto / dashboard = the Zoho adjustment reasons (counter, workshop, Neto,
+// Order Dispatch) — the stock table shows the split under the total.
+const salesWindow = (u) => Object.fromEntries(["total", ...SALE_SCOPES].map((k) => [k, (u && u[k]) || 0]));
 // A register row → the row the Stock Monitoring table renders.
 function shapeListRow(r, { hidden, seaIds, memberOf }) {
   const m = r.metrics || {};
@@ -474,6 +475,7 @@ function shapeListRow(r, { hidden, seaIds, memberOf }) {
     committed: m.committed || 0,
     reorderLevel: r.reorderLevel || 0,
     imageUrl: imageUrlFromId(r.imageId),
+    imageId: r.imageId || null,
     classification: r.classification || "",
     subClassification: r.subClassification || "",
     quality: r.quality || "",
@@ -482,6 +484,13 @@ function shapeListRow(r, { hidden, seaIds, memberOf }) {
     compatibleModels: r.compatibleModels || [],
     showInStore: !!r.showInStore,
     sales: { 7: salesWindow(m.units7), 14: salesWindow(m.units14), 30: salesWindow(m.units30), 90: salesWindow(m.units90) },
+    // The dashboard table's other columns: on order (open purchase lines as
+    // of the last sync — the page reads them live too), last sold, the
+    // sitting-still mark, and whether the item is in the Archive.
+    openPoQty: m.openPoQty || 0,
+    daysSinceSale: m.daysSinceSale == null ? null : m.daysSinceSale,
+    stale: !!m.stale,
+    archived: !!r.archived,
   };
   if (memberOf) row.memberOf = memberOf.get(r.itemId) || [];
   if (hidden && hidden.has(r.itemId)) row.hidden = true;
@@ -786,7 +795,10 @@ router.get("/browse-items", VIEW, async (req, res, next) => {
     const page = Math.max(1, parseInt(q.page, 10) || 1);
     const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(q.pageSize, 10) || 20));
     const wantAll = String(q.all || "") === "1";
-    const SORTS = { name: "name", sku: "sku", stock: "metrics.available", sales: `metrics.units${days}.total` };
+    const SORTS = {
+      name: "name", sku: "sku", location: "location", stock: "metrics.available", sales: `metrics.units${days}.total`,
+      onOrder: "metrics.openPoQty", lastSold: "metrics.daysSinceSale",
+    };
     const sortField = SORTS[String(q.sort)] || "name";
     const order = String(q.order) === "desc" ? -1 : 1;
     const sort = { [sortField]: order, itemId: 1 };

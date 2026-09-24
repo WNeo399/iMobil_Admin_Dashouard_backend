@@ -77,7 +77,6 @@ const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Batt
 const CHANNELS = ["海运", "Special Order", "New Product"];
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
-// The classification of an item as the register has it, "Other" when blank.
 // The register's say on a line's item: its classification as a module
 // category (blank / unknown → Other) and its image id.
 async function registerFacts(db, itemId) {
@@ -705,6 +704,9 @@ router.post("/byItemIds", VIEW, async (req, res, next) => {
     if (!ids.length) return res.json({ success: true, data: {} });
     const db = await connectToDatabase();
     const qtyIf = (status, field) => ({ $sum: { $cond: [{ $eq: ["$status", status] }, { $ifNull: [field, 0] }, 0] } });
+    // The same, for the 海运 (sea freight) lines only — 空运 (air) is the rest.
+    const isSea = { $eq: ["$category", "海运"] };
+    const seaIf = (status, field) => ({ $sum: { $cond: [{ $and: [{ $eq: ["$status", status] }, isSea] }, { $ifNull: [field, 0] }, 0] } });
     const rows = await db
       .collection(ORDERS)
       .aggregate([
@@ -719,16 +721,25 @@ router.post("/byItemIds", VIEW, async (req, res, next) => {
             ordered: qtyIf("ordered", "$orderQty"),
             shipped: qtyIf("shipped", "$shippedQty"),
             shortage: qtyIf("shortage", "$orderQty"),
+            seaPending: seaIf("pending", "$orderQty"),
+            seaToConfirm: seaIf("toConfirm", "$orderQty"),
+            seaOrdered: seaIf("ordered", "$orderQty"),
+            seaShipped: seaIf("shipped", "$shippedQty"),
+            seaShortage: seaIf("shortage", "$orderQty"),
             trackings: { $addToSet: "$tracking" },
             count: { $sum: 1 },
             // the pending lines themselves — the dashboard edits one inline
-            pendingLines: { $push: { $cond: [{ $eq: ["$status", "pending"] }, { id: { $toString: "$_id" }, orderQty: "$orderQty" }, null] } },
+            pendingLines: { $push: { $cond: [{ $eq: ["$status", "pending"] }, { id: { $toString: "$_id" }, orderQty: "$orderQty", sea: isSea }, null] } },
           },
         },
       ])
       .toArray();
     const data = {};
+    const STAGES = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
+    const cap = (k) => k[0].toUpperCase() + k.slice(1);
     for (const r of rows) {
+      const sea = Object.fromEntries(STAGES.map((k) => [k, r["sea" + cap(k)] || 0]));
+      const air = Object.fromEntries(STAGES.map((k) => [k, (r[k] || 0) - sea[k]]));
       data[r._id] = {
         orderQty: r.orderQty || 0,
         shippedQty: r.shippedQty || 0,
@@ -740,6 +751,9 @@ router.post("/byItemIds", VIEW, async (req, res, next) => {
         count: r.count || 0,
         trackings: (r.trackings || []).map((t) => str(t)).filter(Boolean),
         pendingLines: (r.pendingLines || []).filter(Boolean),
+        // by channel: 海运 (sea) and 空运 (air, every other category)
+        sea,
+        air,
       };
     }
     return res.json({ success: true, data });
