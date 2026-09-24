@@ -1516,9 +1516,18 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
 // Zoho refuses is retried item by item so one bad rate does not sink the
 // rest. Each accepted rate is mirrored into the register exactly like the
 // single-item route above.
+//
+// list "purchase" is the item's PURCHASE price (Zoho's purchase_rate on the
+// item itself, not a pricebook): written one item at a time with the item
+// update endpoint, after the pricebooks. The register mirror then recomputes
+// what hangs on the cost — the below-cost flag and the pricing formula's
+// rule, reference prices and off-formula flag — and sends them back with the
+// flags so the page redraws the row.
 //   body  { changes: [{ itemId, list, rate }] }   (max 500; last wins per item+list)
 //   reply { results: [{ itemId, list, rate, ok, message, flags, flagsSeq }] }
 const BULK_PRICE_CHUNK = 25;
+// The purchase price travels in the same queue as the four price lists.
+const PURCHASE_LIST = "purchase";
 router.put("/prices/bulk", requirePermission("zoho:stock:edit"), async (req, res) => {
   const raw = Array.isArray(req.body && req.body.changes) ? req.body.changes : [];
   if (!raw.length) return res.status(400).json({ success: false, message: "No changes" });
@@ -1530,7 +1539,7 @@ router.put("/prices/bulk", requirePermission("zoho:stock:edit"), async (req, res
     const itemId = String((c && c.itemId) || "").trim();
     const list = String((c && c.list) || "").toLowerCase();
     const rate = Number(c && c.rate);
-    if (!/^[0-9]{6,25}$/.test(itemId) || !PRICE_FIELDS[list] || !Number.isFinite(rate) || rate < 0 || rate > 1000000) {
+    if (!/^[0-9]{6,25}$/.test(itemId) || !(PRICE_FIELDS[list] || list === PURCHASE_LIST) || !Number.isFinite(rate) || rate < 0 || rate > 1000000) {
       return res.status(400).json({ success: false, message: `Bad change for item ${itemId || "?"} / ${list || "?"}` });
     }
     byKey.set(`${itemId}|${list}`, { itemId, list, rate: Math.round(rate * 100) / 100 });
@@ -1542,14 +1551,17 @@ router.put("/prices/bulk", requirePermission("zoho:stock:edit"), async (req, res
   // the single-item route.
   const mirror = async ({ itemId, list, rate }) =>
     withItemLock(itemId, async () => {
-      const field = PRICE_FIELDS[list];
+      const field = list === PURCHASE_LIST ? "purchasePrice" : PRICE_FIELDS[list];
       const row = await db.collection(ITEMS).findOne(
         { itemId },
         { projection: { pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1, name: 1, category: 1, classification: 1, quality: 1 } },
       );
       if (!row) return null;
       row[field] = rate;
-      const next = { ...priceHealthFlags(row), priceRuleBroken: evaluatePriceRule(row).broken };
+      const rule = evaluatePriceRule(row);
+      const next = { ...priceHealthFlags(row), priceRuleBroken: rule.broken };
+      // A new cost moves the formula itself: its rule and reference prices.
+      if (list === PURCHASE_LIST) Object.assign(next, { priceRule: rule.rule, priceExpected: rule.expected });
       await db.collection(ITEMS).updateOne({ itemId }, { $set: { [field]: rate, ...next } });
       return { flags: next, seq: ++mirrorSeq };
     });
@@ -1580,6 +1592,19 @@ router.put("/prices/bulk", requirePermission("zoho:stock:edit"), async (req, res
             results.push({ ...c, ok: false, message: (one && (one.message || (one.error && one.error.message))) || (resp && resp.message) || "Zoho rejected the price" });
           }
         }
+      }
+    }
+    // Purchase prices: the item's own purchase_rate, one item per call.
+    for (const c of changes.filter((x) => x.list === PURCHASE_LIST)) {
+      const resp = await handleZohoInventoryPutRequest(
+        `https://www.zohoapis.com/inventory/v1/items/${c.itemId}?organization_id=${ZOHO_ORG_ID}`,
+        { purchase_rate: c.rate },
+      );
+      if (resp && resp.code === 0) {
+        const m = await mirror(c);
+        results.push({ ...c, ok: true, flags: m ? m.flags : null, flagsSeq: m ? m.seq : null });
+      } else {
+        results.push({ ...c, ok: false, message: (resp && (resp.message || (resp.error && resp.error.message))) || "Zoho rejected the purchase price" });
       }
     }
   } catch (error) {
