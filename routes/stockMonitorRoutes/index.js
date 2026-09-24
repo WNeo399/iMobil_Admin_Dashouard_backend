@@ -485,11 +485,10 @@ function shapeListRow(r, { hidden, seaIds, memberOf }) {
     showInStore: !!r.showInStore,
     sales: { 7: salesWindow(m.units7), 14: salesWindow(m.units14), 30: salesWindow(m.units30), 90: salesWindow(m.units90) },
     // The dashboard table's other columns: on order (open purchase lines as
-    // of the last sync — the page reads them live too), last sold, the
-    // sitting-still mark, and whether the item is in the Archive.
+    // of the last sync — the page reads them live too), last sold, and
+    // whether the item is in the Archive.
     openPoQty: m.openPoQty || 0,
     daysSinceSale: m.daysSinceSale == null ? null : m.daysSinceSale,
-    stale: !!m.stale,
     archived: !!r.archived,
   };
   if (memberOf) row.memberOf = memberOf.get(r.itemId) || [];
