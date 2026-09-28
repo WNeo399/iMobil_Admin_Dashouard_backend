@@ -31,7 +31,8 @@ var express = require("express");
 var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
-const { requirePermission } = require("../../middleware/auth");
+const { requirePermission, requireAnyPermission } = require("../../middleware/auth");
+const { hasPermission } = require("../../constants/roles");
 const {
   getViewData,
   handleZohoInventoryRequest,
@@ -188,6 +189,128 @@ function buildMatch(req) {
 
   return { match, filter };
 }
+
+// ── GET /stock-monitor/images/summary · /images/items ───────────────
+// The Missing Images page (Spare Parts Purchase → Missing Images, since
+// 2026-09-28). It is open to iMobile staff (zoho:stock:view) AND to the
+// parts supplier (spp:image:view), so these answer only what the page shows:
+// spare parts without an image, with name / SKU / category / shelf / stock /
+// units sold / last sale — no prices, costs, vendors or sales breakdown.
+// Staff also get the vendor filter and the archived no-image bucket.
+const IMAGES_VIEW = requireAnyPermission("zoho:stock:view", "spp:image:view");
+const IMAGE_FILTERS = ["noImage", "noImageInStock", "noImageOutOfStock"];
+const IMAGE_SORTS = new Set(["name", "sku", "location", "available", "units90", "daysSinceSale"]);
+const isStockViewer = (req) => hasPermission((req.user && req.user.permissions) || [], "zoho:stock:view");
+// The request's filters, trimmed to what the caller may use, in the shape
+// baseFilterMatch / buildMatch read.
+function imagesQuery(req) {
+  const q = req.query || {};
+  const staff = isStockViewer(req);
+  const filters = staff ? [...IMAGE_FILTERS, "noImageArchived"] : IMAGE_FILTERS;
+  return {
+    staff,
+    req: {
+      query: {
+        scope: "parts",
+        search: q.search, category: q.category, collection: q.collection,
+        ...(staff ? { vendor: q.vendor } : {}),
+        filter: filters.includes(q.filter) ? q.filter : "noImage",
+      },
+    },
+  };
+}
+
+router.get("/images/summary", IMAGES_VIEW, async (req, res, next) => {
+  try {
+    const db = await connectToDatabase();
+    const refresh = await latestRefresh(db);
+    if (!refresh) return res.json({ success: true, snapshotDate: null, run: null, counts: null, options: null });
+    const { staff, req: q } = imagesQuery(req);
+    const base = { active: true, scope: "parts" };
+    const noImage = { imageId: { $type: "null" } };
+    const filtered = { ...base, archived: { $ne: true }, ...baseFilterMatch(q), ...noImage };
+    const [tiles] = await db.collection(ITEMS).aggregate([
+      { $match: filtered },
+      {
+        $group: {
+          _id: null,
+          noImage: { $sum: 1 },
+          noImageInStock: { $sum: { $cond: [{ $gt: ["$metrics.available", 0] }, 1, 0] } },
+          noImageOutOfStock: { $sum: { $cond: [{ $lte: ["$metrics.available", 0] }, 1, 0] } },
+        },
+      },
+    ]).toArray();
+    const counts = {
+      noImage: (tiles && tiles.noImage) || 0,
+      noImageInStock: (tiles && tiles.noImageInStock) || 0,
+      noImageOutOfStock: (tiles && tiles.noImageOutOfStock) || 0,
+    };
+    if (staff) counts.noImageArchived = await db.collection(ITEMS).countDocuments({ ...base, ...baseFilterMatch(q), archived: true, ...noImage });
+    // Filter choices from the items that are missing an image.
+    const optionsOf = async (field, unwind) => {
+      const stages = [{ $match: { ...base, archived: { $ne: true }, ...noImage } }];
+      if (unwind) stages.push({ $unwind: `$${field}` });
+      stages.push({ $match: { [field]: { $nin: [null, ""] } } }, { $group: { _id: `$${field}`, n: { $sum: 1 } } }, { $sort: { _id: 1 } });
+      return (await db.collection(ITEMS).aggregate(stages).toArray()).map((r) => ({ value: r._id, count: r.n }));
+    };
+    const [categories, collections, vendors] = await Promise.all([
+      optionsOf("category"),
+      optionsOf("collections", true),
+      staff ? optionsOf("preferVendor") : Promise.resolve([]),
+    ]);
+    const run = await db.collection(RUNS).findOne({}, { sort: { startedAt: -1 } });
+    return res.json({
+      success: true,
+      snapshotDate: refresh.snapshotDate,
+      run: run ? { ok: run.ok !== false, error: run.error || null } : null,
+      counts,
+      options: { categories, collections, vendors },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/images/items", IMAGES_VIEW, async (req, res, next) => {
+  try {
+    const db = await connectToDatabase();
+    const refresh = await latestRefresh(db);
+    if (!refresh) return res.json({ success: true, snapshotDate: null, rows: [], total: 0 });
+    const { req: q } = imagesQuery(req);
+    const { match } = buildMatch(q);
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
+    const sortField = IMAGE_SORTS.has(String(req.query.sort)) ? String(req.query.sort) : "available";
+    const order = String(req.query.order) === "asc" ? 1 : -1;
+    const [stored, total] = await Promise.all([
+      db.collection(ITEMS)
+        .find(match, {
+          projection: {
+            _id: 0, itemId: 1, sku: 1, name: 1, category: 1, location: 1, imageId: 1, archived: 1,
+            "metrics.available": 1, "metrics.units90.total": 1, "metrics.daysSinceSale": 1,
+          },
+        })
+        .sort({ [fieldPath(sortField)]: order, _id: 1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray(),
+      db.collection(ITEMS).countDocuments(match),
+    ]);
+    const rows = stored.map((r) => {
+      const m = r.metrics || {};
+      return {
+        itemId: r.itemId, sku: r.sku, name: r.name, category: r.category || "", location: r.location || "",
+        imageUrl: imageUrlFromId(r.imageId), archived: !!r.archived,
+        available: m.available || 0,
+        units90: { total: (m.units90 && m.units90.total) || 0 },
+        daysSinceSale: m.daysSinceSale == null ? null : m.daysSinceSale,
+      };
+    });
+    return res.json({ success: true, snapshotDate: refresh.snapshotDate, rows, total });
+  } catch (error) {
+    next(error);
+  }
+});
 
 // ── POST /stock-monitor/snapshot/run ────────────────────────────────
 // The full register refresh on demand (the dashboard's "Update Now"
@@ -1178,7 +1301,8 @@ function uploadErrorMessage(err) {
 
 router.post(
   "/item/:itemId/images",
-  EDIT,
+  // stock editors, or whoever may upload images (the parts supplier)
+  requireAnyPermission("zoho:stock:edit", "spp:image:upload"),
   (req, res, next) =>
     imageUpload(req, res, (err) =>
       err ? res.status(400).json({ success: false, message: uploadErrorMessage(err) }) : next(),
@@ -1243,7 +1367,8 @@ router.post(
 // `accountingStock` the invoice-driven one the Accessories page shows
 // beside it.
 const MAX_LIVE_IDS = 200;
-router.get("/live", VIEW, async (req, res) => {
+// (Also read by the Missing Images page, which the parts supplier has.)
+router.get("/live", requireAnyPermission("zoho:stock:view", "spp:image:view"), async (req, res) => {
   const ids = [
     ...new Set(
       String(req.query.ids || "")

@@ -140,13 +140,17 @@ const ROLE_PERMISSIONS = {
   [ROLES.IMOBILE_PURCHASE]: ["po:*:*", "spp:*:*"],
   // Parts Supplier — Spare Parts Purchase: sees every order, quotes / places
   // / flags shortages, ships batches. Creating orders and receiving batches
-  // stay with iMobile (spp:order:create / spp:order:receive).
+  // stay with iMobile (spp:order:create / spp:order:receive). Since
+  // 2026-09-28 also Missing Images: the parts with no image, and uploading
+  // images for them (not archiving — that is a stock-edit action).
   [ROLES.PARTS_SUPPLIER]: [
     "spp:order:view",
     "spp:order:supply",
     "spp:batch:view",
     "spp:batch:create",
     "spp:batch:manage",
+    "spp:image:view",
+    "spp:image:upload",
   ],
 };
 
