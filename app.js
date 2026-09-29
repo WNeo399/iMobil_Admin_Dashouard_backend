@@ -57,6 +57,8 @@ var exengineRouter = require('./routes/exengineRoutes/index');
 var consignmentRouter = require('./routes/consignmentRoutes/index');
 var blackbeltRouter = require('./routes/blackbeltRoutes/index');
 var explodedRouter = require('./routes/explodedRoutes/index');
+// iMobile Website — storefront content (banners for the carousel widget).
+var websiteRouter = require('./routes/websiteRoutes/index');
 var posRouter = require('./routes/posRoutes/index');
 // Public daily-cron trigger for the Purchase Order UPDATE sync (Tencent → DB).
 var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
@@ -185,6 +187,7 @@ app.use('/exengine', authenticate, exengineRouter);
 app.use('/consignment', authenticate, consignmentRouter);
 app.use('/blackbelt', authenticate, blackbeltRouter);
 app.use('/exploded', authenticate, explodedRouter);
+app.use('/website', authenticate, websiteRouter);
 app.use('/pos', authenticate, posRouter);
 
 // catch 404 and forward to error handler

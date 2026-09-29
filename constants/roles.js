@@ -101,6 +101,8 @@ const ROLE_PERMISSIONS = {
   [ROLES.IMOBILE_ADMIN]: [
     "zoho:*:*", "repair:*:*", "svp:*:*", "po:*:*", "refurb:*:*", "spp:*:*",
     "inflow:order:view", "inflow:customer:view",
+    // iMobile Website (banners for the storefront carousel)
+    "web:*:*",
   ],
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.

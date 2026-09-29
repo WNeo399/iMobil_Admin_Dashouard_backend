@@ -8,8 +8,13 @@ public/widgets/
     └── v1.js          ← built IIFE bundle, served at /widget-assets/special-order/v1.js
 ```
 
-These files are produced by the `iMobile_Widget` repo, NOT edited by hand
-in this repo. The flow:
+Exceptions — hand-written vanilla JS, no build step, edited right here:
+`exploded-diagram/v1.js` and `banner-carousel/v1.js` (the iMobile website
+banner carousel; banners are managed on the dashboard's iMobile Website →
+Banner page). Each has a `demo/` page.
+
+The other bundles are produced by the `iMobile_Widget` repo, NOT edited by
+hand in this repo. The flow:
 
 ```sh
 # from the iMobile_Widget repo:

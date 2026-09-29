@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Banner Carousel Widget — Embed Demo</title>
+    <!--
+      Mimics the website: one div + one script tag. Hand-written vanilla JS
+      (no build step) — edit public/widgets/banner-carousel/v1.js directly.
+
+        http://localhost:3000/widget-assets/banner-carousel/demo/index.html
+
+      ?bare=1 drops the page around the carousel — the dashboard's Banner
+      page shows it that way in its Preview (desktop / tablet / mobile
+      frames). Only ACTIVE banners appear, exactly as on the website.
+    -->
+    <style>
+      body { margin: 0; padding: 32px 20px; background: #f3f4f6; font: 14px/1.5 system-ui, sans-serif; color: #1f2937; }
+      .demo { max-width: 1280px; margin: 0 auto; }
+      .demo > h1 { margin: 0 0 4px; font-size: 22px; }
+      .demo > p { margin: 0 0 20px; color: #6b7280; }
+      body.bare { padding: 0; background: #fff; }
+      body.bare .demo { max-width: none; }
+      body.bare .demo > h1, body.bare .demo > p { display: none; }
+    </style>
+  </head>
+  <body>
+    <div class="demo">
+      <h1>Banner Carousel — Embed Demo</h1>
+      <p>The carousel below is loaded exactly as the website embeds it. Resize the window to see the tablet and mobile images.</p>
+      <div id="imobile-banner-carousel" data-no-cache="true"></div>
+    </div>
+    <script>
+      if (/[?&]bare=1/.test(location.search)) document.body.className = 'bare';
+    </script>
+    <!-- Served by the backend itself, so the widget's default API base (the
+         server the script came from) is the right one here. -->
+    <script src="/widget-assets/banner-carousel/v1.js" defer></script>
+  </body>
+</html>
