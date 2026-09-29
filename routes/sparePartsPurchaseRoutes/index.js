@@ -7,6 +7,8 @@
 // Data
 //   imb_spp_orders     one record per item line, SP-10001+
 //   imb_spp_batches    one shipment to iMobile, PB-10001+, with copies of its lines
+//   imb_spp_order_batches  下单批次: lines placed with one supplier, OB-10001+;
+//                      a draft (no number, lines untouched) until confirmed
 //   imb_spp_counters   the two number sequences
 //
 // Line status
@@ -518,9 +520,26 @@ router.post("/orders/:id/place", SUPPLY, (req, res, next) =>
 );
 
 // ── Order batches (下单批次) ─────────────────────────────────────────
-// Pending / shortage lines placed with one supplier in one go. The batch
-// keeps the list that was sent to the supplier; when the quote comes back
-// the prices are keyed in here and written onto the lines.
+// Pending / shortage lines placed with one supplier in one go. A new batch
+// is a DRAFT (user ask 2026-09-29): no number yet and the lines are not
+// touched — they stay pending — so it can be changed (supplier, note, which
+// lines) or discarded. Confirming places the lines with the supplier
+// (status ordered) and issues the OB number. The confirmed batch keeps the
+// list that was sent to the supplier; when the quote comes back the prices
+// are keyed in here and written onto the lines.
+//
+//   POST   /order-batches              save a new draft
+//   PUT    /order-batches/:id          edit a draft
+//   POST   /order-batches/:id/confirm  confirm (optionally with the form's
+//                                      latest supplier / note / lines)
+//   DELETE /order-batches/:id          discard a draft
+//   PUT    /order-batches/:id/prices   the supplier's prices (confirmed only)
+//
+// Batches saved before drafts existed have no status: they count as confirmed.
+// A confirmed batch turned back into a draft (by hand, e.g. OB-10011 on
+// 2026-09-29) keeps its batchNo / seq, and confirming reuses them.
+const isDraft = (batch) => batch && batch.status === "draft";
+
 router.get("/order-batches", VIEW, async (req, res, next) => {
   try {
     const q = req.query || {};
@@ -528,6 +547,8 @@ router.get("/order-batches", VIEW, async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 20));
     const match = {};
     if (q.supplier) match.supplier = str(q.supplier);
+    if (q.status === "draft") match.status = "draft";
+    else if (q.status === "confirmed") match.status = { $ne: "draft" };
     const search = str(q.search);
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
@@ -535,8 +556,16 @@ router.get("/order-batches", VIEW, async (req, res, next) => {
     }
     const db = await connectToDatabase();
     const col = db.collection(ORDER_BATCHES);
+    // drafts (work in progress) on top, then the newest number first
     const [rows, total] = await Promise.all([
-      col.find(match).sort({ seq: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      col.aggregate([
+        { $match: match },
+        { $addFields: { _draft: { $cond: [{ $eq: ["$status", "draft"] }, 1, 0] } } },
+        { $sort: { _draft: -1, seq: -1, createdAt: -1 } },
+        { $skip: (page - 1) * pageSize },
+        { $limit: pageSize },
+        { $project: { _draft: 0 } },
+      ]).toArray(),
       col.countDocuments(match),
     ]);
     return res.json({ success: true, page, pageSize, total, rows });
@@ -565,69 +594,209 @@ router.get("/order-batches/:id", VIEW, async (req, res, next) => {
   }
 });
 
-// Place the selected lines with a supplier as one batch.
+// A line as the batch keeps it (the list sent to the supplier).
+const orderBatchLine = (r) => ({
+  orderId: r._id,
+  orderNo: r.orderNo,
+  itemId: r.itemId || null,
+  sku: r.sku || "",
+  productName: r.productName || "",
+  category: r.category || "",
+  orderQty: r.orderQty,
+  note: r.note || "",
+  unitPrice: null,
+});
+const placeable = (r) => r && (r.status === "pending" || r.status === "shortage");
+const qtyOf = (lines) => lines.reduce((t, l) => t + (l.orderQty || 0), 0);
+
+// The draft's lines from the picked ids: still pending / shortage and not
+// already in another draft. Returns { lines, skipped } or { error }.
+async function draftLines(db, rawIds, selfId) {
+  const ids = (Array.isArray(rawIds) ? rawIds : []).map(oid).filter(Boolean);
+  if (!ids.length) return { error: "No lines selected" };
+  if (ids.length > 300) return { error: "Too many lines (max 300)" };
+  const recs = await db.collection(ORDERS).find({ _id: { $in: ids } }, { projection: { history: 0 } }).toArray();
+  const ok = recs.filter(placeable);
+  if (!ok.length) return { error: "None of the selected lines is still pending" };
+  const others = await db.collection(ORDER_BATCHES).find(
+    { status: "draft", ...(selfId ? { _id: { $ne: selfId } } : {}), "lines.orderId": { $in: ok.map((r) => r._id) } },
+    { projection: { "lines.orderId": 1, createdBy: 1 } },
+  ).toArray();
+  const taken = new Set(others.flatMap((d) => d.lines.map((l) => String(l.orderId))));
+  const clash = ok.filter((r) => taken.has(String(r._id)));
+  if (clash.length) {
+    return { error: `Already in another draft: ${clash.slice(0, 5).map((r) => r.orderNo).join(", ")}${clash.length > 5 ? " …" : ""}` };
+  }
+  // in the order they were picked
+  const byId = new Map(ok.map((r) => [String(r._id), r]));
+  const lines = ids.map((id) => byId.get(String(id))).filter(Boolean).map(orderBatchLine);
+  const skipped = recs.filter((r) => !placeable(r)).map((r) => ({ orderNo: r.orderNo, sku: r.sku, status: r.status }));
+  return { lines, skipped };
+}
+
+// Save a new draft: the picked lines and (optionally) the supplier.
 router.post("/order-batches", SUPPLY, async (req, res, next) => {
   try {
     const b = req.body || {};
-    const ids = (Array.isArray(b.orderIds) ? b.orderIds : []).map(oid).filter(Boolean);
-    if (!ids.length) return bad(res, "No lines selected");
-    if (ids.length > 300) return bad(res, "Too many lines (max 300)");
-    const supplier = str(b.supplier);
-    if (!supplier) return bad(res, "Supplier is required");
     const db = await connectToDatabase();
-    const col = db.collection(ORDERS);
-    const recs = await col.find({ _id: { $in: ids } }, { projection: { history: 0 } }).toArray();
-    const placeable = recs.filter((r) => r.status === "pending" || r.status === "shortage");
-    if (!placeable.length) return bad(res, "None of the selected lines is still pending");
-    const skipped = recs.filter((r) => !placeable.includes(r)).map((r) => ({ orderNo: r.orderNo, sku: r.sku, status: r.status }));
-
-    const by = actor(req);
+    const d = await draftLines(db, b.orderIds, null);
+    if (d.error) return bad(res, d.error);
     const now = new Date();
-    const { seq, no: batchNo } = await nextNo(db, "orderBatch", "OB", 10001, ORDER_BATCHES);
-    const batchId = new ObjectId();
-    for (const rec of placeable) {
-      await col.updateOne(
-        { _id: rec._id },
-        {
-          $set: { supplier, orderedAt: now, orderedBy: by, shortageNote: "", status: "ordered", orderBatchId: batchId, orderBatchNo: batchNo, updatedAt: now },
-          $push: { history: hist("ordered", by, { supplier, orderBatch: batchNo }) },
-        },
-      );
-    }
-    const lines = placeable.map((r) => ({
-      orderId: r._id,
-      orderNo: r.orderNo,
-      itemId: r.itemId || null,
-      sku: r.sku || "",
-      productName: r.productName || "",
-      category: r.category || "",
-      orderQty: r.orderQty,
-      note: r.note || "",
-      unitPrice: null,
-    }));
     const batch = {
-      _id: batchId,
-      batchNo,
-      seq,
-      supplier,
+      _id: new ObjectId(),
+      batchNo: "",
+      seq: null,
+      status: "draft",
+      supplier: str(b.supplier),
       note: str(b.note),
-      lines,
-      lineCount: lines.length,
-      totalQty: lines.reduce((t, l) => t + (l.orderQty || 0), 0),
+      lines: d.lines,
+      lineCount: d.lines.length,
+      totalQty: qtyOf(d.lines),
       pricedCount: 0,
       createdAt: now,
-      createdBy: by,
+      createdBy: actor(req),
       updatedAt: now,
     };
     await db.collection(ORDER_BATCHES).insertOne(batch);
-    return res.json({ success: true, batch, skipped });
+    return res.json({ success: true, batch, skipped: d.skipped });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Supplier / note / lines of a draft, from the edit form.
+async function applyDraftEdit(db, req, draft, b) {
+  const set = { updatedAt: new Date(), updatedBy: actor(req) };
+  let skipped = [];
+  if (b.supplier !== undefined) set.supplier = str(b.supplier);
+  if (b.note !== undefined) set.note = str(b.note);
+  if (b.orderIds !== undefined) {
+    const d = await draftLines(db, b.orderIds, draft._id);
+    if (d.error) return { error: d.error };
+    set.lines = d.lines;
+    set.lineCount = d.lines.length;
+    set.totalQty = qtyOf(d.lines);
+    skipped = d.skipped;
+  }
+  await db.collection(ORDER_BATCHES).updateOne({ _id: draft._id, status: "draft" }, { $set: set });
+  return { batch: { ...draft, ...set }, skipped };
+}
+
+async function loadDraft(res, id) {
+  const _id = oid(id);
+  if (!_id) { bad(res, "invalid id"); return null; }
+  const db = await connectToDatabase();
+  const batch = await db.collection(ORDER_BATCHES).findOne({ _id });
+  if (!batch) { res.status(404).json({ success: false, message: "Order batch not found" }); return null; }
+  if (!isDraft(batch)) { bad(res, "This order batch is already confirmed"); return null; }
+  return { db, batch };
+}
+
+router.put("/order-batches/:id", SUPPLY, async (req, res, next) => {
+  try {
+    const ctx = await loadDraft(res, req.params.id);
+    if (!ctx) return;
+    const out = await applyDraftEdit(ctx.db, req, ctx.batch, req.body || {});
+    if (out.error) return bad(res, out.error);
+    return res.json({ success: true, batch: out.batch, skipped: out.skipped });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Confirm: the lines still pending / shortage are placed with the supplier
+// (status ordered) and the batch gets its OB number; lines that moved on
+// meanwhile (cancelled, placed on their own…) are left out and reported.
+router.post("/order-batches/:id/confirm", SUPPLY, async (req, res, next) => {
+  try {
+    const ctx = await loadDraft(res, req.params.id);
+    if (!ctx) return;
+    const { db } = ctx;
+    let draft = ctx.batch;
+    const b = req.body || {};
+    if (b.supplier !== undefined || b.note !== undefined || b.orderIds !== undefined) {
+      const out = await applyDraftEdit(db, req, draft, b);
+      if (out.error) return bad(res, out.error);
+      draft = out.batch;
+    }
+    if (!draft.supplier) return bad(res, "Supplier is required");
+
+    // claim the draft so a second click can't confirm it twice
+    const claim = await db.collection(ORDER_BATCHES).updateOne({ _id: draft._id, status: "draft" }, { $set: { status: "confirming" } });
+    if (!claim.modifiedCount) return bad(res, "This order batch is already confirmed");
+    try {
+      const col = db.collection(ORDERS);
+      const recs = await col.find({ _id: { $in: draft.lines.map((l) => l.orderId) } }, { projection: { history: 0 } }).toArray();
+      const byId = new Map(recs.map((r) => [String(r._id), r]));
+      const ready = draft.lines.map((l) => byId.get(String(l.orderId))).filter(placeable);
+      if (!ready.length) {
+        await db.collection(ORDER_BATCHES).updateOne({ _id: draft._id }, { $set: { status: "draft" } });
+        return bad(res, "None of the lines is still pending");
+      }
+      const by = actor(req);
+      const now = new Date();
+      // A batch turned back into a draft keeps its number (the supplier may
+      // know it by it); a new draft gets the next one.
+      const { seq, no: batchNo } = draft.seq && draft.batchNo
+        ? { seq: draft.seq, no: draft.batchNo }
+        : await nextNo(db, "orderBatch", "OB", 10001, ORDER_BATCHES);
+      const placed = [];
+      for (const rec of ready) {
+        const r = await col.updateOne(
+          { _id: rec._id, status: { $in: ["pending", "shortage"] } },
+          {
+            $set: { supplier: draft.supplier, orderedAt: now, orderedBy: by, shortageNote: "", status: "ordered", orderBatchId: draft._id, orderBatchNo: batchNo, updatedAt: now },
+            $push: { history: hist("ordered", by, { supplier: draft.supplier, orderBatch: batchNo }) },
+          },
+        );
+        if (r.modifiedCount) placed.push(rec);
+      }
+      const placedIds = new Set(placed.map((r) => String(r._id)));
+      const skipped = draft.lines
+        .filter((l) => !placedIds.has(String(l.orderId)))
+        .map((l) => ({ orderNo: l.orderNo, sku: l.sku, status: (byId.get(String(l.orderId)) || {}).status || "missing" }));
+      const lines = placed.map(orderBatchLine);
+      const set = {
+        status: "confirmed",
+        batchNo,
+        seq,
+        lines,
+        lineCount: lines.length,
+        totalQty: qtyOf(lines),
+        pricedCount: 0,
+        confirmedAt: now,
+        confirmedBy: by,
+        updatedAt: now,
+      };
+      await db.collection(ORDER_BATCHES).updateOne({ _id: draft._id }, { $set: set });
+      return res.json({ success: true, batch: { ...draft, ...set }, skipped });
+    } catch (e) {
+      // not placed: back to a draft
+      await db.collection(ORDER_BATCHES).updateOne({ _id: draft._id, status: "confirming" }, { $set: { status: "draft" } });
+      throw e;
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+// A draft can be discarded — nothing has been placed with the supplier.
+router.delete("/order-batches/:id", SUPPLY, async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    const db = await connectToDatabase();
+    const r = await db.collection(ORDER_BATCHES).deleteOne({ _id, status: "draft" });
+    if (!r.deletedCount) return bad(res, "Only a draft can be discarded");
+    return res.json({ success: true });
   } catch (error) {
     next(error);
   }
 });
 
 // The supplier's prices, back onto the lines. A line that has already
-// shipped keeps the price it shipped with (its Zoho PO carries it).
+// shipped keeps the price it shipped with (its Zoho PO carries it). Drafts
+// have not been sent to the supplier yet, so they take no prices.
 router.put("/order-batches/:id/prices", SUPPLY, async (req, res, next) => {
   try {
     const _id = oid(req.params.id);
@@ -636,6 +805,7 @@ router.put("/order-batches/:id/prices", SUPPLY, async (req, res, next) => {
     const db = await connectToDatabase();
     const batch = await db.collection(ORDER_BATCHES).findOne({ _id });
     if (!batch) return res.status(404).json({ success: false, message: "Order batch not found" });
+    if (batch.status === "draft" || batch.status === "confirming") return bad(res, "Confirm the order batch before entering prices");
     const wanted = new Map();
     for (const g of given) {
       if (!hasVal(g.unitPrice)) continue;
