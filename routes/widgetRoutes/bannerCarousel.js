@@ -1,13 +1,16 @@
 // Public read endpoint for the Banner Carousel widget (iMobile website).
 //
-//   GET /widget/bannerCarousel/banners   the active banners, in order
+//   GET /widget/bannerCarousel/banners   the active banners, in order, and
+//                                         the display settings (max height /
+//                                         max width, set on the Banner page)
 //
-// Same soft enforcement as the exploded-diagram reads: the per-widget CORS
-// allowlist (widget name "banner-carousel", managed on the Widget Setting
-// page) decides which sites' browsers may load it, with no hard in-handler
-// 403 — the banners are public storefront content anyway. Its own gentle
-// rate limit; mounted before the shared 10/hour submission limiter in
-// widgetRoutes/index.js. Banners are managed in routes/websiteRoutes.
+// The per-widget CORS allowlist (widget name "banner-carousel", managed on
+// the Widget Setting page) decides which sites' browsers may load it: other
+// origins get a 403; requests without an Origin (curl, the backend's own
+// demo page) pass — the banners are public storefront content anyway. Its
+// own gentle rate limit; mounted before the shared 10/hour submission
+// limiter in widgetRoutes/index.js. Banners are managed in
+// routes/websiteRoutes.
 
 var express = require("express");
 var cors = require("cors");
@@ -15,6 +18,7 @@ var rateLimit = require("express-rate-limit");
 var router = express.Router();
 const { connectToDatabase } = require("../../utils/mongodb");
 const { getAllowedOrigins } = require("../../utils/widgetOrigins");
+const { getCarouselSettings } = require("../../utils/webBannerSettings");
 
 const WIDGET_NAME = "banner-carousel";
 const BANNERS = "imb_web_banners";
@@ -84,7 +88,7 @@ router.get("/banners", widgetCors, async (req, res) => {
 
     // A banner change shows on the site within a minute.
     res.set("Cache-Control", "public, max-age=60");
-    return res.json({ success: true, banners });
+    return res.json({ success: true, banners, settings: await getCarouselSettings(db) });
   } catch (e) {
     console.error("Banner widget error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the banners" });

@@ -14,6 +14,8 @@
  *   data-desktop-min="1024"            container width where the desktop image starts
  *   data-label="Promotions"            accessible name of the carousel
  *   data-no-cache="true"               always fetch fresh (the dashboard preview)
+ *   data-max-height / data-max-width   px; override the Banner page's Display
+ *                                      settings for this one embed
  *
  * The banners are managed on the dashboard (iMobile Website → Banner): each
  * has a desktop, tablet and mobile image and an optional link. The image is
@@ -21,22 +23,27 @@
  * suits a narrower column; its height follows the first banner's image for
  * that device. Hand-written vanilla JS, no build step, rendered in a Shadow
  * DOM so host page CSS can't leak in. Data: GET /widget/bannerCarousel/banners
+ *
+ * Size limits (Display on the Banner page, sent with the banners): past the
+ * max height the carousel stops growing taller and the image is trimmed
+ * equally top and bottom (object-fit: cover); past the max width it stops
+ * growing wider and sits centred — the image is then picked for that width.
  */
 (function () {
   "use strict";
 
   var MOUNT_ID = "imobile-banner-carousel";
   var SLIDE_MS = 550;
-  var RATIO_KEY = "imobile-banner-ratio"; // last seen shape per device, to hold the space
+  var RATIO_KEY = "imobile-banner-ratio"; // last seen shape per device + limits, to hold the space
   var SCRIPT = document.currentScript;
 
   var CSS = [
     ":host{all:initial;display:block}",
     "*{box-sizing:border-box}",
-    ".root{position:relative;width:100%;overflow:hidden;border-radius:var(--radius,0);",
+    ".root{position:relative;width:100%;margin:0 auto;overflow:hidden;border-radius:var(--radius,0);",
     "  background:#f3f4f6;font-family:system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;",
     "  -webkit-tap-highlight-color:transparent}",
-    ".viewport{position:relative;width:100%;height:0;overflow:hidden;touch-action:pan-y}",
+    ".viewport{position:relative;width:100%;overflow:hidden;touch-action:pan-y}",
     ".track{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;will-change:transform}",
     ".track.anim{transition:transform " + SLIDE_MS + "ms cubic-bezier(.22,.61,.36,1)}",
     ".slide{position:relative;flex:0 0 100%;width:100%;height:100%;display:block;overflow:hidden;",
@@ -114,6 +121,8 @@
       desktopMin: num(mount.getAttribute("data-desktop-min"), 1024),
       label: mount.getAttribute("data-label") || "Promotions",
       noCache: mount.getAttribute("data-no-cache") === "true",
+      maxHeight: num(mount.getAttribute("data-max-height"), 0) || null,
+      maxWidth: num(mount.getAttribute("data-max-width"), 0) || null,
     };
 
     var shadow = mount.attachShadow ? mount.attachShadow({ mode: "open" }) : mount;
@@ -133,11 +142,30 @@
     var root, viewport, track, slides = [], dots = [], live;
     var settleTimer = null, playTimer = null;
     var paused = { hover: false, focus: false, hidden: document.hidden, drag: false, offscreen: false };
+    var ratio = 0; // height / width of the showing device's image
+    // Size limits: the embed's own attributes win, else the Banner page's
+    // settings (last seen ones until the banners arrive).
+    var saved0 = readRatios();
+    var lim = { maxHeight: opt.maxHeight || saved0.mh || null, maxWidth: opt.maxWidth || saved0.mw || null };
 
-    // 0 while the mount isn't laid out (or sits in a hidden tab) — the
-    // ResizeObserver brings the real width.
+    // The carousel's width (the mount's, capped by the max width); 0 while
+    // the mount isn't laid out or sits in a hidden tab — the ResizeObserver
+    // brings the real width.
     function widthNow() {
-      return mount.getBoundingClientRect().width || 0;
+      var w = mount.getBoundingClientRect().width || 0;
+      return lim.maxWidth ? Math.min(w, lim.maxWidth) : w;
+    }
+    // Height follows the image's shape up to the max height.
+    function heightFor(w, r) {
+      var h = w * r;
+      return Math.round(lim.maxHeight ? Math.min(h, lim.maxHeight) : h);
+    }
+    function applyWidth() {
+      if (root) root.style.maxWidth = lim.maxWidth ? lim.maxWidth + "px" : "";
+    }
+    function size() {
+      var w = widthNow();
+      if (w && ratio && viewport) viewport.style.height = heightFor(w, ratio) + "px";
     }
     function deviceFor(w) {
       return w >= opt.desktopMin ? "desktop" : w >= opt.tabletMin ? "tablet" : "mobile";
@@ -152,8 +180,9 @@
       if (!(r > 0 && r < 5)) return;
       root = el("div", "root");
       root.style.setProperty("--radius", opt.radius + "px");
+      applyWidth();
       viewport = el("div", "viewport");
-      viewport.style.paddingBottom = r * 100 + "%";
+      viewport.style.height = heightFor(w, r) + "px";
       root.appendChild(viewport);
       shadow.appendChild(root);
     }
@@ -173,6 +202,9 @@
         .then(function (d) {
           banners = (d && d.banners) || [];
           n = banners.length;
+          var st = (d && d.settings) || {};
+          lim.maxHeight = opt.maxHeight || st.maxHeight || null;
+          lim.maxWidth = opt.maxWidth || st.maxWidth || null;
           if (!n) {
             clear();
             saveRatios({});
@@ -216,6 +248,7 @@
       clear();
       root = el("div", "root", { role: "region", "aria-roledescription": "carousel", "aria-label": opt.label });
       root.style.setProperty("--radius", opt.radius + "px");
+      applyWidth();
       viewport = el("div", "viewport");
       track = el("div", "track");
       live = el("div", "sr", { "aria-live": "polite", "aria-atomic": "true" });
@@ -281,10 +314,12 @@
       root.classList.toggle("mobile", d === "mobile");
 
       var first = banners[0].images[d] || {};
-      var ratio = first.width && first.height ? first.height / first.width : { desktop: 0.3125, tablet: 0.5, mobile: 1 }[d];
-      viewport.style.paddingBottom = ratio * 100 + "%";
+      ratio = first.width && first.height ? first.height / first.width : { desktop: 0.3125, tablet: 0.5, mobile: 1 }[d];
+      size();
       var saved = readRatios();
       saved[d] = ratio;
+      saved.mh = lim.maxHeight;
+      saved.mw = lim.maxWidth;
       saveRatios(saved);
 
       // The banner showing loads first; the rest follow once it is in.
@@ -491,7 +526,9 @@
       }).observe(mount);
     }
     var onResize = function () {
-      if (root && banners.length) applyDevice(false);
+      if (!root || !banners.length) return;
+      applyDevice(false);
+      size(); // the height follows every width change, not only device switches
     };
     if (window.ResizeObserver) new ResizeObserver(onResize).observe(mount);
     else window.addEventListener("resize", onResize);

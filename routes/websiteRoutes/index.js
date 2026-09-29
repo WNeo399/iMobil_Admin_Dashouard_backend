@@ -13,6 +13,8 @@
 //   PUT    /website/banners/:id         update fields; any image may be
 //                                       replaced (multipart, same names)
 //   DELETE /website/banners/:id         delete (S3 objects best-effort)
+//   PUT    /website/banner-settings     the carousel's max height / width
+//                                       (utils/webBannerSettings)
 //
 // web:banner:view reads, web:banner:manage writes (admin + iMobile Admin).
 //
@@ -27,6 +29,7 @@ const { ObjectId } = require("mongodb");
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { getCarouselSettings, saveCarouselSettings } = require("../../utils/webBannerSettings");
 
 const VIEW = requirePermission("web:banner:view");
 const MANAGE = requirePermission("web:banner:manage");
@@ -162,7 +165,7 @@ router.get("/banners", VIEW, async (req, res) => {
   try {
     const db = await connectToDatabase();
     const rows = await db.collection(BANNERS).find({}).sort({ order: 1, createdAt: 1 }).limit(200).toArray();
-    return res.json({ success: true, rows });
+    return res.json({ success: true, rows, settings: await getCarouselSettings(db) });
   } catch (e) {
     console.error("Banner list error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the banners" });
@@ -294,6 +297,19 @@ router.put("/banners/:id", MANAGE, async (req, res) => {
     if (e.status === 400) return res.status(400).json({ success: false, message: e.message });
     console.error("Banner update error:", e);
     return res.status(500).json({ success: false, message: e.message || "Failed to update the banner" });
+  }
+});
+
+// ── PUT /website/banner-settings ────────────────────────────────────
+router.put("/banner-settings", MANAGE, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const settings = await saveCarouselSettings(db, req.body, who(req));
+    return res.json({ success: true, settings });
+  } catch (e) {
+    if (e.status === 400) return res.status(400).json({ success: false, message: e.message });
+    console.error("Banner settings error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the settings" });
   }
 });
 
