@@ -556,15 +556,19 @@ router.get("/order-batches", VIEW, async (req, res, next) => {
     }
     const db = await connectToDatabase();
     const col = db.collection(ORDER_BATCHES);
-    // drafts (work in progress) on top, then the newest number first
+    // drafts (work in progress) on top, newest first — a new draft has no
+    // number yet — then confirmed batches by number, newest first
     const [rows, total] = await Promise.all([
       col.aggregate([
         { $match: match },
-        { $addFields: { _draft: { $cond: [{ $eq: ["$status", "draft"] }, 1, 0] } } },
-        { $sort: { _draft: -1, seq: -1, createdAt: -1 } },
+        { $addFields: {
+          _draft: { $cond: [{ $eq: ["$status", "draft"] }, 1, 0] },
+          _key: { $cond: [{ $eq: ["$status", "draft"] }, "$createdAt", "$seq"] },
+        } },
+        { $sort: { _draft: -1, _key: -1, createdAt: -1 } },
         { $skip: (page - 1) * pageSize },
         { $limit: pageSize },
-        { $project: { _draft: 0 } },
+        { $project: { _draft: 0, _key: 0 } },
       ]).toArray(),
       col.countDocuments(match),
     ]);
