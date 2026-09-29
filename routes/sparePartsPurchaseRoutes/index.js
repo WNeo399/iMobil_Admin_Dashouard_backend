@@ -199,6 +199,8 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const base = {};
     if (q.category) base.category = str(q.category);
     if (q.supplier) base.supplier = str(q.supplier);
+    // one item's lines (the Stock Monitoring item drawer)
+    if (q.itemId) base.itemId = str(q.itemId);
     const search = str(q.search);
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
