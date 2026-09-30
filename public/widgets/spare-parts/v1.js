@@ -84,7 +84,7 @@
     ".pic img{width:100%;height:100%;object-fit:contain;display:block;background:#fff}",
     ".pic svg{width:42px;height:42px;color:#c4c9d1}",
     ".info{padding:10px 12px 12px;display:flex;flex-direction:column;gap:6px;flex:1}",
-    ".name{font-size:13px;font-weight:600;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}",
+    ".name{font-size:13px;font-weight:600;overflow-wrap:anywhere}",
     ".meta{margin-top:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px;color:var(--muted)}",
     ".tag{background:var(--soft);border-radius:4px;padding:1px 6px;color:var(--text)}",
     ".view{margin-left:auto;color:var(--accent);font-weight:600;white-space:nowrap}",
@@ -278,36 +278,13 @@
       body.innerHTML = html;
     }
 
-    // On a model's page the names all open with that model ("iPhone 13 Pro
-    // (6.1 Inch) Compatible …"), which hides what tells them apart — drop it
-    // there; the full name stays as the tooltip and the link text.
-    function shortName(name) {
-      var full = String(name || "").replace(/\s+/g, " ").trim();
-      if (view.kind !== "model") return full;
-      var rest = full;
-      var brand = view.brand.name + " ";
-      if (rest.toLowerCase().indexOf(brand.toLowerCase()) === 0) rest = rest.slice(brand.length);
-      var model = view.model.name.replace(/\s+/g, " ");
-      if (rest.toLowerCase().indexOf(model.toLowerCase()) !== 0) return full;
-      rest = rest.slice(model.length);
-      // only the usual "<model> (6.1 Inch) Compatible …" shape, or a model
-      // that ends in its code — "iPhone 13 Pro Max …" or "iPhone 13 Pro / 14
-      // Pro …" on the iPhone 13 Pro page keep their whole name
-      var usual = rest.match(/^\s*(\([^)]*(inch|")[^)]*\)\s*)?compatible\b\s*/i);
-      if (usual) rest = rest.slice(usual[0].length);
-      else if (/\)$/.test(model) && /^\s+[a-z]/i.test(rest)) rest = rest.replace(/^\s+/, "");
-      else return full;
-      return rest.length >= 6 ? rest : full;
-    }
-
     function card(p) {
       var pic = p.imageId
         ? '<img loading="lazy" alt="" src="' + IMG_BASE + encodeURIComponent(p.imageId) + '/400x400">'
         : ICON_BOX;
-      return '<a class="card" href="' + esc(link(p.id)) + '" title="' + esc(p.name) + '" aria-label="' + esc(p.name) + '"' +
-        (newTab ? ' target="_blank" rel="noopener"' : "") + ">" +
+      return '<a class="card" href="' + esc(link(p.id)) + '"' + (newTab ? ' target="_blank" rel="noopener"' : "") + ">" +
         '<div class="pic">' + pic + "</div>" +
-        '<div class="info"><div class="name">' + esc(shortName(p.name)) + "</div>" +
+        '<div class="info"><div class="name">' + esc(p.name) + "</div>" +
         '<div class="meta">' + (p.sku ? "<span>SKU " + esc(p.sku) + "</span>" : "") +
         (p.quality ? '<span class="tag">' + esc(p.quality) + "</span>" : "") +
         '<span class="view">View ›</span></div></div></a>';
