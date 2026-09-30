@@ -916,6 +916,25 @@ router.post("/orders/:id/reopen", CREATE_OR_SUPPLY, (req, res, next) =>
   }),
 );
 
+// Device Brand / Device Series of register items, for the part labels:
+// they print the product name without them (user ask 2026-09-30). Either
+// page's viewers print labels (Purchase Order, Order Batches, Batches).
+router.post("/device-terms", requireAny("spp:order:view", "spp:batch:view"), async (req, res, next) => {
+  try {
+    const ids = [...new Set((Array.isArray(req.body && req.body.itemIds) ? req.body.itemIds : []).map(String))]
+      .filter((v) => /^[0-9]{6,25}$/.test(v))
+      .slice(0, 1000);
+    if (!ids.length) return res.json({ success: true, terms: {} });
+    const db = await connectToDatabase();
+    const rows = await db.collection(ITEMS).find({ itemId: { $in: ids } }, { projection: { _id: 0, itemId: 1, deviceBrand: 1, deviceSeries: 1 } }).toArray();
+    const terms = {};
+    for (const r of rows) terms[r.itemId] = { brand: r.deviceBrand || "", series: r.deviceSeries || "" };
+    return res.json({ success: true, terms });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Open purchases per register item, by stage — the Stock Monitoring On
 // order column (pending / ordered / shipped quantities; shortage on the
 // side). orderQty / shippedQty / trackings keep the shape of the old
