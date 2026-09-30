@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spare Parts Widget — Embed Demo</title>
+    <!--
+      Mimics the website: one div + one script tag. Hand-written vanilla JS
+      (no build step) — edit public/widgets/spare-parts/v1.js directly.
+
+        http://localhost:3000/widget-assets/spare-parts/demo/index.html
+
+      ?bare=1 drops the page around the widget — the dashboard's Spare Parts
+      Widget page shows it that way in its Preview (desktop / tablet /
+      mobile frames). Query ?brand=Apple&model=iPhone%2013 opens on a model,
+      like the data-brand / data-model attributes.
+    -->
+    <style>
+      body { margin: 0; padding: 32px 20px; background: #f3f4f6; font: 14px/1.5 system-ui, sans-serif; color: #1f2937; }
+      .demo { max-width: 1200px; margin: 0 auto; }
+      .demo > h1 { margin: 0 0 4px; font-size: 22px; }
+      .demo > p { margin: 0 0 20px; color: #6b7280; }
+      .frame { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+      body.bare { padding: 16px; background: #fff; }
+      body.bare .demo { max-width: none; }
+      body.bare .demo > h1, body.bare .demo > p { display: none; }
+      body.bare .frame { padding: 0; box-shadow: none; }
+    </style>
+  </head>
+  <body>
+    <div class="demo">
+      <h1>Spare Parts — Embed Demo</h1>
+      <p>The widget below is loaded exactly as a website embeds it. Resize the window to see the phone layout.</p>
+      <div class="frame">
+        <div id="imobile-spare-parts"></div>
+      </div>
+    </div>
+    <script>
+      if (/[?&]bare=1/.test(location.search)) document.body.className = 'bare';
+      // ?brand= / ?series= / ?model= → the matching data attributes, for trying presets
+      var qs = new URLSearchParams(location.search);
+      var mount = document.getElementById('imobile-spare-parts');
+      ['brand', 'series', 'model', 'title', 'accent', 'new-tab'].forEach(function (k) {
+        if (qs.has(k)) mount.setAttribute('data-' + k, qs.get(k));
+      });
+    </script>
+    <!-- Served by the backend itself, so the widget's default API base (the
+         server the script came from) is the right one here. -->
+    <script src="/widget-assets/spare-parts/v1.js" defer></script>
+  </body>
+</html>

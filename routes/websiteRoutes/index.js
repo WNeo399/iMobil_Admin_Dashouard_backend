@@ -15,6 +15,8 @@
 //   DELETE /website/banners/:id         delete (S3 objects best-effort)
 //   PUT    /website/banner-settings     the carousel's max height / width
 //                                       (utils/webBannerSettings)
+//   GET    /website/spare-parts         what the Spare Parts widget shows
+//                                       (utils/sparePartsCatalog; web:parts:view)
 //
 // web:banner:view reads, web:banner:manage writes (admin + iMobile Admin).
 //
@@ -30,6 +32,7 @@ const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/cl
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { getCarouselSettings, saveCarouselSettings } = require("../../utils/webBannerSettings");
+const { getCatalog } = require("../../utils/sparePartsCatalog");
 
 const VIEW = requirePermission("web:banner:view");
 const MANAGE = requirePermission("web:banner:manage");
@@ -327,6 +330,28 @@ router.delete("/banners/:id", MANAGE, async (req, res) => {
   } catch (e) {
     console.error("Banner delete error:", e);
     return res.status(500).json({ success: false, message: "Failed to delete the banner" });
+  }
+});
+
+// ── GET /website/spare-parts ────────────────────────────────────────
+// The Spare Parts widget page: what the widget holds, by brand. The widget
+// itself reads the public feed (routes/widgetRoutes/spareParts.js).
+router.get("/spare-parts", requirePermission("web:parts:view"), async (req, res) => {
+  try {
+    const cat = await getCatalog();
+    return res.json({
+      success: true,
+      updatedAt: cat.at,
+      counts: cat.counts,
+      brands: cat.brands.map((b) => ({
+        name: b.name,
+        parts: b.parts,
+        series: b.series.map((s) => ({ name: s.name, parts: s.parts, models: s.models.length })),
+      })),
+    });
+  } catch (e) {
+    console.error("Spare parts summary error:", e);
+    return res.status(500).json({ success: false, message: "Could not read the spare parts" });
   }
 });
 
