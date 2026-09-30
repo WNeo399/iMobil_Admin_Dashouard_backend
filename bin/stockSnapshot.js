@@ -53,6 +53,7 @@ const {
   roundSaleUnits,
   splitRow,
   ensureIndexes,
+  stampArchivedAt,
 } = require("../utils/stockItems");
 const RUNS = "imb_stock_runs";
 const PRODUCTS = "imb_products";
@@ -525,6 +526,8 @@ async function main() {
     { active: true, lastSeenAt: { $lt: finishedAt } },
     { $set: { active: false, inactiveAt: finishedAt } },
   );
+  // When an item went into (or left) the Archive bucket.
+  await stampArchivedAt(db, finishedAt);
   run.counts.inserted = inserted;
   run.counts.inactivated = gone.modifiedCount || 0;
 

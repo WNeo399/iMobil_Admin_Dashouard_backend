@@ -44,6 +44,7 @@ const {
   num,
   stockFlags,
   emptySaleUnits,
+  stampArchivedAt,
 } = require("./stockItems");
 const { imageIdOf } = require("./productImage");
 const { isNoiseName, ARCHIVE_COLLECTION } = require("./stockUniverse");
@@ -261,6 +262,9 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
         inserted += r.upsertedCount || 0;
       }
     }
+
+    // When an item went into (or left) the Archive bucket.
+    await stampArchivedAt(db, startedAt);
 
     // On order for every item, not just the ones Zoho changed: purchase
     // lines move without Zoho knowing.

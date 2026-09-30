@@ -102,6 +102,8 @@ const SORTABLE = new Set([
   "sku", "name", "location", "available", "units7", "units14", "units30",
   "units90", "openPoQty", "daysOfCover", "daysSinceSale",
   "purchasePrice", "pricePlatinum", "priceVip", "priceSvip", "priceWholesale",
+  // the Archive list: newest archived first (null = time unknown, last)
+  "archivedAt",
 ]);
 
 function scopeOf(req) {
@@ -507,7 +509,7 @@ router.get("/items", VIEW, async (req, res, next) => {
           projection: {
             _id: 0, itemId: 1, sku: 1, name: 1, location: 1, scope: 1, classification: 1,
             preferVendor: 1, brand: 1, category: 1, quality: 1, collections: 1, inCatalogue: 1,
-            archived: 1, archivedReason: 1, purchasePrice: 1,
+            archived: 1, archivedReason: 1, archivedAt: 1, purchasePrice: 1,
             pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1,
             priceMissing: 1, pricePlaceholder: 1, priceBelowCost: 1, priceOrderBroken: 1,
             priceRule: 1, priceExpected: 1, priceRuleBroken: 1, imageId: 1,
@@ -1221,10 +1223,13 @@ router.post("/item/:itemId/archived", EDIT, async (req, res, next) => {
         { upsert: true },
       );
     }
-    // Flip the row so the change shows without waiting for the next refresh.
+    // Flip the row so the change shows without waiting for the next refresh
+    // (with the time it went into the Archive).
     await db.collection(ITEMS).updateOne(
       { itemId },
-      { $set: { archived: !restore, archivedReason: restore ? null : "manual" } },
+      restore
+        ? { $set: { archived: false, archivedReason: null }, $unset: { archivedAt: "" } }
+        : { $set: { archived: true, archivedReason: "manual", archivedAt: now } },
     );
     return res.json({ success: true, itemId, archived: !restore });
   } catch (error) {

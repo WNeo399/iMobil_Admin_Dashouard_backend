@@ -223,6 +223,20 @@ function melbourneDate(d = new Date()) {
   }).format(d);
 }
 
+// When an item went into the Archive bucket (`archivedAt`; user ask
+// 2026-09-30 — the Archive list shows the newest first). Every writer of
+// the `archived` flag (the hourly sync, the nightly snapshot) runs this
+// after its write: an item newly archived gets the time, one no longer
+// archived loses it. `archivedAt: null` = archived before this was
+// tracked, time unknown (those sort last). The manual Move to Archive
+// endpoint stamps its own time.
+async function stampArchivedAt(db, at = new Date()) {
+  const c = db.collection(ITEMS);
+  const a = await c.updateMany({ archived: true, archivedAt: { $exists: false } }, { $set: { archivedAt: at } });
+  const b = await c.updateMany({ archived: { $ne: true }, archivedAt: { $exists: true } }, { $unset: { archivedAt: "" } });
+  return { stamped: a.modifiedCount || 0, cleared: b.modifiedCount || 0 };
+}
+
 // Indexes the pages' queries lean on: every list filters on active + scope
 // and sorts on a metric or the SKU; the shelves view groups by location.
 async function ensureIndexes(db) {
@@ -260,4 +274,5 @@ module.exports = {
   ref,
   melbourneDate,
   ensureIndexes,
+  stampArchivedAt,
 };
