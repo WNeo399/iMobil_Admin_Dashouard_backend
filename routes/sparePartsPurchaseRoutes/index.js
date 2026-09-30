@@ -259,7 +259,9 @@ router.get("/orders/open-lines", BATCH_VIEW, async (req, res, next) => {
       .collection(ORDERS)
       .find(match, { projection: { history: 0 } })
       .sort({ createdAt: 1 })
-      .limit(300)
+      // the picker groups every waiting line by category client-side, so
+      // no small cap (300 used to hide the newest lines once 400+ waited)
+      .limit(search ? 300 : 3000)
       .toArray();
     rows.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
     return res.json({ success: true, rows });
