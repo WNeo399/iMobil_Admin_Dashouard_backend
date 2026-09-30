@@ -457,6 +457,50 @@ router.post("/orders/:id/quote", SUPPLY, (req, res, next) =>
   }),
 );
 
+// The unit price of a line already placed with the supplier, changed from
+// the Purchase Order page (user ask 2026-09-30). Ordered lines only: a
+// pending line gets a quote, and a shipped one keeps the price it shipped
+// with (its Zoho PO carries it). The order batch's copy follows.
+router.post("/orders/:id/price", SUPPLY, async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    const price = num(req.body && req.body.unitPrice);
+    if (price == null || price < 0) return bad(res, "Unit price must be 0 or more");
+    const unitPrice = round2(price);
+    const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
+    const rec = await col.findOne({ _id }, { projection: { status: 1, orderQty: 1, unitPrice: 1, orderNo: 1, orderBatchId: 1 } });
+    if (!rec) return res.status(404).json({ success: false, message: "Order not found" });
+    if (rec.status !== "ordered") return bad(res, `${rec.orderNo} is ${rec.status}; only an ordered line's price is changed here`);
+    const lineTotal = round2(rec.orderQty * unitPrice);
+    if (rec.unitPrice !== unitPrice) {
+      const now = new Date();
+      const r = await col.updateOne(
+        { _id, status: "ordered" },
+        {
+          $set: { unitPrice, lineTotal, updatedAt: now },
+          $push: { history: hist("priced", actor(req), { from: rec.unitPrice == null ? null : rec.unitPrice, unitPrice }) },
+        },
+      );
+      if (!r.modifiedCount) return bad(res, "The line has just changed — refresh and try again");
+      if (rec.orderBatchId) {
+        const batch = await db.collection(ORDER_BATCHES).findOne({ _id: rec.orderBatchId }, { projection: { lines: 1 } });
+        if (batch && Array.isArray(batch.lines)) {
+          const lines = batch.lines.map((l) => (String(l.orderId) === String(_id) ? { ...l, unitPrice } : l));
+          await db.collection(ORDER_BATCHES).updateOne(
+            { _id: batch._id },
+            { $set: { lines, pricedCount: lines.filter((l) => l.unitPrice != null).length, updatedAt: now } },
+          );
+        }
+      }
+    }
+    return res.json({ success: true, unitPrice, lineTotal });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // 待确认: parked for a decision (a special order, a doubtful price…) before
 // it is placed or shipped. The note says what needs confirming. Either side
 // can park a line; either side can confirm it.
