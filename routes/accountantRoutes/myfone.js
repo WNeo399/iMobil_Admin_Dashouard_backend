@@ -9,6 +9,7 @@
 //                                                 payments in a period
 //   GET    /accountant/myfone/sync                where the history sync is
 //   POST   /accountant/myfone/sync                re-read every shop's history
+//   GET    /accountant/myfone/shops/:contactId/unpaid    its unpaid invoices (cached list)
 //   GET    /accountant/myfone/shops/:contactId/statement[?refresh=1]
 //   GET    /accountant/myfone/contacts?q=         Zoho customer search (to add)
 //   POST   /accountant/myfone/shops {contactId}   add a shop
@@ -162,6 +163,45 @@ router.get("/shops", VIEW, async (req, res) => {
   } catch (e) {
     console.error("My Fone shops error:", e);
     return res.status(500).json({ success: false, message: "Could not load the My Fone shops" });
+  }
+});
+
+// ── a shop's unpaid invoices ────────────────────────────────────────
+// For the Accountant Dashboard's drawer: the shop's invoices still owing,
+// straight from the shared unpaid list (10-minute cache) — no extra Zoho
+// calls. Oldest due first, with days overdue.
+router.get("/shops/:contactId/unpaid", VIEW, async (req, res) => {
+  try {
+    const contactId = String(req.params.contactId);
+    const db = await connectToDatabase();
+    const shop = await db.collection(SHOPS).findOne({ contactId });
+    if (!shop) return res.status(404).json({ success: false, message: "That shop isn't on the My Fone list" });
+    const list = await getUnpaidInvoices({ refresh: req.query.refresh === "1" });
+    const today = todayYmd();
+    const day = (ymd) => Date.UTC(...String(ymd).split("-").map((n, i) => Number(n) - (i === 1 ? 1 : 0)));
+    const rows = list.rows
+      .filter((r) => r.customerId === contactId)
+      .map((r) => ({
+        invoiceId: r.invoiceId,
+        invoiceNumber: r.invoiceNumber,
+        orderNumber: r.orderNumber,
+        date: r.date,
+        dueDate: r.dueDate,
+        total: r.total,
+        balance: r.balance,
+        daysOverdue: r.dueDate && r.dueDate < today ? Math.round((day(today) - day(r.dueDate)) / 86400000) : 0,
+      }))
+      .sort((a, b) => String(a.dueDate || "9999").localeCompare(String(b.dueDate || "9999")) || String(a.date || "").localeCompare(String(b.date || "")));
+    return res.json({
+      success: true,
+      fetchedAt: list.at,
+      ...(list.stale ? { stale: true } : {}),
+      shop: { contactId, name: shop.name, email: shop.email || "", phone: shop.phone || "" },
+      rows,
+    });
+  } catch (e) {
+    console.error("My Fone unpaid invoices error:", e);
+    return res.status(502).json({ success: false, message: "Could not read the unpaid invoices from Zoho" });
   }
 });
 

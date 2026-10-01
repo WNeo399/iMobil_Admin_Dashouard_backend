@@ -14,12 +14,27 @@
 // Data:
 //   consignment_shops    { name, active, createdAt }
 //   consignment_devices  { shopId, batchId, model, imei, costPrice,
-//                          shopPrice (what invoices bill), retailPrice,
-//                          status,
+//                          shopPrice (what invoices bill), retailPrice
+//                          (what the shop sold it for / asks), status,
 //                          assignedAt/receivedAt/soldAt/returnAt/returnedAt,
 //                          invoiceId, statusHistory[] }
-//   consignment_invoices { number, shopId, shopName, periodStart, periodEnd,
-//                          deviceIds, deviceCount, total, createdAt, createdBy }
+//   consignment_invoices { number (CI-10001…), seq, shopId, shopName,
+//                          periodLabel (first – last sold), deviceIds,
+//                          deviceCount, lines[] (snapshot), subTotal,
+//                          gstRate, gstAmount, total, paymentStatus
+//                          (unpaid | paid | void), paidAt, paidBy,
+//                          inflowRecordedAt, inflowRecordedBy,
+//                          createdAt, createdBy, source }
+//   Shops used to run on one Google Sheet each, invoiced from AirTable
+//   (INV-A… numbers; total only, no GST split); those histories were
+//   imported (source "sheet-import" on devices, "airtable" on invoices).
+//   From 2026-10-01 the dashboard raises its own invoices (user ask): one
+//   per shop whenever it suits (Consignment → Invoices), for every sold
+//   device not yet on an invoice, Shop Price + 10% GST.
+//
+// A received device has CONSIGN_DAYS to sell before it's due back (the
+// sheets' "Expired On" = Date Received + 90 days).
+//
 //   Shop logins live in the normal `users` collection with
 //   role "consignment-shop" + consignShopId.
 //
@@ -30,7 +45,7 @@ var express = require("express");
 var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
-const { requirePermission } = require("../../middleware/auth");
+const { requirePermission, requireAnyPermission } = require("../../middleware/auth");
 const { hashPassword } = require("../../utils/authToken");
 const { ROLES } = require("../../constants/roles");
 
@@ -42,8 +57,18 @@ const MANAGE = requirePermission("consign:shop:manage");
 const ASSIGN = requirePermission("consign:device:assign");
 const DEVICE_VIEW = requirePermission("consign:device:view");
 const INSIGHT = requirePermission("consign:insight:view");
+// Invoicing the shops: admin on Consignment → Invoices, and the iMobile
+// Accountant (acct:*) from her Dashboard — sold-not-invoiced, raising
+// invoices, unpaid invoices (user ask 2026-10-01).
+const INVOICE = requireAnyPermission("consign:invoice:manage", "acct:consign:invoice");
+// What every invoice raised here carries (user: "GST is fixed to 10%"),
+// added on top of the shop prices — the sales-order convention.
+const GST_RATE = 0.1;
 
 const STATUSES = ["in-transit", "received", "sold", "returning", "returned"];
+const CONSIGN_DAYS = 90;
+const DAY_MS = 86400000;
+const overdueCutoff = () => new Date(Date.now() - CONSIGN_DAYS * DAY_MS);
 
 // Allowed transitions: action → { from, to, permission, timestampField }
 const TRANSITIONS = {
@@ -73,21 +98,9 @@ function actorOf(req) {
   return (req.user && (req.user.username || req.user.email)) || null;
 }
 
-// The Melbourne-local previous week (Mon 00:00 → next Mon 00:00) as real Date
-// instants. Uses the wall-clock shift trick — fine at weekly granularity.
-function previousMelbourneWeek(now = new Date()) {
-  const mel = new Date(now.toLocaleString("en-US", { timeZone: "Australia/Melbourne" }));
-  const offsetMs = now.getTime() - mel.getTime();
-  const day = (mel.getDay() + 6) % 7; // 0 = Monday
-  const thisMonday = new Date(mel.getFullYear(), mel.getMonth(), mel.getDate() - day);
-  const prevMonday = new Date(thisMonday.getTime() - 7 * 86400000);
-  const label = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  return {
-    start: new Date(prevMonday.getTime() + offsetMs),
-    end: new Date(thisMonday.getTime() + offsetMs), // exclusive
-    startLabel: label(prevMonday),
-    endLabel: label(new Date(thisMonday.getTime() - 86400000)), // inclusive Sunday
-  };
+// YYYY-MM-DD of an instant, Melbourne time.
+function melYmd(d) {
+  return new Date(d).toLocaleDateString("en-CA", { timeZone: "Australia/Melbourne" });
 }
 
 // Scope filter for the current user: consignment-shop logins only ever see
@@ -276,6 +289,8 @@ router.get("/devices", DEVICE_VIEW, async function (req, res) {
       if (sid) match.shopId = sid;
     }
     if (req.query.status && STATUSES.includes(req.query.status)) match.status = req.query.status;
+    // "overdue": received and past the consignment window, still unsold.
+    else if (req.query.status === "overdue") Object.assign(match, { status: "received", receivedAt: { $lt: overdueCutoff() } });
     if (req.query.batchId) match.batchId = String(req.query.batchId);
     const search = String(req.query.search || "").trim();
     if (search) {
@@ -295,9 +310,11 @@ router.get("/devices", DEVICE_VIEW, async function (req, res) {
     // the page can show tabs/KPIs.
     const countMatch = { ...match };
     delete countMatch.status;
+    delete countMatch.receivedAt;
     const counts = {};
     const agg = await col.aggregate([{ $match: countMatch }, { $group: { _id: "$status", n: { $sum: 1 } } }]).toArray();
     for (const r of agg) counts[r._id] = r.n;
+    counts.overdue = await col.countDocuments({ ...countMatch, status: "received", receivedAt: { $lt: overdueCutoff() } });
 
     // Attach shop names for the admin view.
     const shopIds = [...new Set(rows.map((r) => String(r.shopId)))].map((s) => oid(s)).filter(Boolean);
@@ -306,9 +323,24 @@ router.get("/devices", DEVICE_VIEW, async function (req, res) {
       : [];
     const shopName = {};
     for (const s of shops) shopName[String(s._id)] = s.name;
+    // The invoice a sold device was billed on: its number and whether it's
+    // paid (a shop login sees the same — it's their bill).
+    const invIds = [...new Set(rows.map((r) => r.invoiceId && String(r.invoiceId)).filter(Boolean))].map(oid).filter(Boolean);
+    const invs = invIds.length
+      ? await db.collection(INVOICES).find({ _id: { $in: invIds } }).project({ number: 1, paymentStatus: 1 }).toArray()
+      : [];
+    const invById = new Map(invs.map((i) => [String(i._id), i]));
     return res.json({
-      success: true, page, pageSize, total, counts,
-      rows: rows.map((r) => ({ ...r, shopName: shopName[String(r.shopId)] || "" })),
+      success: true, page, pageSize, total, counts, consignDays: CONSIGN_DAYS,
+      rows: rows.map((r) => {
+        const inv = r.invoiceId ? invById.get(String(r.invoiceId)) : null;
+        return {
+          ...r,
+          shopName: shopName[String(r.shopId)] || "",
+          invoiceNo: inv ? inv.number : null,
+          paymentStatus: inv ? inv.paymentStatus || "unpaid" : null,
+        };
+      }),
     });
   } catch (e) {
     console.error("consignment devices error:", e);
@@ -622,6 +654,20 @@ router.post("/devices/updateStatus", DEVICE_VIEW, async function (req, res) {
       $push: { statusHistory: { status: t.to, at: now, by } },
     });
 
+    // Selling can carry what each one went for: { prices: { id: amount } }
+    // (optional, per device — the shop's sale price, not what we bill).
+    if (action === "sell" && r.modifiedCount && req.body && req.body.prices && typeof req.body.prices === "object") {
+      for (const [id, v] of Object.entries(req.body.prices)) {
+        const _id = oid(id);
+        const price = Number(v);
+        if (!_id || v === "" || v == null || !Number.isFinite(price) || price < 0) continue;
+        await db.collection(DEVICES).updateOne(
+          { _id, status: "sold", ...(scope ? { shopId: scope } : {}) },
+          { $set: { retailPrice: Math.round(price * 100) / 100 } },
+        );
+      }
+    }
+
     // The register follows the two transitions that end a consignment:
     // sold stays sold, returned comes home. Guarded on the register
     // still saying On Consignment, so nothing else is clobbered.
@@ -663,6 +709,32 @@ router.post("/devices/updateStatus", DEVICE_VIEW, async function (req, res) {
   } catch (e) {
     console.error("consignment updateStatus error:", e);
     return res.status(500).json({ success: false, message: "Failed to update devices" });
+  }
+});
+
+// The shop's price for one device — what it sold for, or what they're
+// asking while it's on the shelf. { retailPrice: number | null }. The shop
+// sets its own; admin can correct any. Never touches what we bill.
+router.post("/devices/:id/retailPrice", DEVICE_VIEW, async function (req, res) {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ success: false, message: "invalid id" });
+    const raw = req.body && req.body.retailPrice;
+    const price = raw === "" || raw == null ? null : Number(raw);
+    if (price !== null && (!Number.isFinite(price) || price < 0)) {
+      return res.status(400).json({ success: false, message: "Enter a valid price." });
+    }
+    const db = await connectToDatabase();
+    const scope = shopScope(req);
+    const r = await db.collection(DEVICES).updateOne(
+      { _id, status: { $ne: "returned" }, ...(scope ? { shopId: scope } : {}) },
+      { $set: { retailPrice: price === null ? null : Math.round(price * 100) / 100, updatedAt: new Date() } },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "Device not found" });
+    return res.json({ success: true, retailPrice: price === null ? null : Math.round(price * 100) / 100 });
+  } catch (e) {
+    console.error("consignment retail price error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the price" });
   }
 });
 
@@ -723,55 +795,229 @@ router.get("/insights", INSIGHT, async function (req, res) {
   }
 });
 
-// ── Invoices (admin) ────────────────────────────────────────────────
+// ── Invoices (Consignment → Invoices) ──────────────────────────────
+// The dashboard raises its own invoices (user ask 2026-10-01 — before that
+// AirTable did, INV-A…; those were imported with their paid status). No
+// weekly cut-off: the page shows how many sold devices aren't on an
+// invoice yet and raises one per shop whenever it suits — it bills every
+// sold-and-uninvoiced device that shop has at that moment, at the Shop
+// Price plus GST (GST_RATE, added on top).
+//
+//   GET  /consignment/invoices/preview[?shopId]  what an invoice raised now would bill, per shop
+//   POST /consignment/invoices/generate { shopId }
+//   POST /consignment/invoices/generate-batch { shopIds? }   one per shop, in one go
+//   GET  /consignment/invoices[?shopId&paymentStatus]
+//   GET  /consignment/invoices/:id                with its lines
+//   POST /consignment/invoices/:id/payment { paid } mark paid / unpaid (only once in inFlow)
+//   POST /consignment/invoices/:id/inflow { recorded }  entered in inFlow (label)
+//   POST /consignment/invoices/:id/void            unpaid dashboard invoices only;
+//                                                  its devices go back to "to invoice"
 
-// Generate the weekly invoice for a shop: all sold-and-uninvoiced devices up
-// to the end of the previous Melbourne week (catches stragglers too).
-router.post("/invoices/generate", MANAGE, async function (req, res) {
+// What an invoice line shows — a snapshot, so a later edit to the device
+// can't change a bill that's already gone out.
+function invoiceLine(d) {
+  return {
+    deviceId: d._id,
+    imei: d.imei || d.stockId || "",
+    productName: d.productName || "",
+    grade: d.grade || "",
+    soldAt: d.soldAt || null,
+    shopPrice: Number(d.shopPrice) || 0,
+  };
+}
+
+const r2 = (n) => Math.round(n * 100) / 100;
+function invoiceTotals(lines) {
+  const subTotal = r2(lines.reduce((s, l) => s + (Number(l.shopPrice) || 0), 0));
+  const gstAmount = r2(subTotal * GST_RATE);
+  return { subTotal, gstRate: GST_RATE, gstAmount, total: r2(subTotal + gstAmount) };
+}
+// "first sold – last sold" of the lines, Melbourne dates
+function soldSpan(lines) {
+  const days = lines.map((l) => l.soldAt).filter(Boolean).map(melYmd).sort();
+  return days.length ? { from: days[0], to: days[days.length - 1] } : null;
+}
+
+router.get("/invoices/preview", INVOICE, async function (req, res) {
+  try {
+    const db = await connectToDatabase();
+    const match = { status: "sold", invoiceId: null };
+    const sid = req.query.shopId ? oid(req.query.shopId) : null;
+    if (sid) match.shopId = sid;
+    const devices = await db.collection(DEVICES).find(match).sort({ soldAt: 1 }).toArray();
+    const shops = await db.collection(SHOPS).find({}).project({ name: 1 }).toArray();
+    const name = new Map(shops.map((s) => [String(s._id), s.name]));
+    const byShop = new Map();
+    for (const d of devices) {
+      const k = String(d.shopId);
+      if (!byShop.has(k)) byShop.set(k, { shopId: k, shopName: name.get(k) || "", lines: [] });
+      byShop.get(k).lines.push(invoiceLine(d));
+    }
+    const rows = [...byShop.values()]
+      .map((g) => ({ ...g, count: g.lines.length, ...invoiceTotals(g.lines), sold: soldSpan(g.lines) }))
+      .sort((a, b) => a.shopName.localeCompare(b.shopName));
+    return res.json({
+      success: true,
+      gstRate: GST_RATE,
+      shops: rows,
+      count: devices.length,
+      total: r2(rows.reduce((t, g) => t + g.total, 0)),
+    });
+  } catch (e) {
+    console.error("consignment invoice preview error:", e);
+    return res.status(500).json({ success: false, message: "Failed to work out what to invoice" });
+  }
+});
+
+// The invoice indexes, made once per process (each createIndex is a round
+// trip — a batch across many shops shouldn't pay it per shop). The unique
+// seq index makes two invoices raised at once retry with the next number.
+let invoiceIndexes = null;
+function ensureInvoiceIndexes(db) {
+  if (!invoiceIndexes) {
+    invoiceIndexes = Promise.all([
+      db.collection(INVOICES).createIndex({ seq: 1 }, { unique: true, partialFilterExpression: { seq: { $gt: 0 } } }),
+      db.collection(INVOICES).createIndex({ shopId: 1, createdAt: -1 }),
+    ]).catch((e) => {
+      invoiceIndexes = null; // try again next time
+      console.error('consignment invoice indexes:', e.message);
+    });
+  }
+  return invoiceIndexes;
+}
+
+// Raise one invoice for a shop: every device it sold that isn't on an
+// invoice yet. Returns { created: false } when there's nothing to bill.
+async function raiseInvoiceForShop(db, shop, by) {
+  const devices = await db.collection(DEVICES)
+    .find({ shopId: shop._id, status: "sold", invoiceId: null })
+    .sort({ soldAt: 1 })
+    .toArray();
+  if (!devices.length) return { created: false };
+
+  // CI-10001, CI-10002 … — our own running number (imported AirTable
+  // invoices carry no seq); a clash retries with the next number.
+  await ensureInvoiceIndexes(db);
+  const lines = devices.map(invoiceLine);
+  const span = soldSpan(lines);
+  let doc;
+  let insertedId;
+  for (let attempt = 0; attempt < 5 && !insertedId; attempt++) {
+    const last = await db.collection(INVOICES).find({ seq: { $gt: 0 } }).sort({ seq: -1 }).limit(1).toArray();
+    const seq = Math.max((last[0] && last[0].seq) || 0, 10000) + 1;
+    doc = {
+      number: `CI-${seq}`,
+      seq,
+      shopId: shop._id,
+      shopName: shop.name,
+      // the dates the billed devices sold between (information only)
+      periodLabel: span ? `${span.from} – ${span.to}` : "",
+      deviceIds: devices.map((d) => d._id),
+      deviceCount: devices.length,
+      lines,
+      ...invoiceTotals(lines),
+      paymentStatus: "unpaid",
+      paidAt: null,
+      paidBy: null,
+      source: "dashboard",
+      createdAt: new Date(),
+      createdBy: by,
+    };
+    try {
+      insertedId = (await db.collection(INVOICES).insertOne(doc)).insertedId;
+    } catch (e) {
+      if (e && e.code === 11000) continue; // that number was just taken
+      throw e;
+    }
+  }
+  if (!insertedId) throw new Error("Could not get an invoice number");
+
+  // Claimed only while still uninvoiced, so two clicks can't bill a
+  // device twice; a device that slipped away is dropped from the bill.
+  const claim = await db.collection(DEVICES).updateMany(
+    { _id: { $in: doc.deviceIds }, invoiceId: null },
+    { $set: { invoiceId: insertedId, updatedAt: new Date() } },
+  );
+  if (claim.modifiedCount !== doc.deviceIds.length) {
+    const mine = await db.collection(DEVICES).find({ invoiceId: insertedId }).sort({ soldAt: 1 }).toArray();
+    if (!mine.length) {
+      await db.collection(INVOICES).deleteOne({ _id: insertedId });
+      return { created: false, raced: true };
+    }
+    const keep = mine.map(invoiceLine);
+    const s2 = soldSpan(keep);
+    const fix = {
+      deviceIds: mine.map((d) => d._id),
+      deviceCount: mine.length,
+      lines: keep,
+      periodLabel: s2 ? `${s2.from} – ${s2.to}` : "",
+      ...invoiceTotals(keep),
+    };
+    await db.collection(INVOICES).updateOne({ _id: insertedId }, { $set: fix });
+    Object.assign(doc, fix);
+  }
+  return { created: true, invoice: { _id: insertedId, ...doc } };
+}
+
+router.post("/invoices/generate", INVOICE, async function (req, res) {
   try {
     const shopId = oid(req.body && req.body.shopId);
     if (!shopId) return res.status(400).json({ success: false, message: "shopId is required" });
     const db = await connectToDatabase();
     const shop = await db.collection(SHOPS).findOne({ _id: shopId });
     if (!shop) return res.status(404).json({ success: false, message: "Shop not found" });
-
-    const week = previousMelbourneWeek();
-    const devices = await db.collection(DEVICES)
-      .find({ shopId, status: "sold", invoiceId: null, soldAt: { $lt: week.end } })
-      .toArray();
-    if (!devices.length) {
-      return res.json({ success: true, created: false, message: "No uninvoiced sold devices for this shop in that period." });
+    const r = await raiseInvoiceForShop(db, shop, actorOf(req));
+    if (r.raced) return res.status(409).json({ success: false, message: "Those devices were just invoiced — refresh the page." });
+    if (!r.created) {
+      return res.json({ success: true, created: false, message: "Nothing to invoice — every device this shop sold is already on an invoice." });
     }
-
-    const seq = (await db.collection(INVOICES).countDocuments({})) + 1;
-    const number = `CI-${week.endLabel.replace(/-/g, "")}-${String(seq).padStart(4, "0")}`;
-    const total = Math.round(devices.reduce((s, d) => s + (Number(d.shopPrice) || 0), 0) * 100) / 100;
-    const doc = {
-      number,
-      shopId,
-      shopName: shop.name,
-      periodStart: week.start,
-      periodEnd: week.end,
-      periodLabel: `${week.startLabel} – ${week.endLabel}`,
-      deviceIds: devices.map((d) => d._id),
-      deviceCount: devices.length,
-      total,
-      createdAt: new Date(),
-      createdBy: actorOf(req),
-    };
-    const r = await db.collection(INVOICES).insertOne(doc);
-    await db.collection(DEVICES).updateMany(
-      { _id: { $in: doc.deviceIds } },
-      { $set: { invoiceId: r.insertedId, updatedAt: new Date() } },
-    );
-    return res.json({ success: true, created: true, invoice: { _id: r.insertedId, ...doc } });
+    return res.json({ success: true, created: true, invoice: r.invoice });
   } catch (e) {
     console.error("consignment invoice generate error:", e);
-    return res.status(500).json({ success: false, message: "Failed to generate invoice" });
+    return res.status(500).json({ success: false, message: "Failed to raise the invoice" });
   }
 });
 
-router.get("/invoices", MANAGE, async function (req, res) {
+// Raise invoices in one go — one per shop, each billing everything that
+// shop has sold and not been invoiced for. { shopIds: [...] } picks the
+// shops; without it, every shop with something to bill.
+router.post("/invoices/generate-batch", INVOICE, async function (req, res) {
+  try {
+    const db = await connectToDatabase();
+    const wanted = Array.isArray(req.body && req.body.shopIds) ? req.body.shopIds.map(oid).filter(Boolean) : null;
+    const pending = await db.collection(DEVICES).aggregate([
+      { $match: { status: "sold", invoiceId: null, ...(wanted ? { shopId: { $in: wanted } } : {}) } },
+      { $group: { _id: "$shopId" } },
+    ]).toArray();
+    const shops = pending.length
+      ? await db.collection(SHOPS).find({ _id: { $in: pending.map((p) => p._id) } }).sort({ name: 1 }).toArray()
+      : [];
+    const by = actorOf(req);
+    const invoices = [];
+    const failed = [];
+    for (const shop of shops) {
+      try {
+        const r = await raiseInvoiceForShop(db, shop, by);
+        if (r.created) invoices.push(r.invoice);
+      } catch (e) {
+        console.error(`consignment batch invoice error (${shop.name}):`, e.message);
+        failed.push(shop.name);
+      }
+    }
+    return res.json({
+      success: true,
+      created: invoices.length,
+      invoices: invoices.map(({ lines, deviceIds, ...rest }) => rest),
+      total: r2(invoices.reduce((t, i) => t + i.total, 0)),
+      failed,
+    });
+  } catch (e) {
+    console.error("consignment batch invoice error:", e);
+    return res.status(500).json({ success: false, message: "Failed to raise the invoices" });
+  }
+});
+
+router.get("/invoices", INVOICE, async function (req, res) {
   try {
     const db = await connectToDatabase();
     const match = {};
@@ -779,29 +1025,128 @@ router.get("/invoices", MANAGE, async function (req, res) {
       const sid = oid(req.query.shopId);
       if (sid) match.shopId = sid;
     }
-    const invoices = await db.collection(INVOICES).find(match).sort({ createdAt: -1 }).limit(200).toArray();
-    return res.json({ success: true, invoices });
+    const all = { ...match };
+    if (["paid", "unpaid", "void"].includes(req.query.paymentStatus)) {
+      match.paymentStatus = req.query.paymentStatus === "unpaid" ? { $in: ["unpaid", null] } : req.query.paymentStatus;
+    }
+    const invoices = await db.collection(INVOICES)
+      .find(match, { projection: { lines: 0, deviceIds: 0 } })
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .toArray();
+    const sums = await db.collection(INVOICES).aggregate([
+      { $match: all },
+      { $group: { _id: { $ifNull: ["$paymentStatus", "unpaid"] }, n: { $sum: 1 }, total: { $sum: "$total" } } },
+    ]).toArray();
+    const totals = {};
+    for (const s of sums) totals[s._id] = { count: s.n, total: r2(s.total) };
+    // the shop filter's options (so the page needn't read the Shops list)
+    const shops = await db.collection(SHOPS).find({}).project({ name: 1 }).sort({ name: 1 }).toArray();
+    return res.json({ success: true, invoices, totals, shops });
   } catch (e) {
     console.error("consignment invoices error:", e);
     return res.status(500).json({ success: false, message: "Failed to load invoices" });
   }
 });
 
-router.get("/invoices/:id", MANAGE, async function (req, res) {
+router.get("/invoices/:id", INVOICE, async function (req, res) {
   try {
     const _id = oid(req.params.id);
     if (!_id) return res.status(400).json({ success: false, message: "invalid id" });
     const db = await connectToDatabase();
     const invoice = await db.collection(INVOICES).findOne({ _id });
     if (!invoice) return res.status(404).json({ success: false, message: "Invoice not found" });
-    const devices = await db.collection(DEVICES)
-      .find({ _id: { $in: invoice.deviceIds || [] } })
-      .project({ stockId: 1, productName: 1, sku: 1, grade: 1, imei: 1, shopPrice: 1, soldAt: 1 })
-      .toArray();
-    return res.json({ success: true, invoice, devices });
+    // Lines come from the snapshot; invoices from before snapshots read
+    // their devices.
+    let lines = invoice.lines;
+    if (!Array.isArray(lines) || !lines.length) {
+      const devices = await db.collection(DEVICES).find({ _id: { $in: invoice.deviceIds || [] } }).sort({ soldAt: 1 }).toArray();
+      lines = devices.map(invoiceLine);
+    }
+    const { lines: _l, ...rest } = invoice;
+    return res.json({ success: true, invoice: rest, lines });
   } catch (e) {
     console.error("consignment invoice detail error:", e);
     return res.status(500).json({ success: false, message: "Failed to load invoice" });
+  }
+});
+
+router.post("/invoices/:id/payment", INVOICE, async function (req, res) {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ success: false, message: "invalid id" });
+    const paid = !!(req.body && req.body.paid);
+    const db = await connectToDatabase();
+    const now = new Date();
+    // An invoice is recorded in inFlow before it can be paid (user rule
+    // 2026-10-01). Guarded in the update itself, so the order holds even
+    // if two people click at once.
+    const r = await db.collection(INVOICES).updateOne(
+      { _id, paymentStatus: { $ne: "void" }, ...(paid ? { inflowRecordedAt: { $ne: null } } : {}) },
+      { $set: paid ? { paymentStatus: "paid", paidAt: now, paidBy: actorOf(req) } : { paymentStatus: "unpaid", paidAt: null, paidBy: null } },
+    );
+    if (!r.matchedCount) {
+      const inv = await db.collection(INVOICES).findOne({ _id }, { projection: { paymentStatus: 1, inflowRecordedAt: 1 } });
+      if (inv && paid && inv.paymentStatus !== "void" && !inv.inflowRecordedAt) {
+        return res.status(400).json({ success: false, message: "Record it in inFlow first — an invoice is entered in inFlow before it's marked paid." });
+      }
+      return res.status(404).json({ success: false, message: "Invoice not found" });
+    }
+    return res.json({ success: true, paymentStatus: paid ? "paid" : "unpaid", paidAt: paid ? now : null });
+  } catch (e) {
+    console.error("consignment invoice payment error:", e);
+    return res.status(500).json({ success: false, message: "Failed to update the invoice" });
+  }
+});
+
+// Whether the invoice has been entered into inFlow (the accounts are kept
+// there) — { recorded: true | false }. Marks who and when; a label shows
+// on the invoice lists (user ask 2026-10-01).
+router.post("/invoices/:id/inflow", INVOICE, async function (req, res) {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ success: false, message: "invalid id" });
+    const recorded = !!(req.body && req.body.recorded);
+    const db = await connectToDatabase();
+    const now = new Date();
+    const by = actorOf(req);
+    // Taking the mark off a paid invoice would break the inFlow-before-paid
+    // order, so that's refused (mark it unpaid first).
+    const r = await db.collection(INVOICES).updateOne(
+      { _id, paymentStatus: recorded ? { $ne: "void" } : { $nin: ["void", "paid"] } },
+      { $set: recorded ? { inflowRecordedAt: now, inflowRecordedBy: by } : { inflowRecordedAt: null, inflowRecordedBy: null } },
+    );
+    if (!r.matchedCount) {
+      const inv = await db.collection(INVOICES).findOne({ _id }, { projection: { paymentStatus: 1 } });
+      if (inv && !recorded && inv.paymentStatus === "paid") {
+        return res.status(400).json({ success: false, message: "It's marked paid — mark it unpaid before taking the inFlow mark off." });
+      }
+      return res.status(404).json({ success: false, message: "Invoice not found" });
+    }
+    return res.json({ success: true, inflowRecordedAt: recorded ? now : null, inflowRecordedBy: recorded ? by : null });
+  } catch (e) {
+    console.error("consignment invoice inflow error:", e);
+    return res.status(500).json({ success: false, message: "Failed to update the invoice" });
+  }
+});
+
+router.post("/invoices/:id/void", INVOICE, async function (req, res) {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ success: false, message: "invalid id" });
+    const db = await connectToDatabase();
+    const inv = await db.collection(INVOICES).findOne({ _id });
+    if (!inv) return res.status(404).json({ success: false, message: "Invoice not found" });
+    if (inv.source !== "dashboard") return res.status(400).json({ success: false, message: "Only invoices raised here can be voided." });
+    if (inv.paymentStatus === "paid") return res.status(400).json({ success: false, message: "It's marked paid — mark it unpaid first." });
+    if (inv.paymentStatus === "void") return res.json({ success: true });
+    const now = new Date();
+    await db.collection(INVOICES).updateOne({ _id }, { $set: { paymentStatus: "void", voidedAt: now, voidedBy: actorOf(req) } });
+    const r = await db.collection(DEVICES).updateMany({ invoiceId: _id }, { $set: { invoiceId: null, updatedAt: now } });
+    return res.json({ success: true, released: r.modifiedCount });
+  } catch (e) {
+    console.error("consignment invoice void error:", e);
+    return res.status(500).json({ success: false, message: "Failed to void the invoice" });
   }
 });
 
