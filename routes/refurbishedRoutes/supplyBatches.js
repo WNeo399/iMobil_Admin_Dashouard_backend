@@ -144,9 +144,13 @@ const CURRENCIES = ["AUD", "CNY", "HKD"];
 // supplier. Applied to the device docs BEFORE snapshotting, so the
 // batch lines and the register can't disagree.
 //   updates: [{ deviceId, costPrice, currency, supplierId }]
-// Costs only ever FILL a blank (an existing figure is never silently
-// overwritten from this path); supplier changes are phone-supplier
-// only, validated against their own scoped list ('' clears it).
+// For staff, costs only ever FILL a blank (an existing figure is never
+// overwritten from this path). A phone supplier's figure is their price,
+// which they may change here — the same rule as the Stock page: always
+// recorded as supplierPrice, and the register's costPrice follows while
+// the unit is still theirs (once received, costPrice is our landed cost).
+// Supplier changes are phone-supplier only, validated against their own
+// scoped list ('' clears it).
 async function applyDeviceUpdates(db, req, devices, rawUpdates) {
   const updates = Array.isArray(rawUpdates) ? rawUpdates : [];
   if (!updates.length) return null;
@@ -162,17 +166,30 @@ async function applyDeviceUpdates(db, req, devices, rawUpdates) {
     const history = [];
 
     const cost = u.costPrice;
-    if (d.costPrice == null && cost != null && cost !== "" && Number.isFinite(Number(cost)) && Number(cost) >= 0) {
+    const validCost = cost != null && cost !== "" && Number.isFinite(Number(cost)) && Number(cost) >= 0;
+    if (validCost && isSupplierUser) {
+      const price = Number(cost);
+      const prev = supplierPriceOf(d);
+      const currency = CURRENCIES.includes(String(u.currency || "").toUpperCase())
+        ? String(u.currency).toUpperCase()
+        : prev.currency || d.currency || "AUD";
+      if (prev.price !== price || prev.currency !== currency) {
+        set.supplierPrice = price;
+        set.supplierCurrency = currency;
+        const stillTheirUnit = d.status === STATUS_WITH_SUPPLIER || d.status === STATUS_NOT_RECEIVED;
+        if (stillTheirUnit || d.costPrice == null) {
+          set.costPrice = price;
+          set.currency = currency;
+        }
+        history.push(prev.price == null
+          ? `Price set to ${currency} ${price.toFixed(2)} on a supply batch`
+          : `Price changed from ${prev.currency} ${Number(prev.price).toFixed(2)} to ${currency} ${price.toFixed(2)} on a supply batch`);
+      }
+    } else if (validCost && d.costPrice == null) {
       const currency = CURRENCIES.includes(String(u.currency || "").toUpperCase())
         ? String(u.currency).toUpperCase()
         : d.currency || "AUD";
       set.costPrice = Number(cost);
-      // Entered by the supplier themselves — recorded as what they
-      // charge, so receiving the unit keeps it as their price.
-      if (isSupplierUser) {
-        set.supplierPrice = Number(cost);
-        set.supplierCurrency = currency;
-      }
       set.currency = currency;
       history.push(`Cost set to ${currency} ${Number(cost).toFixed(2)} while boarding a supply batch`);
     }

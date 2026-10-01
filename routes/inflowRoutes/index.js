@@ -2533,6 +2533,36 @@ router.post("/dispatch/manual/:id/title", VIEW_ORDERS, async (req, res) => {
   }
 });
 
+// ── POST /inflow/dispatch/manual/:id/return-code ────────────────────
+// Oscar Mobile's supplier cards print the return code SS-<prefix>-<barcode>.
+// The prefix is usually typed at upload (or when the customer is linked);
+// this sets or changes it from the dispatch dialog, where the labels are
+// printed (user ask 2026-10-01). Body { faultyCodePrefix } — empty clears.
+// It ends up in a barcode and a QR, so no spaces.
+router.post("/dispatch/manual/:id/return-code", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const prefix = String((req.body && req.body.faultyCodePrefix) || "").trim();
+    if (/\s/.test(prefix) || prefix.length > 40) {
+      return res.status(400).json({ success: false, message: "The return code can't have spaces (40 characters at most)" });
+    }
+    const db = await connectToDatabase();
+    const r = await db.collection(DISPATCH_UPLOADS).findOneAndUpdate(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { faultyCodePrefix: prefix || null, updatedAt: new Date() } },
+      { returnDocument: "after", projection: { faultyCodePrefix: 1 } },
+    );
+    const doc = r ? r.value || r : null;
+    if (!doc) return res.status(404).json({ success: false, message: "Record not found" });
+    return res.json({ success: true, faultyCodePrefix: doc.faultyCodePrefix || null });
+  } catch (e) {
+    console.error("InFlow dispatch return code error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the return code" });
+  }
+});
+
 router.post("/dispatch/manual/:id/customer", VIEW_ORDERS, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {

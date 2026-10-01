@@ -17,6 +17,7 @@
 //                                       (utils/webBannerSettings)
 //   GET    /website/spare-parts         what the Spare Parts widget shows
 //                                       (utils/sparePartsCatalog; web:parts:view)
+//   /website/campaigns/…                 email campaigns via Zoho Campaigns (./campaigns.js)
 //
 // web:banner:view reads, web:banner:manage writes (admin + iMobile Admin).
 //
@@ -354,5 +355,7 @@ router.get("/spare-parts", requirePermission("web:parts:view"), async (req, res)
     return res.status(500).json({ success: false, message: "Could not read the spare parts" });
   }
 });
+
+router.use("/campaigns", require("./campaigns"));
 
 module.exports = router;

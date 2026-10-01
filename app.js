@@ -66,6 +66,10 @@ var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
 // incremental pass (default) and the full nightly refresh (?mode=full).
 // Same shared-secret scheme as the PO sync.
 var stockSyncRouter = require('./routes/stockSyncRoutes/index');
+// Email campaign drafts from another agent — POST/GET /integration/campaigns,
+// shared-secret auth (CAMPAIGN_AGENT_KEY); can't send — a person reviews and
+// sends on iMobile Website → Campaign.
+var campaignAgentRouter = require('./routes/campaignAgentRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -113,6 +117,8 @@ app.use('/aiQuery', express.json({ limit: '15mb' }));
 app.use('/blackbelt', express.json({ limit: '10mb' }));
 // 2mb limit so the SVP serial-list import (a few thousand serials posted as a
 // JSON array) fits; default 100kb is too small. Still bounded.
+// campaign drafts may arrive as JSON with a base64 zip
+app.use('/integration/campaigns', express.json({ limit: '20mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 app.use(cookieParser());
@@ -129,6 +135,7 @@ app.use('/integration/inflow', inflowWebhookRouter);
 // Retired with the Tencent sheet (2026-09-23): answers "retired", syncs nothing.
 app.use('/integration/purchaseOrderSync', purchaseOrderSyncRouter);
 app.use('/integration/stockSync', stockSyncRouter);
+app.use('/integration/campaigns', campaignAgentRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
