@@ -59,6 +59,8 @@ var blackbeltRouter = require('./routes/blackbeltRoutes/index');
 var explodedRouter = require('./routes/explodedRoutes/index');
 // iMobile Website — storefront content (banners for the carousel widget).
 var websiteRouter = require('./routes/websiteRoutes/index');
+// iMobile Accountant — money owed to iMobile (unpaid Zoho invoices).
+var accountantRouter = require('./routes/accountantRoutes/index');
 var posRouter = require('./routes/posRoutes/index');
 // Public daily-cron trigger for the Purchase Order UPDATE sync (Tencent → DB).
 var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
@@ -195,6 +197,7 @@ app.use('/consignment', authenticate, consignmentRouter);
 app.use('/blackbelt', authenticate, blackbeltRouter);
 app.use('/exploded', authenticate, explodedRouter);
 app.use('/website', authenticate, websiteRouter);
+app.use('/accountant', authenticate, accountantRouter);
 app.use('/pos', authenticate, posRouter);
 
 // catch 404 and forward to error handler

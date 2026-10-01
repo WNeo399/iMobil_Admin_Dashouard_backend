@@ -24,6 +24,7 @@ const ROLES = {
   // The spare-parts purchase partner (buys from the factories, ships the
   // batches to iMobile) — Spare Parts Purchase only.
   PARTS_SUPPLIER: "parts-supplier",
+  IMOBILE_ACCOUNTANT: "imobile-accountant",
 };
 
 const ROLE_LABELS = {
@@ -38,6 +39,7 @@ const ROLE_LABELS = {
   [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
   [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
   [ROLES.PARTS_SUPPLIER]: "Parts Supplier",
+  [ROLES.IMOBILE_ACCOUNTANT]: "iMobile Accountant",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -69,6 +71,7 @@ const ROLE_GROUP_OF = {
   [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
   [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
   [ROLES.PARTS_SUPPLIER]: ROLE_GROUPS.IMOBILE,
+  [ROLES.IMOBILE_ACCOUNTANT]: ROLE_GROUPS.IMOBILE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -154,6 +157,10 @@ const ROLE_PERMISSIONS = {
     "spp:image:view",
     "spp:image:upload",
   ],
+  // iMobile Accountant (2026-09-30): the iMobile Accountant menu only —
+  // what customers owe, from Zoho Inventory. Nobody else holds acct:*
+  // (admin sees it through *:*:*).
+  [ROLES.IMOBILE_ACCOUNTANT]: ["acct:*:*"],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
