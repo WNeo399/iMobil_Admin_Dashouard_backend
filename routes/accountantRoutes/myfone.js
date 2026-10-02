@@ -83,6 +83,22 @@ function daysBetween(fromYmd, toYmd) {
   return Math.round((d(toYmd) - d(fromYmd)) / 86400000);
 }
 
+// My Fone shops have a month to pay (user 2026-10-02), but Zoho has their
+// invoices due on receipt, so an invoice falls due one calendar month after
+// its date (31 Aug → 30 Sep) — or Zoho's own due date, if that is later.
+function dueDateOf(dateYmd, zohoDue) {
+  let due = null;
+  if (YMD.test(String(dateYmd || ""))) {
+    const y = +dateYmd.slice(0, 4);
+    const m = +dateYmd.slice(5, 7); // the next month, 0-based
+    const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    const d = new Date(Date.UTC(y, m, Math.min(+dateYmd.slice(8, 10), last)));
+    due = d.toISOString().slice(0, 10);
+  }
+  const z = YMD.test(String(zohoDue || "")) ? String(zohoDue) : null;
+  return [due, z].filter(Boolean).sort().pop() || null;
+}
+
 async function zohoGet(path, key, pace = 0) {
   let lastSeen;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -123,11 +139,13 @@ function summarise(shop, rows, today) {
   };
   for (const r of mine) {
     s.outstanding += r.balance;
-    const late = r.dueDate ? daysBetween(r.dueDate, today) : 0; // > 0 = days overdue
-    if (late > 0 || r.status === "overdue") {
+    // not Zoho's "overdue" status — that counts from its due-on-receipt date
+    const due = dueDateOf(r.date, r.dueDate);
+    const late = due ? daysBetween(due, today) : 0; // > 0 = days overdue
+    if (late > 0) {
       s.overdue += r.balance;
       s.overdueInvoices += 1;
-      if (r.dueDate && (!s.oldestDue || r.dueDate < s.oldestDue)) s.oldestDue = r.dueDate;
+      if (!s.oldestDue || due < s.oldestDue) s.oldestDue = due;
     } else s.notDue += r.balance;
     const bucket = late <= 0 ? "current" : late <= 30 ? "d30" : late <= 60 ? "d60" : late <= 90 ? "d90" : "older";
     s.aging[bucket] += r.balance;
@@ -181,16 +199,19 @@ router.get("/shops/:contactId/unpaid", VIEW, async (req, res) => {
     const day = (ymd) => Date.UTC(...String(ymd).split("-").map((n, i) => Number(n) - (i === 1 ? 1 : 0)));
     const rows = list.rows
       .filter((r) => r.customerId === contactId)
-      .map((r) => ({
-        invoiceId: r.invoiceId,
-        invoiceNumber: r.invoiceNumber,
-        orderNumber: r.orderNumber,
-        date: r.date,
-        dueDate: r.dueDate,
-        total: r.total,
-        balance: r.balance,
-        daysOverdue: r.dueDate && r.dueDate < today ? Math.round((day(today) - day(r.dueDate)) / 86400000) : 0,
-      }))
+      .map((r) => {
+        const due = dueDateOf(r.date, r.dueDate);
+        return {
+          invoiceId: r.invoiceId,
+          invoiceNumber: r.invoiceNumber,
+          orderNumber: r.orderNumber,
+          date: r.date,
+          dueDate: due,
+          total: r.total,
+          balance: r.balance,
+          daysOverdue: due && due < today ? Math.round((day(today) - day(due)) / 86400000) : 0,
+        };
+      })
       .sort((a, b) => String(a.dueDate || "9999").localeCompare(String(b.dueDate || "9999")) || String(a.date || "").localeCompare(String(b.date || "")));
     return res.json({
       success: true,
@@ -223,7 +244,7 @@ async function readLedger(contactId, pace = 0) {
   for (const i of invoices) {
     if (!live(i.status)) continue;
     entries.push({
-      kind: "invoice", id: String(i.invoice_id), number: i.invoice_number || "", date: i.date, dueDate: i.due_date || null,
+      kind: "invoice", id: String(i.invoice_id), number: i.invoice_number || "", date: i.date, dueDate: dueDateOf(i.date, i.due_date),
       reference: text(i.reference_number), debit: num(i.total), credit: 0, balance: num(i.balance), status: i.status, created: i.created_time || "",
     });
     if (num(i.write_off_amount) > 0) {
