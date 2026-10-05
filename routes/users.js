@@ -11,8 +11,10 @@ const {
   ROLE_GROUPS,
   ROLE_GROUP_LABELS,
   ROLE_GROUP_OF,
-  isValidRole,
   isShopScopedRole,
+  isCombinableRole,
+  roleSetError,
+  rolesOfUser,
 } = require("../constants/roles");
 
 const COLLECTION = "users";
@@ -40,6 +42,19 @@ function normalizeShopIdsForRole(shopIds, role) {
   return ids;
 }
 
+// The roles a create / update asks for, main role first: `roles` (a list —
+// a staff account can hold several) or the single `role` older callers
+// send. A `role` sent alongside the list names the main one. Null when
+// neither came (an update that leaves the roles alone).
+function rolesFromBody(body) {
+  if (body.roles === undefined && body.role === undefined) return null;
+  const clean = (v) => (typeof v === "string" ? v.trim() : "");
+  const list = [...new Set((Array.isArray(body.roles) ? body.roles : []).map(clean).filter(Boolean))];
+  const main = clean(body.role);
+  if (!list.length) return main ? [main] : [];
+  return list.includes(main) ? [main, ...list.filter((r) => r !== main)] : list;
+}
+
 // Roles available for assignment (for the role dropdown) plus UI grouping
 // metadata so the Users page can render its left-side role tree without
 // duplicating the group map.
@@ -48,6 +63,8 @@ router.get("/roles", requireUserAdmin, function (req, res) {
     value,
     label: ROLE_LABELS[value] || value,
     shopScoped: isShopScopedRole(value),
+    // A staff role an account can hold together with other staff roles.
+    combinable: isCombinableRole(value),
     group: ROLE_GROUP_OF[value] || null,
   }));
   const groups = Object.values(ROLE_GROUPS).map((value) => ({
@@ -67,19 +84,21 @@ router.get("/list", requireUserAdmin, async function (req, res, next) {
     const collection = db.collection(COLLECTION);
 
     const query = {};
+    const and = [];
     // `role` accepts either a single role string or a comma-separated list
     // so the Users page tree can filter a group node (multiple roles) in
     // one request. Single-role callers (the old dropdown / the shop-edit
-    // Users tab) keep working unchanged.
+    // Users tab) keep working unchanged. An account holding several roles
+    // (`roles`) shows under each of them.
+    let roleFiltered = false;
     if (role) {
       const roles = String(role)
         .split(",")
         .map((r) => r.trim())
         .filter(Boolean);
-      if (roles.length === 1) {
-        query.role = roles[0];
-      } else if (roles.length > 1) {
-        query.role = { $in: roles };
+      if (roles.length) {
+        and.push({ $or: [{ role: { $in: roles } }, { roles: { $in: roles } }] });
+        roleFiltered = true;
       }
     }
     if (active !== undefined && active !== "") {
@@ -87,7 +106,7 @@ router.get("/list", requireUserAdmin, async function (req, res, next) {
     }
     if (search) {
       const re = { $regex: String(search), $options: "i" };
-      query.$or = [{ username: re }, { email: re }];
+      and.push({ $or: [{ username: re }, { email: re }] });
     }
 
     // Used by the Shop edit dialog's Users tab — match any user whose shopIds
@@ -96,10 +115,11 @@ router.get("/list", requireUserAdmin, async function (req, res, next) {
     // admin user that happens to have a shop linked to them.
     if (shopId && ObjectId.isValid(shopId)) {
       query.shopIds = new ObjectId(shopId);
-      if (!query.role) {
+      if (!roleFiltered) {
         query.role = { $in: [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP] };
       }
     }
+    if (and.length) query.$and = and;
 
     const totalDocs = await collection.countDocuments(query);
     const data = await collection
@@ -150,15 +170,18 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
     // provided we still lowercase + uniqueness-check it.
     const email = (req.body.email || "").trim().toLowerCase();
     const password = req.body.password;
-    const role = req.body.role;
+    // One role, or several staff roles — the first is the main one.
+    const roles = rolesFromBody(req.body) || [];
+    const role = roles[0];
 
     if (!username || !password) {
       return res
         .status(400)
         .json({ success: false, message: "username and password are required" });
     }
-    if (!isValidRole(role)) {
-      return res.status(400).json({ success: false, message: "Invalid role" });
+    const roleError = roleSetError(roles);
+    if (roleError) {
+      return res.status(400).json({ success: false, message: roleError });
     }
 
     const db = await connectToDatabase();
@@ -182,6 +205,7 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
       email: email || null,
       passwordHash: await hashPassword(password),
       role,
+      roles,
       // Shop list only matters for shop-scoped roles. normalizeShopIdsForRole
       // also enforces the max-1 rule for the repair-shop role.
       shopIds: normalizeShopIdsForRole(req.body.shopIds, role),
@@ -244,20 +268,27 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     }
     if (req.body.active !== undefined) update.active = !!req.body.active;
 
-    let effectiveRole = existing.role;
-    if (req.body.role !== undefined) {
-      if (!isValidRole(req.body.role)) {
-        return res.status(400).json({ success: false, message: "Invalid role" });
+    // The role list (main role first). Everything role-specific below goes
+    // by the main role: only staff roles combine, and none of them carries
+    // shops, a stock source or an InFlow customer.
+    let effectiveRole = rolesOfUser(existing)[0];
+    const nextRoles = rolesFromBody(req.body);
+    const rolesChanged = nextRoles !== null;
+    if (rolesChanged) {
+      const roleError = roleSetError(nextRoles);
+      if (roleError) {
+        return res.status(400).json({ success: false, message: roleError });
       }
-      update.role = req.body.role;
-      effectiveRole = req.body.role;
+      update.role = nextRoles[0];
+      update.roles = nextRoles;
+      effectiveRole = nextRoles[0];
     }
 
     // Keep shopIds consistent with the (effective) role — incl. enforcing
     // the max-1 rule for repair-shop. We use the existing shopIds when the
     // request didn't include them so a pure role-change still gets trimmed
     // (e.g. shop-owner → repair-shop with prior multi-shop list).
-    if (req.body.shopIds !== undefined || req.body.role !== undefined) {
+    if (req.body.shopIds !== undefined || rolesChanged) {
       const sourceIds = req.body.shopIds !== undefined ? req.body.shopIds : existing.shopIds;
       update.shopIds = normalizeShopIdsForRole(sourceIds, effectiveRole);
     }
@@ -268,7 +299,7 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
       if (req.body.stockSource !== undefined) {
         update.stockSource = normalizeStockSource(req.body.stockSource) || null;
       }
-    } else if (req.body.role !== undefined && existing.stockSource) {
+    } else if (rolesChanged && existing.stockSource) {
       update.stockSource = null;
     }
 

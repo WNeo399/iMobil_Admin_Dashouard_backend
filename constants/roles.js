@@ -223,14 +223,65 @@ const SHOP_SCOPED_ROLES = [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP];
 function isValidRole(role) {
   return Object.values(ROLES).includes(role);
 }
+// Roles one account may hold TOGETHER (user ask 2026-10-05: "multiple roles,
+// staff roles only"). An account's roles live in `roles` on the user record,
+// main role first; `role` stays as that main role, and a record without
+// `roles` simply holds `[role]` — so nothing had to be migrated. Admin is
+// left out (it already holds everything), and so is every outside-facing
+// role: each of those narrows the account to its own shop / supplier /
+// customer, and code all over checks them with `req.user.role === …` — they
+// stay an account's ONLY role.
+const COMBINABLE_ROLES = [
+  ROLES.IMOBILE_ADMIN,
+  ROLES.IMOBILE_REPAIR_ADMIN,
+  ROLES.TECHELITE_ADMIN,
+  ROLES.IMOBILE_PURCHASE,
+  ROLES.IMOBILE_ACCOUNTANT,
+  ROLES.IMOBILE_WAREHOUSE,
+  ROLES.IMOBILE_FRONT_DESK,
+];
+
 
 function getPermissionsForRole(role) {
   return ROLE_PERMISSIONS[role] ? [...ROLE_PERMISSIONS[role]] : [];
 }
+function isCombinableRole(role) {
+  return COMBINABLE_ROLES.includes(role);
+}
+
+// Why this list of roles can't be saved on one account, or null when it can.
+function roleSetError(roles) {
+  if (!Array.isArray(roles) || roles.length === 0) return "Invalid role";
+  if (!roles.every(isValidRole)) return "Invalid role";
+  if (roles.length > 1) {
+    const single = roles.filter((r) => !isCombinableRole(r));
+    if (single.length) {
+      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only staff roles can`;
+    }
+  }
+  return null;
+}
+
+// The roles a user record holds, main role first. A stored list that breaks
+// the staff-only rule (it can only get there by hand) falls back to the main
+// role alone, so an outside-facing role is never widened.
+function rolesOfUser(user) {
+  if (!user) return [];
+  const extra = Array.isArray(user.roles) ? user.roles : [];
+  const all = [...new Set([user.role, ...extra].filter(Boolean))];
+  if (all.length > 1 && !all.every(isCombinableRole)) return [all[0]];
+  return all;
+}
+
 
 function isShopScopedRole(role) {
   return SHOP_SCOPED_ROLES.includes(role);
 }
+// Everything any of the roles allows.
+function getPermissionsForRoles(roles) {
+  return [...new Set((roles || []).flatMap((r) => ROLE_PERMISSIONS[r] || []))];
+}
+
 
 // Does `granted` (a single permission string, possibly with wildcards) cover
 // the `required` permission? Compares segment-by-segment.
@@ -260,6 +311,11 @@ module.exports = {
   isValidRole,
   getPermissionsForRole,
   isShopScopedRole,
+  COMBINABLE_ROLES,
   permissionMatches,
+  isCombinableRole,
+  roleSetError,
+  rolesOfUser,
   hasPermission,
+  getPermissionsForRoles,
 };

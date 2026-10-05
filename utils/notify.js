@@ -52,12 +52,13 @@ async function notifyShopForCase(db, caseDoc, payload) {
 }
 
 // Resolve all active users holding any of the given roles, and notify them.
+// A staff account can hold several roles (`roles`); one match is enough.
 async function notifyRoles(db, roles, payload) {
   if (!roles || roles.length === 0) return 0;
   const recipients = await db
     .collection(USERS)
     .find(
-      { role: { $in: roles }, active: { $ne: false } },
+      { $or: [{ role: { $in: roles } }, { roles: { $in: roles } }], active: { $ne: false } },
       { projection: { _id: 1 } },
     )
     .toArray();

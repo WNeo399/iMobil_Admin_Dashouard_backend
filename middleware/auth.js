@@ -2,7 +2,8 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../utils/mongodb");
 const { verifyToken } = require("../utils/authToken");
 const {
-  getPermissionsForRole,
+  getPermissionsForRoles,
+  rolesOfUser,
   isShopScopedRole,
   hasPermission,
 } = require("../constants/roles");
@@ -50,16 +51,21 @@ async function authenticate(req, res, next) {
     }
 
     const shopIds = Array.isArray(user.shopIds) ? user.shopIds : [];
+    // A staff account can hold several roles (constants/roles.js); `role` is
+    // the main one, and the permissions are everything any of them allows.
+    const roles = rolesOfUser(user);
+    const role = roles[0];
 
     req.user = {
       _id: user._id,
       username: user.username,
       email: user.email,
-      role: user.role,
-      permissions: getPermissionsForRole(user.role),
+      role,
+      roles,
+      permissions: getPermissionsForRoles(roles),
       shopIds,
       // null = unscoped (sees all). An array = restricted to these shop ids.
-      accessibleShopIds: isShopScopedRole(user.role)
+      accessibleShopIds: isShopScopedRole(role)
         ? shopIds.map((id) => (id instanceof ObjectId ? id : new ObjectId(id)))
         : null,
       // InFlow customer-portal link — scopes the Statement page to one customer.

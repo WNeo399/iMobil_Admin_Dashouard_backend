@@ -196,8 +196,11 @@ async function resolveModel(db, modelId) {
 }
 
 // Roles allowed to use the shop-group filter on /list and /counts (iMobile
-// Front Desk works SQT like TechElite Admin, 2026-10-05).
+// Front Desk works SQT like TechElite Admin, 2026-10-05). Any one of an
+// account's roles is enough.
 const GROUP_FILTER_ROLES = ["admin", "techelite-admin", "imobile-front-desk"];
+const canFilterByGroup = (user) =>
+  !!user && (user.roles || [user.role]).some((r) => GROUP_FILTER_ROLES.includes(r));
 
 // ── Shop data scoping ────────────────────────────────────────────────────────
 // req.user.accessibleShopIds is null for unscoped roles (Admin / iMobile /
@@ -321,7 +324,7 @@ router.get(
       // matches nothing.
       if (
         !query.shopId &&
-        req.user && GROUP_FILTER_ROLES.includes(req.user.role) &&
+        canFilterByGroup(req.user) &&
         req.query.groupId && ObjectId.isValid(req.query.groupId)
       ) {
         const members = await db
@@ -415,7 +418,7 @@ router.get(
       // so the tree counts match exactly what the filtered table shows.
       if (
         !match.shopId &&
-        req.user && GROUP_FILTER_ROLES.includes(req.user.role) &&
+        canFilterByGroup(req.user) &&
         req.query.groupId && ObjectId.isValid(req.query.groupId)
       ) {
         const members = await db

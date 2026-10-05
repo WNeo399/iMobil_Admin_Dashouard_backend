@@ -4,7 +4,7 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { comparePassword, hashPassword, signToken } = require("../../utils/authToken");
 const { authenticate } = require("../../middleware/auth");
-const { ROLE_LABELS } = require("../../constants/roles");
+const { ROLE_LABELS, getPermissionsForRole } = require("../../constants/roles");
 
 const USERS_COLLECTION = "users";
 
@@ -81,10 +81,15 @@ router.get("/getInfo", authenticate, async function (req, res, next) {
         email: u.email,
         nickName: u.username,
         role: u.role,
-        roleLabel: ROLE_LABELS[u.role] || u.role,
+        roleLabel: u.roles.map((r) => ROLE_LABELS[r] || r).join(" + "),
       },
-      // RuoYi frontend expects arrays here
-      roles: [u.role],
+      // RuoYi frontend expects arrays here. Main role first; a staff account
+      // can hold several.
+      roles: u.roles,
+      roleLabels: Object.fromEntries(u.roles.map((r) => [r, ROLE_LABELS[r] || r])),
+      // What each role grants by itself — the frontend needs it for routes
+      // hidden from one role (`excludeRoles`) on an account that holds others.
+      rolePermissions: Object.fromEntries(u.roles.map((r) => [r, getPermissionsForRole(r)])),
       permissions: u.permissions,
       // null = unscoped; array of id strings = restricted to these shops
       accessibleShopIds:
