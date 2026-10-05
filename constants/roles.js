@@ -25,6 +25,8 @@ const ROLES = {
   // batches to iMobile) — Spare Parts Purchase only.
   PARTS_SUPPLIER: "parts-supplier",
   IMOBILE_ACCOUNTANT: "imobile-accountant",
+  // Warehouse staff — iMobile Spare Parts, Spare Parts Purchase, InFlow and Tools.
+  IMOBILE_WAREHOUSE: "imobile-warehouse",
 };
 
 const ROLE_LABELS = {
@@ -40,6 +42,7 @@ const ROLE_LABELS = {
   [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
   [ROLES.PARTS_SUPPLIER]: "Parts Supplier",
   [ROLES.IMOBILE_ACCOUNTANT]: "iMobile Accountant",
+  [ROLES.IMOBILE_WAREHOUSE]: "iMobile Warehouse",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -72,6 +75,7 @@ const ROLE_GROUP_OF = {
   [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
   [ROLES.PARTS_SUPPLIER]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_ACCOUNTANT]: ROLE_GROUPS.IMOBILE,
+  [ROLES.IMOBILE_WAREHOUSE]: ROLE_GROUPS.IMOBILE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -157,10 +161,37 @@ const ROLE_PERMISSIONS = {
     "spp:image:view",
     "spp:image:upload",
   ],
-  // iMobile Accountant (2026-09-30): the iMobile Accountant menu only —
-  // what customers owe, from Zoho Inventory. Nobody else holds acct:*
-  // (admin sees it through *:*:*).
-  [ROLES.IMOBILE_ACCOUNTANT]: ["acct:*:*"],
+  // iMobile Accountant (2026-09-30): the iMobile Accountant menu — what
+  // customers owe, from Zoho Inventory. Nobody else holds acct:* (admin
+  // sees it through *:*:*). Since 2026-10-05 also InFlow — view orders and
+  // customers, and record payments (inflow:order:payment, otherwise
+  // Admin-only); no creating orders, no customer portal logins — and the
+  // whole Refurbished Device menu: stock, sales, supply batches, repairs
+  // (view + manage) and Consignment. Not refurb:offer:view (the ExEngine
+  // scraper data) and not refurb:incoming:manage (Incoming Stocks stays
+  // Admin / iMobile Admin).
+  [ROLES.IMOBILE_ACCOUNTANT]: [
+    "acct:*:*",
+    "inflow:order:view", "inflow:customer:view", "inflow:order:payment",
+    "refurb:stock:view", "refurb:stock:manage",
+    "refurb:sale:view", "refurb:sale:manage",
+    "refurb:supply:view", "refurb:supply:manage",
+    "refurb:repair:view", "refurb:repair:manage",
+    "consign:*:*",
+  ],
+  // iMobile Warehouse (2026-10-05): full access inside four menus —
+  // iMobile Spare Parts (stock + price monitoring, collections, catalogue,
+  // edits included), Spare Parts Purchase (the whole module), InFlow orders
+  // (view + create) and customers, and Tools. Tools' backend needs
+  // zoho:salesOrder:create, which also opens iMobile → Credit Note and
+  // Special Order (the user agreed). InFlow payments (inflow:order:payment)
+  // and customer portal logins (inflow:portal:manage) stay Admin-only. The
+  // Tools menu itself is role-gated in the frontend router (meta.roles).
+  [ROLES.IMOBILE_WAREHOUSE]: [
+    "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create",
+    "spp:*:*",
+    "inflow:order:view", "inflow:order:create", "inflow:customer:view",
+  ],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
