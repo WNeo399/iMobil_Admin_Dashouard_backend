@@ -191,8 +191,10 @@ const ROLE_PERMISSIONS = {
   // Special Order (the user agreed). InFlow payments (inflow:order:payment)
   // and customer portal logins (inflow:portal:manage) stay Admin-only. The
   // Tools menu itself is role-gated in the frontend router (meta.roles).
+  // zoho:purchaseOrder:create is the Create Purchase Order tool (2026-10-05)
+  // — every role with Tools gets it, so no card on that page is a dead end.
   [ROLES.IMOBILE_WAREHOUSE]: [
-    "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create",
+    "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create", "zoho:purchaseOrder:create",
     "spp:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
   ],
@@ -204,7 +206,8 @@ const ROLE_PERMISSIONS = {
   // whole Refurbished Device menu like iMobile Accountant (not the ExEngine
   // scraper data or Incoming Stocks), and Tools (zoho:salesOrder:create —
   // also opens Credit Note / Special Order; the user agreed). The Tools menu
-  // itself is role-gated in the frontend router (meta.roles).
+  // itself is role-gated in the frontend router (meta.roles). Tools also
+  // brings zoho:purchaseOrder:create (the Create Purchase Order tool).
   [ROLES.IMOBILE_FRONT_DESK]: [
     "sqt:*:*",
     "inflow:order:view", "inflow:customer:view", "inflow:order:create", "inflow:order:payment",
@@ -213,16 +216,13 @@ const ROLE_PERMISSIONS = {
     "refurb:supply:view", "refurb:supply:manage",
     "refurb:repair:view", "refurb:repair:manage",
     "consign:*:*",
-    "zoho:salesOrder:create",
+    "zoho:salesOrder:create", "zoho:purchaseOrder:create",
   ],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
 const SHOP_SCOPED_ROLES = [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP];
 
-function isValidRole(role) {
-  return Object.values(ROLES).includes(role);
-}
 // Roles one account may hold TOGETHER (user ask 2026-10-05: "multiple roles,
 // staff roles only"). An account's roles live in `roles` on the user record,
 // main role first; `role` stays as that main role, and a record without
@@ -241,10 +241,10 @@ const COMBINABLE_ROLES = [
   ROLES.IMOBILE_FRONT_DESK,
 ];
 
-
-function getPermissionsForRole(role) {
-  return ROLE_PERMISSIONS[role] ? [...ROLE_PERMISSIONS[role]] : [];
+function isValidRole(role) {
+  return Object.values(ROLES).includes(role);
 }
+
 function isCombinableRole(role) {
   return COMBINABLE_ROLES.includes(role);
 }
@@ -273,15 +273,18 @@ function rolesOfUser(user) {
   return all;
 }
 
-
-function isShopScopedRole(role) {
-  return SHOP_SCOPED_ROLES.includes(role);
+function getPermissionsForRole(role) {
+  return ROLE_PERMISSIONS[role] ? [...ROLE_PERMISSIONS[role]] : [];
 }
+
 // Everything any of the roles allows.
 function getPermissionsForRoles(roles) {
   return [...new Set((roles || []).flatMap((r) => ROLE_PERMISSIONS[r] || []))];
 }
 
+function isShopScopedRole(role) {
+  return SHOP_SCOPED_ROLES.includes(role);
+}
 
 // Does `granted` (a single permission string, possibly with wildcards) cover
 // the `required` permission? Compares segment-by-segment.
@@ -308,14 +311,14 @@ module.exports = {
   ROLE_GROUP_OF,
   ROLE_PERMISSIONS,
   SHOP_SCOPED_ROLES,
-  isValidRole,
-  getPermissionsForRole,
-  isShopScopedRole,
   COMBINABLE_ROLES,
-  permissionMatches,
+  isValidRole,
   isCombinableRole,
   roleSetError,
   rolesOfUser,
-  hasPermission,
+  getPermissionsForRole,
   getPermissionsForRoles,
+  isShopScopedRole,
+  permissionMatches,
+  hasPermission,
 };

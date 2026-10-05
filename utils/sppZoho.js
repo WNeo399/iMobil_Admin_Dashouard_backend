@@ -155,4 +155,4 @@ async function cancelBatchPurchaseOrders(batch) {
   return failed;
 }
 
-module.exports = { createBatchPurchaseOrders, cancelBatchPurchaseOrders, loadVendors, ZOHO_VENDORS, vendorById };
+module.exports = { createBatchPurchaseOrders, cancelBatchPurchaseOrders, loadVendors, gstTaxId, ZOHO_VENDORS, vendorById };

@@ -2,6 +2,7 @@ var express = require("express");
 var router = express.Router();
 var productRouter = require("./product/index");
 var salesOrderRouter = require("./salesOrder/index");
+var purchaseOrderRouter = require("./purchaseOrder/index");
 var buzztechRouter = require("./buzztech/index");
 var locationRouter = require("./location/index");
 const { ObjectId } = require("mongodb");
@@ -17,6 +18,7 @@ router.get("/", function (req, res, next) {
 
 router.use("/product", productRouter);
 router.use("/salesOrder", salesOrderRouter);
+router.use("/purchaseOrder", purchaseOrderRouter);
 router.use("/buzztech", buzztechRouter);
 router.use("/location", locationRouter);
 
