@@ -1467,11 +1467,16 @@ router.get("/item/:itemId/sales-trend", VIEW, async (req, res) => {
 });
 
 // ── GET /stock-monitor/item/:itemId/prices ──────────────────────────
-// The four price-list rates for one item, read live from the Analytics
-// prices view — the Price Monitoring page's "check live" button. One call;
-// fresher than the nightly refresh (Analytics itself syncs from Inventory
-// within a few hours of a price push).
-const PRICES_VIEW_ID = "1404913000003936194";
+// The four price-list rates and the cost for one item, read live from Zoho
+// Inventory — the Price Monitoring page's "check live" button. Zoho Analytics
+// (the refresh's source) lags Inventory by hours, so a price set in Zoho the
+// same morning stayed "missing" (user, 2026-10-05); this reads Inventory
+// itself: the item record once per price list (`?pricebook_id=` makes Zoho
+// return that list's rate — `price_brackets` is empty when the item has no
+// entry in the list), 4 calls, one at a time. The answer is then written into
+// the register row with the flags recomputed, like a price push, so the fix
+// sticks until the next refresh catches up.
+//   reply { prices: { platinum, vip, svip, wholesale }, purchasePrice, flags, flagsSeq }
 const PRICE_LISTS = {
   platinum: "2591985000001439015",
   vip: "2591985000000103001",
@@ -1485,30 +1490,50 @@ router.get("/item/:itemId/prices", VIEW, async (req, res) => {
     return res.status(400).json({ success: false, message: "Bad item id" });
   }
   try {
-    const rows = await getViewData(
-      `https://analyticsapi.zoho.com/restapi/v2/workspaces/${ANALYTICS_WORKSPACE_ID}` +
-        `/views/${PRICES_VIEW_ID}/data?CONFIG=` +
-        encodeURIComponent(
-          JSON.stringify({
-            responseFormat: "json",
-            selectedColumns: ["PriceList ID", "Product ID", "PriceList Rate"],
-            criteria: `"Product ID" = '${itemId}'`,
-          }),
-        ),
-    );
-    if (!Array.isArray(rows)) {
-      throw new Error("prices view returned " + JSON.stringify(rows).slice(0, 120));
-    }
-    const money = (raw) => {
-      const n = parseFloat(String(raw == null ? "" : raw).replace(/[^0-9.]/g, ""));
-      return Number.isFinite(n) ? n : null;
-    };
-    const byList = new Map(rows.map((r) => [String(r["PriceList ID"]), r["PriceList Rate"]]));
     const prices = {};
+    let purchasePrice = null;
     for (const [key, listId] of Object.entries(PRICE_LISTS)) {
-      prices[key] = byList.has(listId) ? money(byList.get(listId)) : null;
+      const r = await handleZohoInventoryRequest(
+        `https://www.zohoapis.com/inventory/v1/items/${itemId}?organization_id=${ZOHO_ORG_ID}&pricebook_id=${listId}`,
+      );
+      const it = r && r.item;
+      if (!it) throw new Error(`item read (${key}) gave ${JSON.stringify(r).slice(0, 120)}`);
+      const brackets = Array.isArray(it.price_brackets) ? it.price_brackets : [];
+      const rate = brackets.length ? Number(it.pricebook_rate != null ? it.pricebook_rate : brackets[0].pricebook_rate) : null;
+      prices[key] = Number.isFinite(rate) ? Math.round(rate * 100) / 100 : null;
+      const cost = Number(it.purchase_rate);
+      purchasePrice = Number.isFinite(cost) ? Math.round(cost * 100) / 100 : 0;
     }
-    return res.json({ success: true, prices });
+
+    // Into the register: the rates and cost, and everything that hangs on
+    // them (health flags, the formula's rule / reference prices / verdict).
+    const db = await connectToDatabase();
+    const mirrored = await withItemLock(itemId, async () => {
+      const row = await db.collection(ITEMS).findOne(
+        { itemId },
+        { projection: { name: 1, category: 1, classification: 1, quality: 1 } },
+      );
+      if (!row) return null;
+      const set = {
+        pricePlatinum: prices.platinum,
+        priceVip: prices.vip,
+        priceSvip: prices.svip,
+        priceWholesale: prices.wholesale,
+        purchasePrice,
+      };
+      Object.assign(row, set);
+      const rule = evaluatePriceRule(row);
+      const flags = { ...priceHealthFlags(row), priceRuleBroken: rule.broken, priceRule: rule.rule, priceExpected: rule.expected };
+      await db.collection(ITEMS).updateOne({ itemId }, { $set: { ...set, ...flags } });
+      return { flags, seq: ++mirrorSeq };
+    });
+    return res.json({
+      success: true,
+      prices,
+      purchasePrice,
+      flags: mirrored ? mirrored.flags : null,
+      flagsSeq: mirrored ? mirrored.seq : null,
+    });
   } catch (error) {
     console.error("Stock monitor live prices error:", error && error.message);
     return res.status(502).json({
