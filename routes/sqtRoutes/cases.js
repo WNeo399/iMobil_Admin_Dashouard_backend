@@ -195,8 +195,9 @@ async function resolveModel(db, modelId) {
   return db.collection("sqt_models").findOne({ _id: new ObjectId(modelId) });
 }
 
-// Roles allowed to use the shop-group filter on /list and /counts.
-const GROUP_FILTER_ROLES = ["admin", "techelite-admin"];
+// Roles allowed to use the shop-group filter on /list and /counts (iMobile
+// Front Desk works SQT like TechElite Admin, 2026-10-05).
+const GROUP_FILTER_ROLES = ["admin", "techelite-admin", "imobile-front-desk"];
 
 // ── Shop data scoping ────────────────────────────────────────────────────────
 // req.user.accessibleShopIds is null for unscoped roles (Admin / iMobile /

@@ -27,6 +27,8 @@ const ROLES = {
   IMOBILE_ACCOUNTANT: "imobile-accountant",
   // Warehouse staff — iMobile Spare Parts, Spare Parts Purchase, InFlow and Tools.
   IMOBILE_WAREHOUSE: "imobile-warehouse",
+  // Front desk staff — SQT (like TechElite Admin), InFlow, Refurbished Device and Tools.
+  IMOBILE_FRONT_DESK: "imobile-front-desk",
 };
 
 const ROLE_LABELS = {
@@ -43,6 +45,7 @@ const ROLE_LABELS = {
   [ROLES.PARTS_SUPPLIER]: "Parts Supplier",
   [ROLES.IMOBILE_ACCOUNTANT]: "iMobile Accountant",
   [ROLES.IMOBILE_WAREHOUSE]: "iMobile Warehouse",
+  [ROLES.IMOBILE_FRONT_DESK]: "iMobile Front Desk",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -76,6 +79,7 @@ const ROLE_GROUP_OF = {
   [ROLES.PARTS_SUPPLIER]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_ACCOUNTANT]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_WAREHOUSE]: ROLE_GROUPS.IMOBILE,
+  [ROLES.IMOBILE_FRONT_DESK]: ROLE_GROUPS.IMOBILE,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -191,6 +195,25 @@ const ROLE_PERMISSIONS = {
     "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create",
     "spp:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
+  ],
+  // iMobile Front Desk (2026-10-05): SQT like TechElite Admin (every action,
+  // and the admin-side view the frontend / the group filter give by role:
+  // SQT_ADMIN_SIDE_ROLES in sqt/cases, GROUP_FILTER_ROLES in sqtRoutes/cases;
+  // not the Admin-only Service Report or Shops → Users), InFlow view +
+  // create orders + record payments (portal logins stay Admin-only), the
+  // whole Refurbished Device menu like iMobile Accountant (not the ExEngine
+  // scraper data or Incoming Stocks), and Tools (zoho:salesOrder:create —
+  // also opens Credit Note / Special Order; the user agreed). The Tools menu
+  // itself is role-gated in the frontend router (meta.roles).
+  [ROLES.IMOBILE_FRONT_DESK]: [
+    "sqt:*:*",
+    "inflow:order:view", "inflow:customer:view", "inflow:order:create", "inflow:order:payment",
+    "refurb:stock:view", "refurb:stock:manage",
+    "refurb:sale:view", "refurb:sale:manage",
+    "refurb:supply:view", "refurb:supply:manage",
+    "refurb:repair:view", "refurb:repair:manage",
+    "consign:*:*",
+    "zoho:salesOrder:create",
   ],
 };
 
