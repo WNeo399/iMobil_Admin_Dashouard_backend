@@ -226,7 +226,7 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
 
     // Stock source — a phone supplier's stock comes from somewhere, and
     // that's the source stamped on the refurbished devices they add.
-    if (role === "phone-supplier") {
+    if (roles.includes("phone-supplier")) {
       doc.stockSource = normalizeStockSource(req.body.stockSource) || null;
     }
 
@@ -268,10 +268,10 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     }
     if (req.body.active !== undefined) update.active = !!req.body.active;
 
-    // The role list (main role first). Everything role-specific below goes
-    // by the main role: only staff roles combine, and none of them carries
-    // shops, a stock source or an InFlow customer.
-    let effectiveRole = rolesOfUser(existing)[0];
+    // The role list (main role first). Shops and the InFlow customer go by
+    // the main role — the roles that carry them are never combined. The
+    // stock source goes by HOLDING Phone Supplier, which can be.
+    let effectiveRoles = rolesOfUser(existing);
     const nextRoles = rolesFromBody(req.body);
     const rolesChanged = nextRoles !== null;
     if (rolesChanged) {
@@ -281,8 +281,9 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
       }
       update.role = nextRoles[0];
       update.roles = nextRoles;
-      effectiveRole = nextRoles[0];
+      effectiveRoles = nextRoles;
     }
+    const effectiveRole = effectiveRoles[0];
 
     // Keep shopIds consistent with the (effective) role — incl. enforcing
     // the max-1 rule for repair-shop. We use the existing shopIds when the
@@ -295,7 +296,7 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
 
     // Stock source — only meaningful for the phone-supplier role. Cleared on
     // a move off that role so a stale source can't be stamped later.
-    if (effectiveRole === "phone-supplier") {
+    if (effectiveRoles.includes("phone-supplier")) {
       if (req.body.stockSource !== undefined) {
         update.stockSource = normalizeStockSource(req.body.stockSource) || null;
       }
@@ -333,7 +334,7 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     // Guard: an admin can't demote or deactivate their own account (avoids
     // accidentally locking the last admin out).
     const isSelf = String(req.user._id) === String(id);
-    if (isSelf && (update.role && update.role !== ROLES.ADMIN)) {
+    if (isSelf && update.roles && !update.roles.includes(ROLES.ADMIN)) {
       return res
         .status(400)
         .json({ success: false, message: "You cannot change your own role" });

@@ -17,7 +17,8 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
-const { stockSourceForUser } = require("./stockSource");
+const { normalizeStockSource } = require("./stockSource");
+const { userHasRole } = require("../../constants/roles");
 
 const VIEW = requirePermission("refurb:stock:view");
 const MANAGE = requirePermission("refurb:stock:manage");
@@ -33,13 +34,14 @@ function str(v, cap) {
 
 // The page is for phone suppliers only, and their stock source is the
 // scope for everything below. Staff roles are refused outright — this
-// list is the suppliers' own address book, not ours.
+// list is the suppliers' own address book, not ours. An account that holds
+// Phone Supplier among several roles keeps its address book.
 function supplierScope(req, res) {
-  if (!req.user || req.user.role !== "phone-supplier") {
+  if (!userHasRole(req.user, "phone-supplier")) {
     res.status(403).json({ success: false, message: "Suppliers are managed by phone-supplier accounts" });
     return null;
   }
-  const src = stockSourceForUser(req.user);
+  const src = normalizeStockSource(req.user.stockSource);
   if (!src) {
     res.status(400).json({
       success: false,

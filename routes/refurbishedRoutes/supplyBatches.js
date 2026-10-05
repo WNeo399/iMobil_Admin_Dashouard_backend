@@ -32,6 +32,7 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { actsAsPhoneSupplier } = require("../../constants/roles");
 const {
   STATUS_IN_STOCK,
   STATUS_NOT_RECEIVED,
@@ -59,7 +60,7 @@ function actor(req) {
 // Same shelf-scoping rule as the Stock page: a supplier works their own
 // stock source; staff are unscoped (null).
 function supplierSource(user) {
-  if (!user || user.role !== "phone-supplier") return null;
+  if (!actsAsPhoneSupplier(user)) return null;
   return stockSourceForUser(user) || " unassigned";
 }
 
@@ -155,7 +156,7 @@ async function applyDeviceUpdates(db, req, devices, rawUpdates) {
   const updates = Array.isArray(rawUpdates) ? rawUpdates : [];
   if (!updates.length) return null;
   const byId = new Map(devices.map((d) => [String(d._id), d]));
-  const isSupplierUser = req.user && req.user.role === "phone-supplier";
+  const isSupplierUser = actsAsPhoneSupplier(req.user);
   const who = actor(req);
   const now = new Date();
 
@@ -321,7 +322,7 @@ router.get("/:id", VIEW, async (req, res) => {
     // line carries `price` and costPrice is dropped. A unit that has left
     // the register falls back to the snapshot taken when the batch was
     // confirmed — their charge at the time they sent it.
-    const forSupplier = req.user && req.user.role === "phone-supplier";
+    const forSupplier = actsAsPhoneSupplier(req.user);
     const lines = (batch.lines || []).map((l) => {
       const d = liveById.get(String(l.deviceId));
       const live = d

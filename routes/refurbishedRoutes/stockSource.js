@@ -6,6 +6,10 @@
 // received against an incoming batch it's the source chosen when that batch
 // was uploaded. Either way it is never taken from a request body — a client
 // can't file stock under someone else's source.
+// "A phone supplier" below is an account WORKING as one — see
+// actsAsPhoneSupplier (an account can hold several roles).
+const { actsAsPhoneSupplier } = require("../../constants/roles");
+
 const STOCK_SOURCES = ["HK", "iMobile", "DICO", "Exyon"];
 const DEFAULT_STOCK_SOURCE = "iMobile";
 
@@ -17,7 +21,7 @@ function normalizeStockSource(v, fallback = "") {
 }
 
 function stockSourceForUser(user) {
-  if (user && user.role === "phone-supplier") {
+  if (actsAsPhoneSupplier(user)) {
     return normalizeStockSource(user.stockSource);
   }
   return DEFAULT_STOCK_SOURCE;
@@ -36,7 +40,7 @@ const LOCATION_SENDING_IMOBILE = "Sending to iMobile";
 const RECEIVE_LOCATIONS = [LOCATION_IMOBILE, LOCATION_EXYON];
 
 function locationForUser(user) {
-  if (user && user.role === "phone-supplier") {
+  if (actsAsPhoneSupplier(user)) {
     // Named after the supplier, not a generic shelf — "DICO" says where the
     // unit physically sits in a way "Supplier Stock" never did.
     return normalizeStockSource(user.stockSource) || LOCATION_SUPPLIER;

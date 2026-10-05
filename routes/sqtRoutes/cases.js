@@ -843,7 +843,7 @@ router.post(
 // this, because TechElite Admin's sqt:*:* would match any sqt permission.
 router.post("/review-unrepairable/:id", async (req, res) => {
   try {
-    if (!req.user || req.user.role !== "admin") {
+    if (!req.user || !(req.user.roles || [req.user.role]).includes("admin")) {
       return res.status(403).json({ success: false, message: "Only an admin can review unrepairable cases" });
     }
     const { id } = req.params;

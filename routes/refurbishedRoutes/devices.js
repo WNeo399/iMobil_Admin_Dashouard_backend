@@ -18,6 +18,7 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { actsAsPhoneSupplier } = require("../../constants/roles");
 const blackbelt = require("../../utils/blackbelt");
 const {
   stockSourceForUser,
@@ -37,7 +38,7 @@ const MANAGE = requirePermission("refurb:stock:manage");
 // supplier with no source assigned scopes to a value no device carries, so
 // they see an empty register rather than someone else's.
 function supplierSource(user) {
-  if (!user || user.role !== "phone-supplier") return null;
+  if (!actsAsPhoneSupplier(user)) return null;
   return stockSourceForUser(user) || "\u0000unassigned";
 }
 // 404, not 403 — a device outside the supplier's scope should read as
@@ -235,7 +236,7 @@ router.get("/", VIEW, async (req, res) => {
     // Our AUD landed cost stays internal, same as consignment hides
     // costPrice from shops — including for a unit they never priced,
     // where they see nothing rather than our figure.
-    const supplierView = req.user && req.user.role === "phone-supplier";
+    const supplierView = actsAsPhoneSupplier(req.user);
     const hasSupplierPrice = { $gt: ["$supplierPrice", null] };
     const stillTheirs = { $in: ["$status", SUPPLIER_OWNED_STATUSES] };
     const [total, rows, checkedCount, valueAgg] = await Promise.all([
@@ -640,7 +641,7 @@ router.post("/", MANAGE, async (req, res) => {
     if (!CODE_RE.test(imei)) {
       return res.status(400).json({ success: false, message: CODE_HINT });
     }
-    if (req.user && req.user.role === "phone-supplier" && !stockSourceForUser(req.user)) {
+    if (actsAsPhoneSupplier(req.user) && !stockSourceForUser(req.user)) {
       return res.status(400).json({
         success: false,
         message: "Your account has no stock source assigned — ask an admin to set it first",
@@ -656,7 +657,7 @@ router.post("/", MANAGE, async (req, res) => {
     // id + name snapshot.
     let supplierRef = null;
     const supplierId = req.body && req.body.supplierId;
-    if (supplierId && req.user && req.user.role === "phone-supplier") {
+    if (supplierId && actsAsPhoneSupplier(req.user)) {
       if (!ObjectId.isValid(String(supplierId))) {
         return res.status(400).json({ success: false, message: "Bad supplier id" });
       }
@@ -673,7 +674,7 @@ router.post("/", MANAGE, async (req, res) => {
     const built = buildDevice(req.body || {});
     // A price a supplier records is what they charge us — kept as their
     // figure from the start, so receiving the unit can't lose it.
-    if (req.user && req.user.role === "phone-supplier" && built.costPrice != null) {
+    if (actsAsPhoneSupplier(req.user) && built.costPrice != null) {
       built.supplierPrice = built.costPrice;
       built.supplierCurrency = built.currency || DEFAULT_CURRENCY;
     }
@@ -688,7 +689,7 @@ router.post("/", MANAGE, async (req, res) => {
       // starts With Supplier and only becomes In Stock by arriving
       // through a supply batch.
       status:
-        req.user && req.user.role === "phone-supplier" ? STATUS_WITH_SUPPLIER : "In Stock",
+        actsAsPhoneSupplier(req.user) ? STATUS_WITH_SUPPLIER : "In Stock",
       history: [historyEntry(req.user, "created")],
       createdAt: now,
       updatedAt: now,
@@ -798,7 +799,7 @@ router.put("/:id", MANAGE, async (req, res) => {
     // from the device view — validated against their own scoped list,
     // '' clears it, same rules as the create and supply-batch paths.
     // Other roles never touch the field through this route.
-    if (req.user && req.user.role === "phone-supplier" && req.body && req.body.supplierId !== undefined) {
+    if (actsAsPhoneSupplier(req.user) && req.body && req.body.supplierId !== undefined) {
       const wantedId = req.body.supplierId == null ? "" : String(req.body.supplierId);
       const currentId = existing.supplier ? String(existing.supplier.id) : "";
       if (wantedId !== currentId) {
@@ -825,7 +826,7 @@ router.put("/:id", MANAGE, async (req, res) => {
     // While the unit is still on their shelf the register's costPrice is
     // that same figure and keeps following it; after receiving, our cost
     // is not theirs to change.
-    if (req.user && req.user.role === "phone-supplier") {
+    if (actsAsPhoneSupplier(req.user)) {
       const stillTheirUnit = SUPPLIER_OWNED_STATUSES.includes(existing.status);
       if (set.costPrice !== undefined) {
         set.supplierPrice = set.costPrice;

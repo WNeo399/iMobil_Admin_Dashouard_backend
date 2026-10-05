@@ -223,23 +223,19 @@ const ROLE_PERMISSIONS = {
 // Roles whose data is scoped to the shops listed on their user record.
 const SHOP_SCOPED_ROLES = [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP];
 
-// Roles one account may hold TOGETHER (user ask 2026-10-05: "multiple roles,
-// staff roles only"). An account's roles live in `roles` on the user record,
-// main role first; `role` stays as that main role, and a record without
-// `roles` simply holds `[role]` — so nothing had to be migrated. Admin is
-// left out (it already holds everything), and so is every outside-facing
-// role: each of those narrows the account to its own shop / supplier /
-// customer, and code all over checks them with `req.user.role === …` — they
-// stay an account's ONLY role.
-const COMBINABLE_ROLES = [
-  ROLES.IMOBILE_ADMIN,
-  ROLES.IMOBILE_REPAIR_ADMIN,
-  ROLES.TECHELITE_ADMIN,
-  ROLES.IMOBILE_PURCHASE,
-  ROLES.IMOBILE_ACCOUNTANT,
-  ROLES.IMOBILE_WAREHOUSE,
-  ROLES.IMOBILE_FRONT_DESK,
-];
+// Roles one account may hold TOGETHER (user 2026-10-05): the roles under
+// iMobile in the Users page's role tree — Admin, iMobile Admin, iMobile
+// Repair Admin, Phone Supplier, iMobile Purchase, Parts Supplier, iMobile
+// Accountant, iMobile Warehouse, iMobile Front Desk — with each other. An
+// account's roles live in `roles` on the user record, main role first;
+// `role` stays as that main role, and a record without `roles` simply
+// holds `[role]` — so nothing had to be migrated. The roles of the other
+// groups (TechElite, InFlow, Consignment) stay an account's ONLY role: the
+// shop / customer ones narrow the account to its own shops or customer, and
+// code checks them with `req.user.role === …`.
+const COMBINABLE_ROLES = Object.values(ROLES).filter(
+  (r) => ROLE_GROUP_OF[r] === ROLE_GROUPS.IMOBILE,
+);
 
 function isValidRole(role) {
   return Object.values(ROLES).includes(role);
@@ -256,15 +252,15 @@ function roleSetError(roles) {
   if (roles.length > 1) {
     const single = roles.filter((r) => !isCombinableRole(r));
     if (single.length) {
-      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only staff roles can`;
+      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile can`;
     }
   }
   return null;
 }
 
 // The roles a user record holds, main role first. A stored list that breaks
-// the staff-only rule (it can only get there by hand) falls back to the main
-// role alone, so an outside-facing role is never widened.
+// the iMobile-only rule (it can only get there by hand) falls back to the
+// main role alone, so a shop / customer role is never widened.
 function rolesOfUser(user) {
   if (!user) return [];
   const extra = Array.isArray(user.roles) ? user.roles : [];
@@ -280,6 +276,27 @@ function getPermissionsForRole(role) {
 // Everything any of the roles allows.
 function getPermissionsForRoles(roles) {
   return [...new Set((roles || []).flatMap((r) => ROLE_PERMISSIONS[r] || []))];
+}
+
+// Does the user (req.user, or a user record) hold this role — as its main
+// role or any other?
+function userHasRole(user, role) {
+  return rolesOfUser(user).includes(role);
+}
+
+// Is the user working as a PHONE SUPPLIER on the Refurbished Device pages —
+// narrowed to the stock source on their record, with the supplier's view of
+// a device? Yes when they hold that role and none of their OTHER roles opens
+// the stock register by itself: an account's roles add up, so a Phone
+// Supplier who is also Admin / iMobile Admin / Accountant / Front Desk works
+// the whole register like any staff member, while Phone Supplier + Parts
+// Supplier (or Purchase, Warehouse…) stays on its own shelf.
+function actsAsPhoneSupplier(user) {
+  const roles = rolesOfUser(user);
+  if (!roles.includes(ROLES.PHONE_SUPPLIER)) return false;
+  return !roles.some(
+    (r) => r !== ROLES.PHONE_SUPPLIER && hasPermission(ROLE_PERMISSIONS[r] || [], "refurb:stock:view"),
+  );
 }
 
 function isShopScopedRole(role) {
@@ -316,6 +333,8 @@ module.exports = {
   isCombinableRole,
   roleSetError,
   rolesOfUser,
+  userHasRole,
+  actsAsPhoneSupplier,
   getPermissionsForRole,
   getPermissionsForRoles,
   isShopScopedRole,
