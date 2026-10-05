@@ -68,7 +68,10 @@ async function notifyRoles(db, roles, payload) {
   );
 }
 
-const RETURN_TRACKER_ROLES = [ROLES.ADMIN, ROLES.TECHELITE_ADMIN];
+// The admin-side SQT roles — iMobile Front Desk works SQT like TechElite
+// Admin and gets its notifications too (user ask 2026-10-05).
+const SQT_ADMIN_SIDE_ROLES = [ROLES.ADMIN, ROLES.TECHELITE_ADMIN, ROLES.IMOBILE_FRONT_DESK];
+const RETURN_TRACKER_ROLES = SQT_ADMIN_SIDE_ROLES;
 
 // Unrepairable / BER / Cancelled all activate return tracking — tell the people
 // who chase returns what needs to come back. No-op if nothing's returnable.
@@ -128,9 +131,10 @@ const NOTIFY_ON_STATUS = {
     },
   },
   // A shop has asked for more parts on an in-progress case — tell the people
-  // who dispatch parts (Admin + TechElite Admin), with the requested-parts note.
+  // who dispatch parts (Admin, TechElite Admin, iMobile Front Desk), with the
+  // requested-parts note.
   "require-extra-parts": {
-    audience: { kind: "roles", roles: [ROLES.ADMIN, ROLES.TECHELITE_ADMIN] },
+    audience: { kind: "roles", roles: SQT_ADMIN_SIDE_ROLES },
     build: (c) => {
       const last =
         Array.isArray(c.statusHistory) && c.statusHistory.length
