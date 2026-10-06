@@ -193,8 +193,11 @@ const ROLE_PERMISSIONS = {
   // Tools menu itself is role-gated in the frontend router (meta.roles).
   // zoho:purchaseOrder:create is the Create Purchase Order tool (2026-10-05)
   // — every role with Tools gets it, so no card on that page is a dead end.
+  // svp:*:* is Serials Lookup (2026-10-06): the genuine-serial list and the
+  // customer enquiries, which moved into the iMobile Spare Parts menu.
   [ROLES.IMOBILE_WAREHOUSE]: [
     "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create", "zoho:purchaseOrder:create",
+    "svp:*:*",
     "spp:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
   ],
