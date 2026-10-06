@@ -79,6 +79,12 @@ const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Batt
 const CHANNELS = ["海运", "Special Order", "New Product"];
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
+// A New Product line (user rule 2026-10-06) is not in Zoho yet: the supplier
+// quotes it first, the quote parks it in To Confirm, and only once iMobile
+// confirms it is it placed, put on an order batch or shipped like any other
+// line. Until then it "awaits a quote".
+const NEW_PRODUCT = "New Product";
+const awaitsQuote = (r) => !!r && r.category === NEW_PRODUCT && ["pending", "shortage"].includes(r.status) && !r.confirmed;
 // The register's say on a line's item: its classification as a module
 // category (blank / unknown → Other) and its image id.
 async function registerFacts(db, itemId) {
@@ -264,7 +270,7 @@ router.get("/orders/open-lines", BATCH_VIEW, async (req, res, next) => {
       .limit(search ? 300 : 3000)
       .toArray();
     rows.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
-    return res.json({ success: true, rows });
+    return res.json({ success: true, rows: rows.filter((r) => !awaitsQuote(r)) });
   } catch (error) {
     next(error);
   }
@@ -283,7 +289,7 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
       .collection(ORDERS)
       .find({ status: { $in: ["ordered", "pending"] }, sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { history: 0 } })
       .toArray();
-    const candidates = rows.filter((r) => !exclude.has(String(r._id)));
+    const candidates = rows.filter((r) => !exclude.has(String(r._id)) && !awaitsQuote(r));
     if (!candidates.length) return res.json({ success: true, match: null, hadWaiting: rows.length > 0 });
     candidates.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
     return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1 });
@@ -434,19 +440,20 @@ async function transition(req, res, next, { from, to, action, build }) {
 
 // A quote — the price the supplier can get it for. Does not move the line,
 // unless asked to park it in To Confirm with the quote (a price iMobile has
-// to agree to first).
+// to agree to first). A New Product awaiting its quote always parks there.
+const parksOnQuote = (rec, b) => (b.toConfirm || awaitsQuote(rec)) && rec.status !== "toConfirm";
 router.post("/orders/:id/quote", SUPPLY, (req, res, next) =>
   transition(req, res, next, {
     from: ["pending", "shortage", "ordered", "toConfirm"],
-    to: (rec, b) => (b.toConfirm && rec.status !== "toConfirm" ? "toConfirm" : null),
+    to: (rec, b) => (parksOnQuote(rec, b) ? "toConfirm" : null),
     action: "quoted",
     build: (rec, b) => {
       const price = num(b.unitPrice);
       if (price == null || price < 0) return { error: "Unit price must be 0 or more" };
       const set = { quotedPrice: round2(price) };
       const detail = { quotedPrice: round2(price) };
-      if (b.toConfirm && rec.status !== "toConfirm") {
-        const note = str(b.note);
+      if (parksOnQuote(rec, b)) {
+        const note = str(b.note) || (awaitsQuote(rec) ? `New product quoted ¥${round2(price).toFixed(2)} — confirm to order` : "");
         set.confirmFrom = rec.status;
         set.confirmNote = note;
         detail.toConfirm = true;
@@ -510,6 +517,7 @@ router.post("/orders/:id/to-confirm", CREATE_OR_SUPPLY, (req, res, next) =>
     to: "toConfirm",
     action: "toConfirm",
     build: (rec, b) => {
+      if (awaitsQuote(rec) && rec.quotedPrice == null) return { error: "Quote this new product first — the quote moves it to To Confirm" };
       const note = str(b.note);
       if (!note) return { error: "Say what needs confirming" };
       // parked again: an earlier Confirmed mark no longer applies
@@ -527,6 +535,7 @@ router.post("/orders/:id/confirm", CREATE_OR_SUPPLY, (req, res, next) =>
     to: "pending",
     action: "confirmed",
     build: (rec, b, by) => {
+      if (rec.category === NEW_PRODUCT && rec.quotedPrice == null) return { error: "Quote this new product before confirming it" };
       const note = str(b.note);
       return {
         set: {
@@ -549,6 +558,7 @@ router.post("/orders/:id/place", SUPPLY, (req, res, next) =>
     to: "ordered",
     action: "ordered",
     build: (rec, b, by) => {
+      if (awaitsQuote(rec)) return { error: "A new product is quoted and confirmed before it is ordered" };
       const supplier = str(b.supplier);
       if (!supplier) return { error: "Supplier is required" };
       const set = { supplier, orderedAt: new Date(), orderedBy: by, shortageNote: "" };
@@ -656,7 +666,7 @@ const orderBatchLine = (r) => ({
   note: r.note || "",
   unitPrice: null,
 });
-const placeable = (r) => r && (r.status === "pending" || r.status === "shortage");
+const placeable = (r) => r && (r.status === "pending" || r.status === "shortage") && !awaitsQuote(r);
 const qtyOf = (lines) => lines.reduce((t, l) => t + (l.orderQty || 0), 0);
 
 // The draft's lines from the picked ids: still pending / shortage and not
@@ -1213,6 +1223,7 @@ async function shipBatch(db, req, b, draft) {
     if (rec.status !== "ordered" && rec.status !== "pending") {
       return { error: `${rec.sku || rec.orderNo} is ${rec.status}; only ordered or pending lines can ship` };
     }
+    if (awaitsQuote(rec)) return { error: `${rec.productName || rec.orderNo}: a new product is quoted and confirmed before it ships` };
     if (rec.status === "pending" && !p.supplier && !rec.supplier) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
     // The price may be left off when placing, but every shipped line must
     // carry one — from the batch form or already on the line.
