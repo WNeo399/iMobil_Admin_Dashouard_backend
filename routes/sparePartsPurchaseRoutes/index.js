@@ -1044,8 +1044,17 @@ router.get("/batches/:id", BATCH_VIEW, async (req, res, next) => {
   }
 });
 
+// The freight for the parcel (CNY), typed on the batch form — optional. It
+// goes on the batch's Zoho PO as its own line (utils/sppZoho). Blank = none.
+function shippingCostOf(b) {
+  if (!hasVal(b.shippingCost)) return { value: null };
+  const n = num(b.shippingCost);
+  if (n == null || n < 0) return { error: "Shipping cost must be 0 or more" };
+  return { value: round2(n) };
+}
+
 // A draft batch is the Create Batch form saved for later: lines with or
-// without a quantity, tracking, date, note. Nothing ships and no PB number
+// without a quantity, tracking, date, note, shipping cost. Nothing ships and no PB number
 // is issued until it is shipped — its lines stay ordered / pending and can
 // still board another batch (the ship step re-checks them).
 async function draftPayload(db, b) {
@@ -1089,8 +1098,10 @@ async function draftPayload(db, b) {
       unitPrice: p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : rec.quotedPrice != null ? rec.quotedPrice : null,
     });
   }
+  const ship = shippingCostOf(b);
+  if (ship.error) return { error: ship.error };
   const vendor = vendorById(b.zohoVendorId);
-  return { lines, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
+  return { lines, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
 }
 
 // Straight away, or a saved draft
@@ -1176,6 +1187,10 @@ async function shipBatch(db, req, b, draft) {
   if (rawLines.length > 300) return { error: "Too many lines (max 300)" };
   const zohoVendor = vendorById(b.zohoVendorId);
   if (!zohoVendor) return { error: "Pick the Zoho vendor for this batch" };
+  // the form's shipping cost; a caller that leaves the field out of the body
+  // altogether keeps what the draft had
+  const ship = b.shippingCost === undefined && draft && draft.shippingCost != null ? { value: draft.shippingCost } : shippingCostOf(b);
+  if (ship.error) return { error: ship.error };
   const parsed = [];
   for (const l of rawLines) {
     const _id = oid(l.orderId);
@@ -1289,6 +1304,7 @@ async function shipBatch(db, req, b, draft) {
       tracking,
       shippedAt,
       note: str(b.note),
+      shippingCost: ship.value,
       zohoVendorId: zohoVendor.id,
       zohoVendorName: zohoVendor.name,
       lines,

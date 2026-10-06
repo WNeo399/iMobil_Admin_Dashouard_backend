@@ -6,7 +6,9 @@
 // (2026-09-22), and the whole batch becomes ONE Zoho PO under it. Rates are
 // our CNY unit prices, sent when the vendor's currency is CNY (all three
 // are). Lines without a Zoho item id cannot go on a Zoho PO and are
-// reported as skipped.
+// reported as skipped. A shipping cost typed on the batch (CNY) goes on the
+// PO as one more line: the "Shipping fee" item, quantity 1, at that price
+// (user ask 2026-10-06).
 //
 // Everything here is non-fatal for the batch: the outcome is stored on the
 // batch (`zoho`) and can be retried from the Batches page.
@@ -16,6 +18,9 @@ const { handleZohoInventoryRequest, handleZohoInventoryPostRequest, refreshToken
 const ORG = "746138234";
 const BASE = "https://www.zohoapis.com/inventory/v1";
 const VENDOR_TTL_MS = 60 * 60 * 1000;
+// Zoho's "Shipping fee" item (SKU 10807) — the line a batch's shipping cost
+// is booked on, as on the team's hand-made purchase orders.
+const SHIPPING_ITEM_ID = "2591985000010307946";
 
 // The Zoho vendors a batch may be booked to (the user's list). A test
 // vendor can be added for a local run with SPP_ZOHO_TEST_VENDOR_ID.
@@ -88,6 +93,8 @@ async function createBatchPurchaseOrders(db, batch, existing) {
     for (const [vendorId, g] of groups) {
       if (done.has(vendorId)) continue;
       const cny = g.vendor.currency === "CNY";
+      // typed in CNY like the unit prices, so it is only sent to a CNY vendor
+      const shippingCost = cny && Number(batch.shippingCost) > 0 ? Number(batch.shippingCost) : 0;
       const body = {
         vendor_id: vendorId,
         date: ymd(batch.shippedAt),
@@ -98,11 +105,14 @@ async function createBatchPurchaseOrders(db, batch, existing) {
           [...new Set(g.lines.map((l) => l.supplier).filter(Boolean))].length ? `Suppliers: ${[...new Set(g.lines.map((l) => l.supplier).filter(Boolean))].join(", ")}` : "",
           batch.note || "",
         ].filter(Boolean).join("\n"),
-        line_items: g.lines.map((l) => {
-          const li = { item_id: String(l.itemId), quantity: Number(l.shippedQty) || 0, tax_id: taxId };
-          if (cny && l.unitPrice != null && Number.isFinite(Number(l.unitPrice))) li.rate = Number(l.unitPrice);
-          return li;
-        }),
+        line_items: [
+          ...g.lines.map((l) => {
+            const li = { item_id: String(l.itemId), quantity: Number(l.shippedQty) || 0, tax_id: taxId };
+            if (cny && l.unitPrice != null && Number.isFinite(Number(l.unitPrice))) li.rate = Number(l.unitPrice);
+            return li;
+          }),
+          ...(shippingCost ? [{ item_id: SHIPPING_ITEM_ID, quantity: 1, rate: shippingCost, tax_id: taxId }] : []),
+        ],
       };
       const r = await handleZohoInventoryPostRequest(`${BASE}/purchaseorders?organization_id=${ORG}`, body);
       if (!r || r.code !== 0 || !r.purchaseorder) {
@@ -126,6 +136,7 @@ async function createBatchPurchaseOrders(db, batch, existing) {
         qty: g.lines.reduce((t, l) => t + (Number(l.shippedQty) || 0), 0),
         total: po.total != null ? po.total : null,
         issued,
+        ...(shippingCost ? { shippingCost } : {}),
       });
     }
   } catch (e) {
