@@ -472,7 +472,8 @@ router.get("/summary", VIEW, async (req, res, next) => {
             error: run.error || null,
           }
         : null,
-      // The hourly sync's last pass, for the "synced N min ago" note.
+      // When the register last matched Zoho (hourly pass or full refresh),
+      // for the "synced N min ago" note.
       sync,
       counts: {
         ...stripId(tiles),

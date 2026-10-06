@@ -304,17 +304,34 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
   }
 }
 
-// The dashboard's view of the sync: when it last ran and how it went.
+// The full refresh (bin/stockSnapshot.js — Update Now, or the nightly
+// trigger) reads live stock for every active item, so it counts as a sync
+// for the dashboard's "synced N ago" too (user ask 2026-10-06: Update Now
+// resets it). It has a field of its own: the hourly pass's watermark and
+// lock are left alone.
+async function markFullRefresh(db, at) {
+  await db.collection(STATE).updateOne({ _id: STATE_ID }, { $max: { fullRefreshAt: at } }, { upsert: true });
+}
+
+// The dashboard's view of the sync: when the register was last brought in
+// line with Zoho (the later of the hourly pass and the full refresh), and
+// the hourly pass's last error unless a run since has superseded it.
 async function getStockItemsSyncState(db) {
   const doc = await db.collection(STATE).findOne({ _id: STATE_ID }, { projection: { _id: 0 } });
   if (!doc) return null;
+  const hourly = doc.lastRunAt ? new Date(doc.lastRunAt) : null;
+  const full = doc.fullRefreshAt ? new Date(doc.fullRefreshAt) : null;
+  const latest = hourly && full ? (full > hourly ? full : hourly) : hourly || full;
+  const error = doc.lastError && (!latest || new Date(doc.lastError.at) > latest) ? doc.lastError : null;
   return {
     since: doc.since || null,
     running: !!doc.running,
-    lastRunAt: doc.lastRunAt || null,
+    lastRunAt: latest,
+    lastHourlyAt: hourly,
+    lastFullAt: full,
     lastResult: doc.lastResult || null,
-    lastError: doc.lastError || null,
+    lastError: error,
   };
 }
 
-module.exports = { runStockItemsSync, getStockItemsSyncState };
+module.exports = { runStockItemsSync, getStockItemsSyncState, markFullRefresh };

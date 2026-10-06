@@ -21,6 +21,7 @@
 require("dotenv").config();
 
 const { connectToDatabase } = require("../utils/mongodb");
+const { markFullRefresh } = require("../utils/stockItemsSync");
 const {
   fetchItemAttributes,
   fetchItemDetails,
@@ -571,6 +572,9 @@ async function main() {
   run.durationMs = Date.now() - startedAt.getTime();
   run.finishedAt = new Date();
   await db.collection(RUNS).insertOne(run);
+  // Every active item's stock was just read from Zoho: the dashboard's
+  // "synced N ago" restarts from this run.
+  await markFullRefresh(db, startedAt);
   log(`\nrefreshed ${rows.length} rows in ${ITEMS} · ${inserted} new · ${gone.modifiedCount || 0} no longer listed`);
 }
 
