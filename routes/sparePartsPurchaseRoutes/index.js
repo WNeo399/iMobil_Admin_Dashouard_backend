@@ -206,6 +206,9 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const pageSize = Math.min(200, Math.max(1, parseInt(q.pageSize, 10) || 20));
     const base = {};
     if (q.category) base.category = str(q.category);
+    // categories the list leaves out (the Purchase Order page's "All orders"
+    // skips the ones pinned above its tree)
+    else if (str(q.excludeCategory)) base.category = { $nin: str(q.excludeCategory).split(",").map((c) => c.trim()).filter(Boolean) };
     if (q.supplier) base.supplier = str(q.supplier);
     // one item's lines (the Stock Monitoring item drawer)
     if (q.itemId) base.itemId = str(q.itemId);
