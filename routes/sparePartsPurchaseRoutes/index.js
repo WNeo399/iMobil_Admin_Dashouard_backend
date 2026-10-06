@@ -45,6 +45,7 @@ const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
 const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, ZOHO_VENDORS, vendorById } = require("../../utils/sppZoho");
+const { MAX_IMAGES, acceptImage, storeImage, removeImage } = require("../../utils/sppImages");
 
 const ORDERS = "imb_spp_orders";
 const BATCHES = "imb_spp_batches";
@@ -79,12 +80,17 @@ const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Batt
 const CHANNELS = ["海运", "Special Order", "New Product"];
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
-// A New Product line (user rule 2026-10-06) is not in Zoho yet: the supplier
-// quotes it first, the quote parks it in To Confirm, and only once iMobile
-// confirms it is it placed, put on an order batch or shipped like any other
-// line. Until then it "awaits a quote".
+// A New Product or Special Order line (user rules 2026-10-06) is quoted
+// first: the supplier quotes it, the quote parks it in To Confirm, and only
+// once iMobile confirms it is it placed, put on an order batch or shipped
+// like any other line. Until then it "awaits a quote".
 const NEW_PRODUCT = "New Product";
-const awaitsQuote = (r) => !!r && r.category === NEW_PRODUCT && ["pending", "shortage"].includes(r.status) && !r.confirmed;
+const SPECIAL_ORDER = "Special Order";
+const QUOTE_FIRST = [NEW_PRODUCT, SPECIAL_ORDER];
+const awaitsQuote = (r) => !!r && QUOTE_FIRST.includes(r.category) && ["pending", "shortage"].includes(r.status) && !r.confirmed;
+// A Special Order says who it is for (a preset name or one typed) and
+// whether it is urgent.
+const forOf = (v) => str(v).slice(0, 60);
 // The register's say on a line's item: its classification as a module
 // category (blank / unknown → Other) and its image id.
 async function registerFacts(db, itemId) {
@@ -215,7 +221,7 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const search = str(q.search);
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
-      base.$or = [{ sku: rx }, { productName: rx }, { orderNo: rx }, { supplier: rx }, { tracking: rx }, { batchNo: rx }, { note: rx }];
+      base.$or = [{ sku: rx }, { productName: rx }, { orderNo: rx }, { supplier: rx }, { tracking: rx }, { batchNo: rx }, { note: rx }, { requestedFor: rx }];
     }
     const match = { ...base };
     const statuses = str(q.status).split(",").map((s) => s.trim()).filter((s) => STATUSES.includes(s));
@@ -226,7 +232,7 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const db = await connectToDatabase();
     const col = db.collection(ORDERS);
     const [rows, total, statusAgg, catAgg, suppliers] = await Promise.all([
-      col.find(match, { projection: { history: 0 } }).sort({ createdAt: dir, _id: dir }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      col.find(match, { projection: { history: 0 } }).sort(String(q.sort) === "received" ? { receivedAt: -1, _id: -1 } : { createdAt: dir, _id: dir }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
       col.countDocuments(match),
       col.aggregate([{ $match: base }, { $group: { _id: "$status", n: { $sum: 1 } } }]).toArray(),
       col.aggregate([{ $group: { _id: "$category", total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } } } }]).toArray(),
@@ -314,6 +320,55 @@ router.get("/orders/:id", VIEW, async (req, res, next) => {
   }
 });
 
+// ── Photos on a line ────────────────────────────────────────────────
+// Mostly New Product / Special Order lines (no Zoho item to show), added
+// from the Order New Product dialog or the details. Either side may add or
+// remove one.
+router.post("/orders/:id/images", requireAny("spp:order:create", "spp:order:supply"), acceptImage, async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    if (!req.file) return bad(res, "An image file is required");
+    const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
+    const rec = await col.findOne({ _id }, { projection: { orderNo: 1, images: 1 } });
+    if (!rec) return res.status(404).json({ success: false, message: "Order not found" });
+    if ((rec.images || []).length >= MAX_IMAGES) return bad(res, `A line can carry at most ${MAX_IMAGES} photos`);
+    let image;
+    try {
+      image = await storeImage(req.file, rec.orderNo);
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ success: false, message: e.message });
+      throw e;
+    }
+    const by = actor(req);
+    image.at = new Date();
+    image.by = by;
+    await col.updateOne({ _id }, { $push: { images: image, history: hist("photo", by, { added: image.name || image.id }) }, $set: { updatedAt: new Date() } });
+    return res.json({ success: true, image });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.delete("/orders/:id/images/:imageId", requireAny("spp:order:create", "spp:order:supply"), async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
+    const rec = await col.findOne({ _id }, { projection: { images: 1 } });
+    if (!rec) return res.status(404).json({ success: false, message: "Order not found" });
+    const image = (rec.images || []).find((i) => i.id === req.params.imageId);
+    if (!image) return res.status(404).json({ success: false, message: "Photo not found" });
+    await col.updateOne({ _id }, { $pull: { images: { id: image.id } }, $push: { history: hist("photo", actor(req), { removed: image.name || image.id }) }, $set: { updatedAt: new Date() } });
+    await removeImage(image.key);
+    return res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Create lines — each one its own order (product, quantity, note). A line
 // files under its item's register classification unless the client asks
 // for a channel (海运 / Special Order).
@@ -349,6 +404,7 @@ router.post("/orders", CREATE, async (req, res, next) => {
         category,
         orderQty,
         note: str(l.note),
+        ...(category === SPECIAL_ORDER ? { requestedFor: forOf(l.requestedFor), urgent: !!l.urgent } : {}),
         status: "pending",
         quotedPrice: null,
         supplier: "",
@@ -372,7 +428,7 @@ router.post("/orders", CREATE, async (req, res, next) => {
       });
     }
     await db.collection(ORDERS).insertMany(docs);
-    return res.json({ success: true, created: docs.length, orderNos: docs.map((d) => d.orderNo) });
+    return res.json({ success: true, created: docs.length, orderNos: docs.map((d) => d.orderNo), ids: docs.map((d) => String(d._id)) });
   } catch (error) {
     next(error);
   }
@@ -399,6 +455,16 @@ router.put("/orders/:id", CREATE, async (req, res, next) => {
         set.orderQty = Math.round(qty);
         set.lineTotal = rec.unitPrice != null ? round2(set.orderQty * rec.unitPrice) : rec.lineTotal;
         changes.orderQty = { from: rec.orderQty, to: set.orderQty };
+      }
+    }
+    if (rec.category === SPECIAL_ORDER || str(b.category) === SPECIAL_ORDER) {
+      if (b.requestedFor !== undefined && forOf(b.requestedFor) !== (rec.requestedFor || "")) {
+        set.requestedFor = forOf(b.requestedFor);
+        changes.requestedFor = { from: rec.requestedFor || "", to: set.requestedFor };
+      }
+      if (b.urgent !== undefined && !!b.urgent !== !!rec.urgent) {
+        set.urgent = !!b.urgent;
+        changes.urgent = set.urgent;
       }
     }
     if (hasVal(b.category) && rec.status === "pending" && str(b.category) !== rec.category) {
@@ -456,7 +522,7 @@ router.post("/orders/:id/quote", SUPPLY, (req, res, next) =>
       const set = { quotedPrice: round2(price) };
       const detail = { quotedPrice: round2(price) };
       if (parksOnQuote(rec, b)) {
-        const note = str(b.note) || (awaitsQuote(rec) ? `New product quoted ¥${round2(price).toFixed(2)} — confirm to order` : "");
+        const note = str(b.note) || (awaitsQuote(rec) ? `${rec.category} quoted ¥${round2(price).toFixed(2)} — confirm to order` : "");
         set.confirmFrom = rec.status;
         set.confirmNote = note;
         detail.toConfirm = true;
@@ -520,7 +586,7 @@ router.post("/orders/:id/to-confirm", CREATE_OR_SUPPLY, (req, res, next) =>
     to: "toConfirm",
     action: "toConfirm",
     build: (rec, b) => {
-      if (awaitsQuote(rec) && rec.quotedPrice == null) return { error: "Quote this new product first — the quote moves it to To Confirm" };
+      if (awaitsQuote(rec) && rec.quotedPrice == null) return { error: `Quote this ${rec.category} line first — the quote moves it to To Confirm` };
       const note = str(b.note);
       if (!note) return { error: "Say what needs confirming" };
       // parked again: an earlier Confirmed mark no longer applies
@@ -538,7 +604,7 @@ router.post("/orders/:id/confirm", CREATE_OR_SUPPLY, (req, res, next) =>
     to: "pending",
     action: "confirmed",
     build: (rec, b, by) => {
-      if (rec.category === NEW_PRODUCT && rec.quotedPrice == null) return { error: "Quote this new product before confirming it" };
+      if (QUOTE_FIRST.includes(rec.category) && rec.quotedPrice == null) return { error: `Quote this ${rec.category} line before confirming it` };
       const note = str(b.note);
       return {
         set: {
@@ -561,7 +627,7 @@ router.post("/orders/:id/place", SUPPLY, (req, res, next) =>
     to: "ordered",
     action: "ordered",
     build: (rec, b, by) => {
-      if (awaitsQuote(rec)) return { error: "A new product is quoted and confirmed before it is ordered" };
+      if (awaitsQuote(rec)) return { error: `A ${rec.category} line is quoted and confirmed before it is ordered` };
       const supplier = str(b.supplier);
       if (!supplier) return { error: "Supplier is required" };
       const set = { supplier, orderedAt: new Date(), orderedBy: by, shortageNote: "" };
@@ -1226,7 +1292,7 @@ async function shipBatch(db, req, b, draft) {
     if (rec.status !== "ordered" && rec.status !== "pending") {
       return { error: `${rec.sku || rec.orderNo} is ${rec.status}; only ordered or pending lines can ship` };
     }
-    if (awaitsQuote(rec)) return { error: `${rec.productName || rec.orderNo}: a new product is quoted and confirmed before it ships` };
+    if (awaitsQuote(rec)) return { error: `${rec.productName || rec.orderNo}: a ${rec.category} line is quoted and confirmed before it ships` };
     if (rec.status === "pending" && !p.supplier && !rec.supplier) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
     // The price may be left off when placing, but every shipped line must
     // carry one — from the batch form or already on the line.
