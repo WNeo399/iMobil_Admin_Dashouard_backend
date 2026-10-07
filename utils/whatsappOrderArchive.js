@@ -1,8 +1,7 @@
 // On WhatsApp special-order session completion, archive everything
 // the customer sent into the SAME imb_special_orders collection the
-// embeddable Special Order widget feeds. Single review surface in the
-// dashboard handles both channels — see views/imobile/specialOrder
-// on the frontend.
+// embeddable Special Order widget feeds. (The dashboard's review page for
+// both channels, iMobile → Special Order, was removed on 2026-10-07.)
 //
 // Two reasons we run this on completion rather than per-message:
 //   1. Twilio media URLs only stay valid for ~24 hours. We download

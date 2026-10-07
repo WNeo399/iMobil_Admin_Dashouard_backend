@@ -22,7 +22,6 @@ var creditNoteRouter = require('./routes/creditNoteRoutes/index');
 // Admin-side endpoints for reviewing widget Special Order
 // submissions. Same gate as Credit Note (zoho:salesOrder:create) so
 // the same role can triage what came in via the embedded widget.
-var specialOrderRouter = require('./routes/specialOrderRoutes/index');
 // Admin CRUD for the per-widget origin allowlist that the public
 // /widget/* endpoints consult on every submission. Gated by
 // system:user:manage — system-tier admins manage who can talk to
@@ -178,7 +177,9 @@ app.use('/dashboard', authenticate, dashboardRouter);
 app.use('/users', authenticate, usersRouter);
 app.use('/repair', authenticate, repairRouter);
 app.use('/creditNote', authenticate, creditNoteRouter);
-app.use('/specialOrder', authenticate, specialOrderRouter);
+// (/specialOrder — the iMobile → Special Order review page's API — was
+// removed on 2026-10-07 with the page; the public form POST /widget/specialOrder
+// and the WhatsApp flow still store requests in imb_special_orders.)
 app.use('/widgetOrigin', authenticate, widgetOriginRouter);
 app.use('/catalogue', authenticate, catalogueRouter);
 app.use('/svpEnquiry', authenticate, svpEnquiryRouter);
