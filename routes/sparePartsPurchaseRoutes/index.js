@@ -1539,4 +1539,8 @@ router.post("/batches/:id/cancel", BATCH_MANAGE, async (req, res, next) => {
   }
 });
 
+// New Products — the models we want parts for, and creating the missing
+// Zoho items (its own file; user ask 2026-10-06).
+router.use("/new-products", require("./newProducts"));
+
 module.exports = router;
