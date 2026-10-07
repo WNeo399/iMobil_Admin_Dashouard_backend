@@ -152,12 +152,15 @@ const ROLE_PERMISSIONS = {
   // zoho:salesOrder:create, which would also unlock the Credit Note page.
   [ROLES.IMOBILE_PURCHASE]: ["po:*:*", "spp:*:*"],
   // Parts Supplier — Spare Parts Purchase: sees every order, quotes / places
-  // / flags shortages, ships batches. Creating orders and receiving batches
-  // stay with iMobile (spp:order:create / spp:order:receive). Since
+  // / flags shortages, ships batches. Editing / deleting orders and receiving
+  // batches stay with iMobile (spp:order:create / spp:order:receive). Since
   // 2026-09-28 also Missing Images: the parts with no image, and uploading
-  // images for them (not archiving — that is a stock-edit action).
+  // images for them (not archiving — that is a stock-edit action). Since
+  // 2026-10-07 also adding lines (spp:order:add): Add Item and Order New
+  // Product — not Special Orders, which are iMobile's own.
   [ROLES.PARTS_SUPPLIER]: [
     "spp:order:view",
+    "spp:order:add",
     "spp:order:supply",
     "spp:batch:view",
     "spp:batch:create",

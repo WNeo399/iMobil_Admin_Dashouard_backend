@@ -27,6 +27,8 @@
 // Permissions (constants/roles.js)
 //   spp:order:view      read the orders                 admin, iMobile admin, parts supplier
 //   spp:order:create    create / edit / cancel          admin, iMobile admin
+//   spp:order:add       add lines (Add Item, New Product — not Special Order)
+//                                                       admin, iMobile admin, parts supplier
 //   spp:order:supply    quote / place / shortage        admin, iMobile admin, parts supplier
 //   spp:order:receive   receive a batch                 admin, iMobile admin
 //   spp:batch:view      read the batches                all three
@@ -69,6 +71,8 @@ const requireAny = (...perms) => (req, res, next) => {
   return res.status(403).json({ success: false, message: "You do not have permission for this action" });
 };
 const CREATE_OR_SUPPLY = requireAny("spp:order:create", "spp:order:supply");
+// Adding lines: iMobile, or the parts supplier (spp:order:add, 2026-10-07).
+const ADD = requireAny("spp:order:create", "spp:order:add");
 
 const STATUSES = ["pending", "toConfirm", "ordered", "shipped", "received", "shortage", "cancelled"];
 // "open" = still to arrive
@@ -371,12 +375,16 @@ router.delete("/orders/:id/images/:imageId", requireAny("spp:order:create", "spp
 
 // Create lines — each one its own order (product, quantity, note). A line
 // files under its item's register classification unless the client asks
-// for a channel (海运 / Special Order).
-router.post("/orders", CREATE, async (req, res, next) => {
+// for a channel (海运 / Special Order). The parts supplier may add lines but
+// not Special Orders (those are ordered for someone at iMobile).
+router.post("/orders", ADD, async (req, res, next) => {
   try {
     const lines = Array.isArray(req.body && req.body.lines) ? req.body.lines : [];
     if (!lines.length) return bad(res, "No lines provided");
     if (lines.length > 100) return bad(res, "Too many lines (max 100)");
+    if (!hasPermission((req.user && req.user.permissions) || [], "spp:order:create") && lines.some((l) => str(l && l.category) === SPECIAL_ORDER)) {
+      return res.status(403).json({ success: false, message: "Special Orders are raised by iMobile" });
+    }
     for (let i = 0; i < lines.length; i++) {
       const l = lines[i] || {};
       const qty = num(l.orderQty);
