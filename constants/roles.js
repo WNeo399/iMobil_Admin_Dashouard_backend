@@ -195,9 +195,12 @@ const ROLE_PERMISSIONS = {
   // — every role with Tools gets it, so no card on that page is a dead end.
   // svp:*:* is Serials Lookup (2026-10-06): the genuine-serial list and the
   // customer enquiries, which moved into the iMobile Spare Parts menu.
+  // parts:browse:view is the Browse Items page (2026-10-07) with its price
+  // columns — Admin (*:*:*) and iMobile Warehouse only (the user's choice).
   [ROLES.IMOBILE_WAREHOUSE]: [
     "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create", "zoho:purchaseOrder:create",
     "svp:*:*",
+    "parts:browse:view",
     "spp:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
   ],

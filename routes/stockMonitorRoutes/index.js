@@ -13,6 +13,7 @@
 //   GET /stock-monitor/collection-items      a collection's rows (the Stock Monitoring list)
 //   GET /stock-monitor/browse-tree           the catalogue as Brand → Series → Classification, with counts
 //   GET /stock-monitor/browse-items          one node of that tree: tile counts + a page of rows
+//   GET /stock-monitor/model-tree            the catalogue as Brand → Series → Model (the Browse Items page)
 //   GET /stock-monitor/shelves               shelf rollup for a stock take
 //   GET /stock-monitor/item/:id              one item's row
 //   GET /stock-monitor/live?ids=             live stock for the rows on screen
@@ -33,6 +34,7 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission, requireAnyPermission } = require("../../middleware/auth");
 const { hasPermission } = require("../../constants/roles");
+const { generation } = require("../../utils/sparePartsCatalog");
 const {
   getViewData,
   handleZohoInventoryRequest,
@@ -701,7 +703,7 @@ router.get("/collection-items", VIEW, async (req, res, next) => {
 // node (straight to sub classification) instead of sitting in "No device".
 const NONE = "__none__";
 const TOOL = "__tool__";
-const CLASS_ORDER = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "Tools", "Other", "Accessory"];
+const CLASS_ORDER = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "IC", "Tools", "Other", "Accessory"];
 const nodeLabel = (v, blank) => (v ? v : blank);
 const multiSplit = (field) => ({ $split: [{ $ifNull: [`$${field}`, ""] }, "; "] });
 // the brand an item files under: its brand, or TOOL for a brand-less tool
@@ -810,6 +812,85 @@ router.get("/browse-tree", VIEW, async (req, res, next) => {
   }
 });
 
+// ── Browse Items: Brand → Series → Model (user ask 2026-10-07) ────────
+// Every active, non-archived part under its Device Brand, its series and
+// the Compatible Models it lists, with counts (an item counts once under
+// its brand, under each series it names and each model it fits). A model
+// files under ONE series — seriesForModel, the same rule as the browse
+// filter's cascader — newest first (utils/sparePartsCatalog generation).
+// A brand without series lists its models directly; brand-less Tools and
+// brand-less parts close the tree as "Tool" and "No device". A node's sel
+// is what /browse-items takes: { brand, series } or { brand, model }.
+function buildModelTree(brandTotals, seriesCounts, pairs, modelCounts) {
+  const brands = new Map();
+  const B = (b) => brands.get(b) || brands.set(b, { count: 0, series: new Map(), pairs: [], models: new Map() }).get(b);
+  for (const x of brandTotals) B(x._id).count = x.n;
+  for (const x of seriesCounts) B(x._id.b).series.set(x._id.s, x.n);
+  for (const x of pairs) B(x._id.b).pairs.push(x);
+  for (const x of modelCounts) B(x._id.b).models.set(x._id.m, x.n);
+  const byNewest = (a, b) => generation(b.label) - generation(a.label) || a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: "base" });
+  const brandRank = (b) => (b === "" ? 3 : b === TOOL ? 2 : b === "Other" ? 1 : 0);
+  return [...brands.entries()]
+    .filter(([, X]) => X.count > 0)
+    .sort((a, b) => brandRank(a[0]) - brandRank(b[0]) || b[1].count - a[1].count || a[0].localeCompare(b[0]))
+    .map(([b, X]) => {
+      const label = b === TOOL ? "Tool" : b || "No device";
+      const id = `b:${b || NONE}`;
+      const n = { id, label, count: X.count, sel: { brand: b || NONE }, children: [] };
+      if (b === TOOL || b === "") return n;
+      // each model → its one series
+      const seriesSize = new Map();
+      const perModel = new Map();
+      for (const g of X.pairs) {
+        const { s, m } = g._id;
+        seriesSize.set(s, (seriesSize.get(s) || 0) + g.n);
+        const bag = perModel.get(m) || perModel.set(m, new Map()).get(m);
+        bag.set(s, (bag.get(s) || 0) + g.n);
+      }
+      const bySeries = new Map();
+      for (const [m, bag] of perModel) {
+        const s = seriesForModel(m, bag, seriesSize);
+        (bySeries.get(s) || bySeries.set(s, []).get(s)).push({ id: `${id}|m:${m}`, label: m, count: X.models.get(m) || bag.get(s), sel: { brand: b, model: m } });
+      }
+      for (const list of bySeries.values()) list.sort(byNewest);
+      const named = [...X.series.keys()].filter(Boolean);
+      if (!named.length) {
+        // no series for this brand: its models straight under it
+        n.children = bySeries.get("") || [];
+        return n;
+      }
+      n.children = [...X.series.entries()]
+        .sort((a, b2) => (a[0] === "" ? 1 : b2[0] === "" ? -1 : b2[1] - a[1] || a[0].localeCompare(b2[0])))
+        .map(([s, cnt]) => ({
+          id: `${id}|s:${s || NONE}`,
+          label: s || "No series",
+          count: cnt,
+          sel: { brand: b, series: s || NONE },
+          children: bySeries.get(s) || [],
+        }));
+      return n;
+    });
+}
+
+router.get("/model-tree", VIEW, async (req, res, next) => {
+  try {
+    const db = await connectToDatabase();
+    const items = db.collection(ITEMS);
+    const match = { $match: { active: true, scope: scopeOf(req), archived: { $ne: true } } };
+    const project = { $project: { b: BRAND_EXPR, series: multiSplit("deviceSeries"), models: { $ifNull: ["$compatibleModels", []] } } };
+    const [brandTotals, seriesCounts, pairs, modelCounts] = await Promise.all([
+      items.aggregate([match, { $group: { _id: BRAND_EXPR, n: { $sum: 1 } } }]).toArray(),
+      items.aggregate([match, project, { $unwind: "$series" }, { $group: { _id: { b: "$b", s: "$series" }, n: { $sum: 1 } } }]).toArray(),
+      items.aggregate([match, project, { $unwind: "$models" }, { $unwind: "$series" }, { $group: { _id: { b: "$b", s: "$series", m: "$models" }, n: { $sum: 1 } } }]).toArray(),
+      items.aggregate([match, project, { $unwind: "$models" }, { $group: { _id: { b: "$b", m: "$models" }, n: { $sum: 1 } } }]).toArray(),
+    ]);
+    const refresh = await latestRefresh(db);
+    return res.json({ success: true, metricsAt: refresh ? refresh.metricsAt : null, tree: buildModelTree(brandTotals, seriesCounts, pairs, modelCounts) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // The node's rows. Server-paged: the tile counts, the quality breakdown
 // (for the Quality filter) and one page of rows come back from a single
 // aggregation, under the same match, so tiles and table always agree.
@@ -819,7 +900,18 @@ router.get("/browse-tree", VIEW, async (req, res, next) => {
 //   hidden=1                                the hidden-items review instead
 //   days                                    the sales window (7/14/30/90) — Under a Month uses it
 //   sort=name|sku|stock|sales, order, page, pageSize; all=1 returns every row (export, capped)
+// Browse Items page (2026-10-07) extras, all opt-in:
+//   prices=1        the four price lists on each row (and price sorts) — only
+//                   for those with parts:browse:view (Admin, iMobile Warehouse)
+//   classCounts=1   items per classification / sub classification over the
+//                   node WITHOUT its class pick, for the chips
+//   includeHidden=1 Stock Monitoring's own hidden list does not apply
+//   tile=inStock    available above zero
 const BROWSE_DAYS = new Set([7, 14, 30, 90]);
+const BROWSE_PRICE_FIELDS = ["pricePlatinum", "priceVip", "priceSvip", "priceWholesale"];
+// Only the four lists: Browse Items does not compare prices with the cost
+// (user 2026-10-07) — no purchase price, no cost-based formula prices.
+const canSeeBrowsePrices = (req) => hasPermission((req.user && req.user.permissions) || [], "parts:browse:view");
 const EXPORT_CAP = 5000;
 // a series cell can hold several values: match one of them
 const oneOf = (field, v) =>
@@ -867,6 +959,21 @@ const browseMatch = (q) => ({ ...nodeMatch(q), ...filterMatch(q) });
 // most of its items have, else the bigger series. A "Nova 3e / P20 Lite"
 // part lists both models under both series — the name rule keeps each
 // where it belongs. Brands without series get a flat model list.
+// how much of the series name the model name carries (0 = none):
+// a one-letter series wants its letter before a digit (P20, A52, S21)
+function stemLen(m, s) {
+  const stem = s.replace(/ Series$/, "");
+  if (!stem) return 0;
+  const re = stem.length === 1 ? new RegExp(`\\b${escapeRegex(stem)}\\d`) : new RegExp(`\\b${escapeRegex(stem)}\\b`, "i");
+  return re.test(m) ? stem.length : 0;
+}
+// The ONE series a model files under, from bag = Map(series → its items
+// with that model): the series its name carries, else the series most of
+// its items have, else the bigger series (seriesSize).
+function seriesForModel(m, bag, seriesSize) {
+  return [...bag.keys()].sort((a, b) =>
+    stemLen(m, b) - stemLen(m, a) || bag.get(b) - bag.get(a) || (seriesSize.get(b) || 0) - (seriesSize.get(a) || 0) || a.localeCompare(b))[0];
+}
 function buildSeriesModels(pairs, modelCounts) {
   const counts = new Map(modelCounts.map((x) => [x._id, x.n]));
   const seriesSize = new Map();
@@ -877,18 +984,9 @@ function buildSeriesModels(pairs, modelCounts) {
     const bag = perModel.get(m) || perModel.set(m, new Map()).get(m);
     bag.set(s, (bag.get(s) || 0) + g.n);
   }
-  // how much of the series name the model name carries (0 = none):
-  // a one-letter series wants its letter before a digit (P20, A52, S21)
-  const stemLen = (m, s) => {
-    const stem = s.replace(/ Series$/, "");
-    if (!stem) return 0;
-    const re = stem.length === 1 ? new RegExp(`\\b${escapeRegex(stem)}\\d`) : new RegExp(`\\b${escapeRegex(stem)}\\b`, "i");
-    return re.test(m) ? stem.length : 0;
-  };
   const bySeries = new Map();
   for (const [m, bag] of perModel) {
-    const s = [...bag.keys()].sort((a, b) =>
-      stemLen(m, b) - stemLen(m, a) || bag.get(b) - bag.get(a) || seriesSize.get(b) - seriesSize.get(a) || a.localeCompare(b))[0];
+    const s = seriesForModel(m, bag, seriesSize);
     const list = bySeries.get(s) || bySeries.set(s, []).get(s);
     const n = counts.get(m) || bag.get(s);
     list.push({ value: m, label: `${m} (${n})`, count: n });
@@ -905,6 +1003,7 @@ const tileMatch = (tile, days) => {
   const units = `$metrics.units${days}.total`;
   switch (tile) {
     case "zero": return { "metrics.available": { $lte: 0 } };
+    case "inStock": return { "metrics.available": { $gt: 0 } };
     case "onOrder": return { "metrics.openPoQty": { $gt: 0 } };
     case "noOnOrder": return { "metrics.available": { $lte: 0 }, "metrics.openPoQty": { $not: { $gt: 0 } } };
     case "underMonth": return { $expr: { $and: [{ $gt: [{ $ifNull: [units, 0] }, 0] }, { $lt: [{ $ifNull: ["$metrics.available", 0] }, { $multiply: [{ $ifNull: [units, 0] }, 30 / days] }] }] } };
@@ -920,10 +1019,13 @@ router.get("/browse-items", VIEW, async (req, res, next) => {
     const page = Math.max(1, parseInt(q.page, 10) || 1);
     const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(q.pageSize, 10) || 20));
     const wantAll = String(q.all || "") === "1";
+    const withPrices = String(q.prices || "") === "1" && canSeeBrowsePrices(req);
     const SORTS = {
       name: "name", sku: "sku", location: "location", stock: "metrics.available", sales: `metrics.units${days}.total`,
       onOrder: "metrics.openPoQty", lastSold: "metrics.daysSinceSale",
+      ...(withPrices ? Object.fromEntries(BROWSE_PRICE_FIELDS.map((f) => [f, f])) : {}),
     };
+    const projection = withPrices ? { ...LIST_PROJECTION, ...Object.fromEntries(BROWSE_PRICE_FIELDS.map((f) => [f, 1])) } : LIST_PROJECTION;
     const sortField = SORTS[String(q.sort)] || "name";
     const order = String(q.order) === "desc" ? -1 : 1;
     const sort = { [sortField]: order, itemId: 1 };
@@ -932,18 +1034,25 @@ router.get("/browse-items", VIEW, async (req, res, next) => {
     const refresh = await latestRefresh(db);
     const hiddenIds = (await db.collection(HIDDEN).find({}, { projection: { itemId: 1 } }).toArray()).map((h) => String(h.itemId));
     const showHidden = String(q.hidden || "") === "1";
+    const includeHidden = !showHidden && String(q.includeHidden || "") === "1";
     const filters = filterMatch(q);
     const node = { active: true, scope, archived: { $ne: true }, ...nodeMatch(q) };
-    // Hidden items are out of the list and its counts — or ARE the list.
-    const nodeBase = { ...node, itemId: showHidden ? { $in: hiddenIds } : { $nin: hiddenIds } };
+    // Hidden items are out of the list and its counts — or ARE the list
+    // (or, for Browse Items, simply part of it).
+    const hiddenPart = includeHidden ? {} : { itemId: showHidden ? { $in: hiddenIds } : { $nin: hiddenIds } };
+    const nodeBase = { ...node, ...hiddenPart };
     const base = { ...nodeBase, ...filters };
     const tile = tileMatch(String(q.tile || ""), days);
     const sea = await db.collection("productCollections").findOne({ seaFreight: true }, { projection: { products: 1 } });
     const seaIds = new Set(((sea && sea.products) || []).map((p) => String(p.itemId)));
-    const shape = (r) => shapeListRow(r, { hidden: showHidden ? new Set([r.itemId]) : null, seaIds, memberOf: null });
+    const shape = (r) => {
+      const row = shapeListRow(r, { hidden: showHidden ? new Set([r.itemId]) : null, seaIds, memberOf: null });
+      if (withPrices) for (const f of BROWSE_PRICE_FIELDS) row[f] = r[f] == null ? null : r[f];
+      return row;
+    };
 
     if (wantAll) {
-      const rows = await db.collection(ITEMS).find({ ...base, ...tile }, { projection: LIST_PROJECTION }).sort(sort).limit(EXPORT_CAP).toArray();
+      const rows = await db.collection(ITEMS).find({ ...base, ...tile }, { projection }).sort(sort).limit(EXPORT_CAP).toArray();
       return res.json({ success: true, total: rows.length, capped: rows.length === EXPORT_CAP, rows: rows.map(shape) });
     }
 
@@ -982,7 +1091,7 @@ router.get("/browse-items", VIEW, async (req, res, next) => {
             ],
             modelCounts: [{ $unwind: "$compatibleModels" }, { $group: { _id: "$compatibleModels", n: { $sum: 1 } } }],
             total: [{ $match: filters }, { $match: tile }, { $count: "n" }],
-            rows: [{ $match: filters }, { $match: tile }, { $sort: sort }, { $skip: (page - 1) * pageSize }, { $limit: pageSize }, { $project: LIST_PROJECTION }],
+            rows: [{ $match: filters }, { $match: tile }, { $sort: sort }, { $skip: (page - 1) * pageSize }, { $limit: pageSize }, { $project: projection }],
           },
         },
       ])
@@ -990,7 +1099,35 @@ router.get("/browse-items", VIEW, async (req, res, next) => {
     const t = (out.tiles && out.tiles[0]) || { all: 0, zero: 0, onOrder: 0, noOnOrder: 0, underMonth: 0 };
     delete t._id;
     // How many of this node's items are hidden — the "N hidden — view" link.
-    const hiddenCount = showHidden ? t.all : hiddenIds.length ? await db.collection(ITEMS).countDocuments({ ...node, ...filters, itemId: { $in: hiddenIds } }) : 0;
+    const hiddenCount = showHidden || includeHidden ? (showHidden ? t.all : 0)
+      : hiddenIds.length ? await db.collection(ITEMS).countDocuments({ ...node, ...filters, itemId: { $in: hiddenIds } }) : 0;
+    // The chips: items per classification (and its sub classifications)
+    // under the node without its class pick, with the filters and tile.
+    let classes;
+    if (String(q.classCounts || "") === "1") {
+      const unclassed = { active: true, scope, archived: { $ne: true }, ...nodeMatch({ ...q, classification: undefined, sub: undefined }), ...hiddenPart };
+      const groups = await db
+        .collection(ITEMS)
+        .aggregate([
+          { $match: { ...unclassed, ...filters, ...tile } },
+          { $group: { _id: { c: { $ifNull: ["$classification", ""] }, u: { $ifNull: ["$subClassification", ""] } }, n: { $sum: 1 } } },
+        ])
+        .toArray();
+      const byClass = new Map();
+      for (const g of groups) {
+        const C = byClass.get(g._id.c) || byClass.set(g._id.c, { count: 0, subs: new Map() }).get(g._id.c);
+        C.count += g.n;
+        if (g._id.u) C.subs.set(g._id.u, (C.subs.get(g._id.u) || 0) + g.n);
+      }
+      const rank = (c) => { const i = CLASS_ORDER.indexOf(c); return i < 0 ? (c ? CLASS_ORDER.length : CLASS_ORDER.length + 1) : i; };
+      classes = [...byClass.entries()]
+        .sort((a, b) => rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]))
+        .map(([c, C]) => ({
+          value: c || NONE,
+          count: C.count,
+          subs: [...C.subs.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([u, n]) => ({ value: u, count: n })),
+        }));
+    }
     return res.json({
       success: true,
       snapshotDate: refresh ? refresh.snapshotDate : null,
@@ -998,6 +1135,8 @@ router.get("/browse-items", VIEW, async (req, res, next) => {
       days,
       tiles: t,
       hiddenCount,
+      ...(classes ? { classes } : {}),
+      prices: withPrices,
       qualities: (out.qualities || []).map((x) => ({ value: x._id, count: x.n })),
       seriesModels: buildSeriesModels(out.seriesModels || [], out.modelCounts || []),
       total: (out.total && out.total[0] && out.total[0].n) || 0,

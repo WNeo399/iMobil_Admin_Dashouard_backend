@@ -18,7 +18,7 @@ const CACHE_MS = 10 * 60 * 1000;
 const PRODUCT_BASE = "https://www.imobilestore.com.au/products/";
 
 // Part types in the order the widget shows them.
-const TYPES = ["Screen", "Battery", "BackCover", "Housing", "Middle Frame", "Small Parts", "Tools", "Other"];
+const TYPES = ["Screen", "Battery", "BackCover", "Housing", "Middle Frame", "Small Parts", "IC", "Tools", "Other"];
 const TYPE_LABELS = { BackCover: "Back Cover" };
 const typeRank = (t) => {
   const i = TYPES.indexOf(t);

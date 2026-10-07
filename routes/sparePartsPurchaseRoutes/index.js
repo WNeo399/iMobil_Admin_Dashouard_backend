@@ -76,7 +76,7 @@ const OPEN = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
 // Where a line files in the tree: the register classification of its item
 // (set automatically on create, 2026-09-22), or one of the two channels the
 // team keeps apart — sea-freight orders (海运) and customer special orders.
-const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "Tools", "Other"];
+const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "IC", "Tools", "Other"];
 const CHANNELS = ["海运", "Special Order", "New Product"];
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
