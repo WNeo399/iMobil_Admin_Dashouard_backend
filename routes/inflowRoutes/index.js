@@ -91,6 +91,44 @@ function withPdf(o) {
   return o;
 }
 
+// ── Generated invoices (orders with no InFlow PDF) ─────────────────
+// The browser draws the invoice in InFlow's layout from the order and the
+// parties' invoice details. Those details are not in the webhook, so they
+// are kept on the vendor / customer records (invoiceDetails) and edited
+// from Sales Orders. Free text, trimmed; a blank field is left out.
+const PARTY_FIELDS = {
+  vendor: ["address", "email", "phone", "abn"],
+  customer: ["billingAddress", "shippingAddress", "contact", "phone", "paymentTerms"],
+};
+function cleanDetails(src, keys) {
+  const out = {};
+  for (const k of keys) {
+    const v = String((src && src[k]) || "").trim().slice(0, 500);
+    if (v) out[k] = v;
+  }
+  return out;
+}
+async function findParty(db, coll, id, name) {
+  const proj = { projection: { name: 1, invoiceDetails: 1 } };
+  if (id && ObjectId.isValid(String(id))) {
+    const d = await db.collection(coll).findOne({ _id: new ObjectId(String(id)) }, proj);
+    if (d) return d;
+  }
+  if (name) return db.collection(coll).findOne({ nameLower: String(name).toLowerCase() }, proj);
+  return null;
+}
+// { vendor: { name, address?, email?, phone?, abn? }, customer: { name, billingAddress?, … } }
+async function invoiceParties(db, order) {
+  const [v, c] = await Promise.all([
+    findParty(db, VENDORS, order.vendorId, order.vendor),
+    findParty(db, CUSTOMERS, order.customerId, order.customerName),
+  ]);
+  return {
+    vendor: { name: order.vendor || (v && v.name) || "", ...cleanDetails(v && v.invoiceDetails, PARTY_FIELDS.vendor) },
+    customer: { name: order.customerName || (c && c.name) || "", ...cleanDetails(c && c.invoiceDetails, PARTY_FIELDS.customer) },
+  };
+}
+
 // Derived balance + status, added via aggregation so we can also filter on them.
 const DERIVED = {
   balance: { $subtract: [{ $ifNull: ["$totalAmount", 0] }, { $ifNull: ["$paidAmount", 0] }] },
@@ -383,10 +421,48 @@ router.get("/salesorders/:id", VIEW_ORDERS, async (req, res) => {
       .toArray();
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
     await attachDispatchState(db, [order]);
+    // no InFlow PDF: what the generated invoice shows for the two parties
+    if (!order.invoiceUrl) order.invoiceParties = await invoiceParties(db, order);
     return res.json({ success: true, order: withPdf(order) });
   } catch (e) {
     console.error("InFlow order detail error:", e);
     return res.status(500).json({ success: false, message: "Failed to load order" });
+  }
+});
+
+// ── PUT /inflow/salesorders/:id/invoice-details ─────────────────────
+// The vendor's and customer's details on generated invoices, edited from
+// one of their orders. Body: { vendor: { address, email, phone, abn },
+// customer: { billingAddress, shippingAddress, contact, phone, paymentTerms } }.
+// Saved on the vendor / customer records, so every order of theirs uses them.
+router.put("/salesorders/:id/invoice-details", CREATE, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const order = await db.collection(ORDERS).findOne(
+      { _id: new ObjectId(req.params.id) },
+      { projection: { vendor: 1, vendorId: 1, customerName: 1, customerId: 1 } },
+    );
+    if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    const b = req.body || {};
+    const now = new Date();
+    const save = async (coll, id, name, details) => {
+      if (!name && !id) return;
+      const found = await findParty(db, coll, id, name);
+      if (found) {
+        await db.collection(coll).updateOne({ _id: found._id }, { $set: { invoiceDetails: details, invoiceDetailsAt: now } });
+      } else if (name) {
+        await db.collection(coll).insertOne({ name, nameLower: String(name).toLowerCase(), createdAt: now, updatedAt: now, invoiceDetails: details, invoiceDetailsAt: now });
+      }
+    };
+    if (b.vendor) await save(VENDORS, order.vendorId, order.vendor, cleanDetails(b.vendor, PARTY_FIELDS.vendor));
+    if (b.customer) await save(CUSTOMERS, order.customerId, order.customerName, cleanDetails(b.customer, PARTY_FIELDS.customer));
+    return res.json({ success: true, invoiceParties: await invoiceParties(db, order) });
+  } catch (e) {
+    console.error("InFlow invoice details error:", e);
+    return res.status(500).json({ success: false, message: "Failed to save the invoice details" });
   }
 });
 
@@ -1292,6 +1368,8 @@ router.get("/statement/order/:id", STATEMENT, async (req, res) => {
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
     // Per-line dispatch progress for the expanded line-items table.
     await attachDispatchState(db, [order]);
+    // no InFlow PDF: the generated invoice's parties
+    if (!order.invoiceUrl) order.invoiceParties = await invoiceParties(db, order);
     return res.json({ success: true, order: withPdf(order) });
   } catch (e) {
     console.error("InFlow statement order error:", e);
