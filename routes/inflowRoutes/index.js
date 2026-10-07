@@ -149,6 +149,16 @@ const DERIVED = {
 // linked and, if so, its progress. Drives the Sales Orders page — a linked
 // order gets the "Dispatch Status" action, an unlinked one is offered
 // create/link inside its detail dialog instead.
+// A dispatch record's status from its quantities: pending / partial /
+// dispatched — or "closed" once someone closed it with quantity still
+// undispatched (user ask 2026-10-07); a fully dispatched record stays
+// "dispatched" either way.
+function dispatchStatusOf(rec, ordered, dispatched) {
+  const base = dispatched <= 0 ? "pending" : dispatched < ordered ? "partial" : "dispatched";
+  return rec && rec.closed && base !== "dispatched" ? "closed" : base;
+}
+const CLOSED_MSG = "This dispatch is closed — reopen it to dispatch more";
+
 async function attachDispatchState(db, orders) {
   const list = (orders || []).filter(Boolean);
   if (!list.length) return orders;
@@ -158,7 +168,7 @@ async function attachDispatchState(db, orders) {
     .collection(DISPATCH_UPLOADS)
     .find(
       { linkedOrderId: { $in: ids } },
-      { projection: { linkedOrderId: 1, invoiceNumber: 1, lineItems: 1 } },
+      { projection: { linkedOrderId: 1, invoiceNumber: 1, lineItems: 1, closed: 1 } },
     )
     .toArray();
   const byOrder = new Map();
@@ -174,8 +184,7 @@ async function attachDispatchState(db, orders) {
       dispatchInvoiceNumber: r.invoiceNumber || "",
       dispatchOrderedQty: ordered,
       dispatchDispatchedQty: dispatched,
-      dispatchStatus:
-        dispatched <= 0 ? "pending" : dispatched < ordered ? "partial" : "dispatched",
+      dispatchStatus: dispatchStatusOf(r, ordered, dispatched),
     });
   }
   for (const o of list) {
@@ -202,8 +211,8 @@ async function attachDispatchState(db, orders) {
         const take = Math.max(0, Math.min(avail, want));
         pool.set(bc, avail - take);
         li.dispatchedQty = take;
-        li.dispatchStatus =
-          take <= 0 ? "pending" : take < want ? "partial" : "dispatched";
+        // A closed record's unfinished lines read "closed" too.
+        li.dispatchStatus = dispatchStatusOf(rec, want, take);
       }
     }
   }
@@ -1326,8 +1335,7 @@ router.get("/statement/order/:id/dispatch", STATEMENT, async (req, res) => {
         invoiceNumber: rec.invoiceNumber || "",
         orderedQty,
         dispatchedQty,
-        dispatchStatus:
-          dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched",
+        dispatchStatus: dispatchStatusOf(rec, orderedQty, dispatchedQty),
         batches: (rec.dispatchBatches || []).map((b) => ({
           batchNo: b.batchNo,
           at: b.at,
@@ -1489,17 +1497,24 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
         $addFields: {
           _status: {
             $cond: [
-              { $lte: ["$_dispatched", 0] },
-              "pending",
-              { $cond: [{ $lt: ["$_dispatched", "$_ordered"] }, "partial", "dispatched"] },
+              // closed with quantity still undispatched
+              { $and: [{ $ne: [{ $ifNull: ["$closed", null] }, null] }, { $lt: ["$_dispatched", "$_ordered"] }] },
+              "closed",
+              {
+                $cond: [
+                  { $lte: ["$_dispatched", 0] },
+                  "pending",
+                  { $cond: [{ $lt: ["$_dispatched", "$_ordered"] }, "partial", "dispatched"] },
+                ],
+              },
             ],
           },
         },
       },
     ];
-    // A comma list of statuses ("pending,partial"); nothing or all three
+    // A comma list of statuses ("pending,partial"); nothing or all four
     // means no filter. "active" survives as an alias for the default pair.
-    const VALID = ["pending", "partial", "dispatched"];
+    const VALID = ["pending", "partial", "dispatched", "closed"];
     const raw = String(req.query.status || "");
     const picked =
       raw === "active"
@@ -1535,8 +1550,7 @@ router.get("/dispatch", VIEW_ORDERS, async (req, res) => {
       const dispatchedQty = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
       o.orderedQty = orderedQty;
       o.dispatchedQty = dispatchedQty;
-      o.dispatchStatus =
-        dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched";
+      o.dispatchStatus = dispatchStatusOf(o, orderedQty, dispatchedQty);
       return withPdf(o);
     });
 
@@ -1575,8 +1589,9 @@ router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
 
     const db = await connectToDatabase();
     const _id = new ObjectId(req.params.id);
-    const order = await db.collection(coll).findOne({ _id }, { projection: { lineItems: 1 } });
+    const order = await db.collection(coll).findOne({ _id }, { projection: { lineItems: 1, closed: 1 } });
     if (!order) return res.status(404).json({ success: false, message: "Not found" });
+    if (order.closed) return res.status(400).json({ success: false, message: CLOSED_MSG });
     if (!Array.isArray(order.lineItems) || lineIndex >= order.lineItems.length) {
       return res.status(400).json({ success: false, message: "Line item not found" });
     }
@@ -1594,6 +1609,63 @@ router.post("/dispatch/:id/qty", VIEW_ORDERS, async (req, res) => {
   } catch (e) {
     console.error("InFlow dispatch qty error:", e);
     return res.status(500).json({ success: false, message: "Failed to save dispatched qty" });
+  }
+});
+
+// ── POST /inflow/dispatch/:id/close · /reopen ──────────────────────
+// Close a dispatch record that still has quantity to dispatch: it is left as
+// it is, reads as "closed", leaves Owing Stocks and takes no new dispatch.
+// Body: { note? }. Reopen puts it back the way it was.
+router.post("/dispatch/:id/close", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const rec = await db.collection(DISPATCH_UPLOADS).findOne({ _id }, { projection: { lineItems: 1, closed: 1 } });
+    if (!rec) return res.status(404).json({ success: false, message: "Not found" });
+    if (rec.closed) return res.status(400).json({ success: false, message: "Already closed" });
+    const items = Array.isArray(rec.lineItems) ? rec.lineItems : [];
+    const ordered = items.reduce((s, li) => s + num(li && li.quantity), 0);
+    const dispatched = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+    if (ordered > 0 && dispatched >= ordered) {
+      return res.status(400).json({ success: false, message: "Everything is dispatched already — nothing to close" });
+    }
+    const closed = {
+      at: new Date(),
+      by: (req.user && (req.user.username || req.user.email)) || null,
+      note: String((req.body && req.body.note) || "").trim().slice(0, 300),
+      ordered,
+      dispatched,
+      remaining: Math.max(0, ordered - dispatched),
+    };
+    await db.collection(DISPATCH_UPLOADS).updateOne({ _id }, { $set: { closed, updatedAt: closed.at } });
+    return res.json({ success: true, closed, dispatchStatus: "closed" });
+  } catch (e) {
+    console.error("InFlow dispatch close error:", e);
+    return res.status(500).json({ success: false, message: "Failed to close the dispatch" });
+  }
+});
+
+router.post("/dispatch/:id/reopen", VIEW_ORDERS, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Bad id" });
+    }
+    const db = await connectToDatabase();
+    const _id = new ObjectId(req.params.id);
+    const rec = await db.collection(DISPATCH_UPLOADS).findOne({ _id }, { projection: { lineItems: 1, closed: 1 } });
+    if (!rec) return res.status(404).json({ success: false, message: "Not found" });
+    if (!rec.closed) return res.status(400).json({ success: false, message: "Not closed" });
+    await db.collection(DISPATCH_UPLOADS).updateOne({ _id }, { $unset: { closed: "" }, $set: { updatedAt: new Date() } });
+    const items = Array.isArray(rec.lineItems) ? rec.lineItems : [];
+    const ordered = items.reduce((s, li) => s + num(li && li.quantity), 0);
+    const dispatched = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
+    return res.json({ success: true, dispatchStatus: dispatchStatusOf(null, ordered, dispatched) });
+  } catch (e) {
+    console.error("InFlow dispatch reopen error:", e);
+    return res.status(500).json({ success: false, message: "Failed to reopen the dispatch" });
   }
 });
 
@@ -1756,8 +1828,9 @@ router.post("/dispatch/:id/batch", VIEW_ORDERS, async (req, res) => {
     const _id = new ObjectId(req.params.id);
     const doc = await db
       .collection(coll)
-      .findOne({ _id }, { projection: { lineItems: 1, dispatchBatches: 1, invoiceNumber: 1 } });
+      .findOne({ _id }, { projection: { lineItems: 1, dispatchBatches: 1, invoiceNumber: 1, closed: 1 } });
     if (!doc) return res.status(404).json({ success: false, message: "Not found" });
+    if (doc.closed) return res.status(400).json({ success: false, message: CLOSED_MSG });
     const items = Array.isArray(doc.lineItems) ? doc.lineItems : [];
 
     const now = new Date();
@@ -2171,8 +2244,7 @@ router.get("/salesorders/:id/dispatch", VIEW_ORDERS, async (req, res) => {
     const dispatchedQty = items.reduce((s, li) => s + num(li && li.dispatchedQty), 0);
     rec.orderedQty = orderedQty;
     rec.dispatchedQty = dispatchedQty;
-    rec.dispatchStatus =
-      dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched";
+    rec.dispatchStatus = dispatchStatusOf(rec, orderedQty, dispatchedQty);
     rec.recordType = "manual";
     return res.json({ success: true, dispatch: rec });
   } catch (e) {
@@ -2185,13 +2257,14 @@ router.get("/salesorders/:id/dispatch", VIEW_ORDERS, async (req, res) => {
 // Outstanding stock: line items whose dispatched quantity is still short
 // of the ordered quantity, grouped by SKU with the owing amounts summed
 // and the contributing records listed. Mirrors the dispatch page — manual
-// upload records only.
+// upload records only, and not the closed ones (what they still lack was
+// let go when they were closed).
 router.get("/dispatch/owing", VIEW_ORDERS, async (req, res) => {
   try {
     const db = await connectToDatabase();
     const uploads = await db
       .collection(DISPATCH_UPLOADS)
-      .find({}, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1 } })
+      .find({ closed: null }, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1 } })
       .toArray();
 
     // Group by iMobile SKU; lines without one fall back to barcode +
@@ -2715,8 +2788,7 @@ router.get("/dispatch/mine", STATEMENT, async (req, res) => {
         invoiceDateRaw: rec.invoiceDateRaw || null,
         orderedQty,
         dispatchedQty,
-        dispatchStatus:
-          dispatchedQty <= 0 ? "pending" : dispatchedQty < orderedQty ? "partial" : "dispatched",
+        dispatchStatus: dispatchStatusOf(rec, orderedQty, dispatchedQty),
         lineItems: items.map((li) => ({
           sku: (li && li.sku) || "",
           description: (li && li.description) || "",
