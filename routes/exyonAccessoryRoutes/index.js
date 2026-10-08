@@ -23,10 +23,10 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
 const { zohoIdsForSkus, netoCall } = require("../../utils/neto");
 
-// Admin-only for now — only admin's wildcard carries exyon:*. Grant
-// "exyon:accessory:view" to a role in constants/roles.js to widen.
+// Admin (*:*:*) and the Exyon Operation role (2026-10-08) — nobody else
+// holds exyon:accessory:* (constants/roles.js).
 const VIEW = requirePermission("exyon:accessory:view");
-// Adding orders to a pick list / taking one off (admin only for now too).
+// Processing orders onto a pick list / taking one off.
 const PICK_EDIT = requirePermission("exyon:accessory:picklist");
 const actor = (req) => (req.user && (req.user.username || req.user.email)) || null;
 

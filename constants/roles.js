@@ -29,6 +29,9 @@ const ROLES = {
   IMOBILE_WAREHOUSE: "imobile-warehouse",
   // Front desk staff — SQT (like TechElite Admin), InFlow, Refurbished Device and Tools.
   IMOBILE_FRONT_DESK: "imobile-front-desk",
+  // Exyon's operations staff — the Exyon Accessories menu (orders, dispatch,
+  // pick lists).
+  EXYON_OPERATION: "exyon-operation",
 };
 
 const ROLE_LABELS = {
@@ -46,6 +49,7 @@ const ROLE_LABELS = {
   [ROLES.IMOBILE_ACCOUNTANT]: "iMobile Accountant",
   [ROLES.IMOBILE_WAREHOUSE]: "iMobile Warehouse",
   [ROLES.IMOBILE_FRONT_DESK]: "iMobile Front Desk",
+  [ROLES.EXYON_OPERATION]: "Exyon Operation",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -56,6 +60,7 @@ const ROLE_GROUPS = {
   TECHELITE: "techelite",
   INFLOW: "inflow",
   CONSIGNMENT: "consignment",
+  EXYON: "exyon",
 };
 
 const ROLE_GROUP_LABELS = {
@@ -63,6 +68,7 @@ const ROLE_GROUP_LABELS = {
   [ROLE_GROUPS.TECHELITE]: "TechElite",
   [ROLE_GROUPS.INFLOW]: "InFlow",
   [ROLE_GROUPS.CONSIGNMENT]: "Consignment",
+  [ROLE_GROUPS.EXYON]: "Exyon",
 };
 
 const ROLE_GROUP_OF = {
@@ -80,6 +86,7 @@ const ROLE_GROUP_OF = {
   [ROLES.IMOBILE_ACCOUNTANT]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_WAREHOUSE]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_FRONT_DESK]: ROLE_GROUPS.IMOBILE,
+  [ROLES.EXYON_OPERATION]: ROLE_GROUPS.EXYON,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -236,6 +243,13 @@ const ROLE_PERMISSIONS = {
     "consign:*:*",
     "zoho:salesOrder:create", "zoho:purchaseOrder:create",
   ],
+  // Exyon Operation (2026-10-08): the Exyon Accessories menu — Orders,
+  // Dispatch (processing orders: tracking numbers, shipping labels) and Pick
+  // Lists. Only Admin (*:*:*) and this role hold exyon:accessory:*.
+  [ROLES.EXYON_OPERATION]: [
+    "exyon:accessory:view",
+    "exyon:accessory:picklist",
+  ],
 };
 
 // Roles whose data is scoped to the shops listed on their user record.
@@ -252,7 +266,7 @@ const SHOP_SCOPED_ROLES = [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP];
 // shop / customer ones narrow the account to its own shops or customer, and
 // code checks them with `req.user.role === …`.
 const COMBINABLE_ROLES = Object.values(ROLES).filter(
-  (r) => ROLE_GROUP_OF[r] === ROLE_GROUPS.IMOBILE,
+  (r) => ROLE_GROUP_OF[r] === ROLE_GROUPS.IMOBILE || ROLE_GROUP_OF[r] === ROLE_GROUPS.EXYON,
 );
 
 function isValidRole(role) {
@@ -270,7 +284,7 @@ function roleSetError(roles) {
   if (roles.length > 1) {
     const single = roles.filter((r) => !isCombinableRole(r));
     if (single.length) {
-      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile can`;
+      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile and Exyon can`;
     }
   }
   return null;
