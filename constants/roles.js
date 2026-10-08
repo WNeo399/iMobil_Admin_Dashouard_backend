@@ -200,12 +200,21 @@ const ROLE_PERMISSIONS = {
   // customer enquiries, which moved into the iMobile Spare Parts menu.
   // parts:browse:view is the Browse Items page (2026-10-07) with its price
   // columns — Admin (*:*:*) and iMobile Warehouse only (the user's choice).
+  // Since 2026-10-08 also the whole Refurbished Device menu, like iMobile
+  // Accountant / Front Desk: stock, sales, supply batches, repairs (view +
+  // manage) and Consignment — not the ExEngine scraper data
+  // (refurb:offer:view) or Incoming Stocks (Admin / iMobile Admin).
   [ROLES.IMOBILE_WAREHOUSE]: [
     "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create", "zoho:purchaseOrder:create",
     "svp:*:*",
     "parts:browse:view",
     "spp:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
+    "refurb:stock:view", "refurb:stock:manage",
+    "refurb:sale:view", "refurb:sale:manage",
+    "refurb:supply:view", "refurb:supply:manage",
+    "refurb:repair:view", "refurb:repair:manage",
+    "consign:*:*",
   ],
   // iMobile Front Desk (2026-10-05): SQT like TechElite Admin (every action,
   // and the admin-side view the frontend / the group filter give by role:
@@ -297,9 +306,9 @@ function userHasRole(user, role) {
 // narrowed to the stock source on their record, with the supplier's view of
 // a device? Yes when they hold that role and none of their OTHER roles opens
 // the stock register by itself: an account's roles add up, so a Phone
-// Supplier who is also Admin / iMobile Admin / Accountant / Front Desk works
+// Supplier who is also Admin / iMobile Admin / Accountant / Front Desk / Warehouse works
 // the whole register like any staff member, while Phone Supplier + Parts
-// Supplier (or Purchase, Warehouse…) stays on its own shelf.
+// Supplier (or Purchase…) stays on its own shelf.
 function actsAsPhoneSupplier(user) {
   const roles = rolesOfUser(user);
   if (!roles.includes(ROLES.PHONE_SUPPLIER)) return false;
