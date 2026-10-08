@@ -41,18 +41,17 @@ const router = express.Router();
 const { ObjectId } = require("mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { connectToDatabase } = require("../../utils/mongodb");
-const multer = require("multer");
-const FormData = require("form-data");
-const { handleZohoInventoryRequest, handleZohoInventoryPostRequest, handleZohoInventoryMultipartPostRequest, handleZohoInventoryPutRequest, refreshToken } = require("../../utils/zohoRequest");
-const { fetchItemDetails } = require("../../utils/zohoStock");
-const { imageIdOf, imageUrlFromId } = require("../../utils/productImage");
-const axios = require("axios");
+const { refreshToken } = require("../../utils/zohoRequest");
+const { imageUrlFromId } = require("../../utils/productImage");
 const { storeImage, removeImage } = require("../../utils/sppImages");
+// creating the Zoho item (shared with the Purchase Order page's New Product lines)
+const {
+  PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, cleanQuality,
+  skuTaken, nextFreeSku, createZohoItem, setPriceLists, uploadItemPhotos, readImagesFromUrls,
+} = require("../../utils/zohoNewItem");
 
 const MODELS = "imb_spp_new_products";
 const ITEMS = "imb_stock_items";
-const ORG = "746138234";
-const ZOHO = "https://www.zohoapis.com/inventory/v1";
 
 const VIEW = requirePermission("spp:product:view");
 const CREATE = requirePermission("spp:product:create");
@@ -104,87 +103,6 @@ function withCodes(m) {
   return codes.length ? `${short} (${codes.join(" / ")})` : short;
 }
 
-// Zoho item setup copied from the team's own stock parts (items 21808 /
-// 13136): an inventory item in qty, Sales / COGS / Inventory Asset, and a
-// placeholder selling price (9999.99 — one of the values Price Monitoring
-// reads as "price still to be set").
-const SALES_ACCOUNT = "2591985000000000388";
-const PURCHASE_ACCOUNT = "2591985000000034003";
-const INVENTORY_ACCOUNT = "2591985000000034001";
-const PLACEHOLDER_RATE = 9999.99;
-// The four price lists (Zoho price books — the same ids as Price Monitoring,
-// routes/stockMonitorRoutes PRICE_LISTS).
-const PRICE_LISTS = {
-  platinum: { id: "2591985000001439015", label: "Platinum" },
-  vip: { id: "2591985000000103001", label: "VIP" },
-  svip: { id: "2591985000078196985", label: "SVIP" },
-  wholesale: { id: "2591985000000103011", label: "Wholesale" },
-};
-const QUALITIES = ["", "Aftermarket", "Original", "Service Pack", "IMB", "Original IMB+", "JK", "Refurbished", "Secondhand", "Original Secondhand", "iVolta", "Original AAA"];
-// The parts SKU sequence (accessories are 25xxx).
-const SKU_MIN = 22000;
-const SKU_MAX = 22999;
-
-// Photos for a new item — Zoho's limits (gif / png / jpeg / bmp / webp,
-// 7 MB each) and 10 at a time, as on the Missing Images upload.
-const IMAGE_MIME = /^image\/(gif|png|jpe?g|bmp|webp)$/i;
-const MAX_IMAGES = 10;
-const photoUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 7 * 1024 * 1024, files: MAX_IMAGES },
-  fileFilter: (req, file, cb) =>
-    IMAGE_MIME.test(file.mimetype)
-      ? cb(null, true)
-      : cb(Object.assign(new Error(`${file.originalname}: only gif, png, jpeg, bmp or webp images`), { badType: true })),
-}).array("images", MAX_IMAGES);
-function acceptPhotos(req, res, next) {
-  photoUpload(req, res, (err) => {
-    if (!err) return next();
-    const message = err.badType ? err.message
-      : err.code === "LIMIT_FILE_SIZE" ? "Each photo must be 7 MB or smaller"
-        : err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE" ? `Up to ${MAX_IMAGES} photos`
-          : "Could not read the photos";
-    return res.status(400).json({ success: false, message });
-  });
-}
-
-// Write a new item's price-list rates — one merge call per list (only this
-// item is touched). Returns { set: { list: rate }, errors: { list: message } }.
-async function setPriceLists(itemId, rates) {
-  const out = { set: {}, errors: {} };
-  for (const [list, rate] of Object.entries(rates)) {
-    try {
-      const r = await handleZohoInventoryPutRequest(
-        `${ZOHO}/pricebooks/${PRICE_LISTS[list].id}/items?organization_id=${ORG}`,
-        [{ item_id: itemId, pricebook_rate: rate }],
-      );
-      if (r && r.code === 0) out.set[list] = rate;
-      else out.errors[list] = (r && r.message) || "Zoho did not take the price";
-    } catch (e) {
-      out.errors[list] = (e && e.message) || "Zoho did not take the price";
-    }
-  }
-  return out;
-}
-
-// Upload photos to a new Zoho item (the first becomes its main image) and
-// read back the main image id. Errors come back as a message, not a throw.
-async function uploadItemPhotos(itemId, files) {
-  try {
-    const url = `${ZOHO}/items/${encodeURIComponent(itemId)}/images?organization_id=${ORG}&update_primary_image=true`;
-    const buildForm = () => {
-      const form = new FormData();
-      for (const f of files) form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });
-      return form;
-    };
-    const r = await handleZohoInventoryMultipartPostRequest(url, buildForm);
-    if (!r || r.code !== 0) return { uploaded: 0, error: (r && r.message) || "Zoho did not accept the photos" };
-    const [detail] = await fetchItemDetails([itemId]).catch(() => []);
-    return { uploaded: files.length, imageId: imageIdOf(detail) };
-  } catch (e) {
-    return { uploaded: 0, error: (e && e.message) || "Could not upload the photos" };
-  }
-}
 
 const str = (v) => String(v == null ? "" : v).trim();
 const oid = (v) => { try { return new ObjectId(String(v)); } catch (e) { return null; } };
@@ -285,7 +203,7 @@ router.get("/", VIEW, async (req, res, next) => {
         deviceBrand: BRANDS[b].deviceBrand,
         parts: BRANDS[b].parts.map((p) => ({ key: p.key, label: p.label, classification: p.classification, subClassification: p.subClassification })),
       })),
-      qualities: QUALITIES,
+      qualities: await qualityOptions(db),
       placeholderRate: PLACEHOLDER_RATE,
       rows,
       // the open drafts, newest first (each opens in the create dialog)
@@ -409,23 +327,7 @@ router.put("/models/:id", CREATE, async (req, res, next) => {
   }
 });
 
-// ── the next free parts SKU ──────────────────────────────────────────
-// The highest 22xxx SKU in the register + 1, and Zoho asked whether it is
-// free (the register lags Zoho by a day). Items created from this page are
-// in `created`, so they count too.
-async function nextFreeSku(db) {
-  const inRegister = await db.collection(ITEMS).find({ sku: /^22\d{3}$/ }, { projection: { _id: 0, sku: 1 } }).toArray();
-  const inCreated = await db.collection(MODELS).aggregate([{ $unwind: "$created" }, { $project: { _id: 0, sku: "$created.sku" } }]).toArray();
-  let n = Math.max(SKU_MIN - 1, ...[...inRegister, ...inCreated].map((x) => Number(x.sku)).filter((x) => Number.isFinite(x) && x >= SKU_MIN && x <= SKU_MAX));
-  for (let tries = 0; tries < 20; tries++) {
-    n += 1;
-    if (n > SKU_MAX) throw new Error("The 22xxx parts SKU range is used up");
-    const r = await handleZohoInventoryRequest(`${ZOHO}/items?organization_id=${ORG}&sku=${n}`);
-    const taken = ((r && r.items) || []).some((it) => String(it.sku).trim() === String(n));
-    if (!taken) return String(n);
-  }
-  throw new Error("Could not find a free SKU");
-}
+// ── the next free parts SKU (utils/zohoNewItem nextFreeSku) ──────────
 
 router.get("/next-sku", CREATE, async (req, res, next) => {
   try {
@@ -467,23 +369,13 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     }
     const name = (str(b.name) || part.name(model)).replace(/[\r\n]+/g, " ");
     if (name.length < 5) return bad(res, "Item name is too short");
-    const quality = str(b.quality);
-    if (quality && !QUALITIES.includes(quality)) return bad(res, "Unknown quality");
+    const { quality, error: qualityError } = cleanQuality(b.quality);
+    if (qualityError) return bad(res, qualityError);
     const rate = b.rate === undefined || b.rate === null || b.rate === "" ? PLACEHOLDER_RATE : Number(b.rate);
     if (!Number.isFinite(rate) || rate < 0) return bad(res, "Selling price must be 0 or more");
     // the price lists given (blank = left unset), checked before creating
-    let askedPrices = b.prices || {};
-    if (typeof askedPrices === "string") {
-      try { askedPrices = JSON.parse(askedPrices || "{}"); } catch (e) { return bad(res, "Bad price lists"); }
-    }
-    const listRates = {};
-    for (const [list, v] of Object.entries(askedPrices || {})) {
-      if (!PRICE_LISTS[list]) return bad(res, `Unknown price list "${list}"`);
-      if (v === null || v === undefined || v === "") continue;
-      const n = Number(v);
-      if (!Number.isFinite(n) || n < 0 || n > 1000000) return bad(res, `${PRICE_LISTS[list].label}: the price must be 0 or more`);
-      listRates[list] = Math.round(n * 100) / 100;
-    }
+    const { rates: listRates, error: priceError } = parsePriceLists(b.prices);
+    if (priceError) return bad(res, priceError);
     // every model the part fits — the brand's models from the page, this
     // one by default; written to Zoho as one "; "-separated value, the way
     // the register reads it back
@@ -495,41 +387,22 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     let sku = str(b.sku);
     if (sku) {
       if (!/^\d{4,6}$/.test(sku)) return bad(res, "SKU must be a number");
-      const r = await handleZohoInventoryRequest(`${ZOHO}/items?organization_id=${ORG}&sku=${encodeURIComponent(sku)}`);
-      if (((r && r.items) || []).some((it) => String(it.sku).trim() === sku)) return bad(res, `SKU ${sku} is already used in Zoho`);
+      if (await skuTaken(sku)) return bad(res, `SKU ${sku} is already used in Zoho`);
     } else {
       sku = await nextFreeSku(db);
     }
 
-    const customFields = [
-      { api_name: "cf_tags", value: part.classification },
-      { api_name: "cf_device_brand", value: cfg.deviceBrand },
-      { api_name: "cf_compatible_model", value: compatibleModel },
-    ];
-    if (part.subClassification) customFields.push({ api_name: "cf_sub_classification", value: part.subClassification });
-    const deviceSeries = seriesFor(cfg, compatibleModels);
-    if (deviceSeries) customFields.push({ api_name: "cf_device_series", value: deviceSeries });
-    if (quality) customFields.push({ api_name: "cf_quality", value: quality });
-    const body = {
-      name,
-      sku,
-      unit: "qty",
-      item_type: "inventory",
-      product_type: "goods",
-      rate,
-      purchase_rate: 0,
-      account_id: SALES_ACCOUNT,
-      purchase_account_id: PURCHASE_ACCOUNT,
-      inventory_account_id: INVENTORY_ACCOUNT,
-      custom_fields: customFields,
-    };
-    const z = await handleZohoInventoryPostRequest(`${ZOHO}/items?organization_id=${ORG}`, body);
-    if (!z || z.code !== 0 || !z.item) {
-      const msg = (z && (z.message || (z.error && z.error.message))) || "Zoho did not create the item";
-      return res.status(502).json({ success: false, message: `Zoho: ${msg}` });
-    }
+    const z = await createZohoItem({
+      name, sku, rate, quality,
+      classification: part.classification,
+      subClassification: part.subClassification,
+      deviceBrand: cfg.deviceBrand,
+      deviceSeries: seriesFor(cfg, compatibleModels),
+      compatibleModel,
+    });
+    if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
     // the photos go onto the new item; a failure there leaves the item made
-    const fromDraft = draft ? await readDraftImages(draft.images || []) : { files: [], errors: [] };
+    const fromDraft = draft ? await readImagesFromUrls(draft.images || []) : { files: [], errors: [] };
     const allFiles = [...fromDraft.files, ...files];
     const photos = allFiles.length ? await uploadItemPhotos(String(z.item.item_id), allFiles) : null;
     if (fromDraft.errors.length) {
@@ -586,8 +459,8 @@ function draftFields(b, cfg) {
   const name = str(b.name).replace(/[\r\n]+/g, " ").slice(0, 200);
   const sku = str(b.sku);
   if (sku && !/^\d{4,6}$/.test(sku)) return { error: "SKU must be a number" };
-  const quality = str(b.quality);
-  if (quality && !QUALITIES.includes(quality)) return { error: "Unknown quality" };
+  const { quality, error: qualityError } = cleanQuality(b.quality);
+  if (qualityError) return { error: qualityError };
   const rate = b.rate === undefined || b.rate === null || b.rate === "" ? null : Number(b.rate);
   if (rate !== null && (!Number.isFinite(rate) || rate < 0)) return { error: "Selling price must be 0 or more" };
   const askedPrices = jsonField(b.prices, {});
@@ -621,19 +494,6 @@ function draftFull(d) {
   };
 }
 
-// The draft's photos, read back from S3 for the Zoho upload (re-encoded JPEGs).
-async function readDraftImages(images) {
-  const out = { files: [], errors: [] };
-  for (const im of images) {
-    try {
-      const r = await axios.get(im.url, { responseType: "arraybuffer", timeout: 30000 });
-      out.files.push({ buffer: Buffer.from(r.data), originalname: im.name || `${im.id}.jpg`, mimetype: "image/jpeg" });
-    } catch (e) {
-      out.errors.push(im.id);
-    }
-  }
-  return out;
-}
 
 async function draftModel(db, modelId) {
   const _id = oid(modelId);

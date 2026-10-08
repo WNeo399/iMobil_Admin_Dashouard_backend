@@ -31,6 +31,8 @@
 //                                                       admin, iMobile admin, parts supplier
 //   spp:order:supply    quote / place / shortage        admin, iMobile admin, parts supplier
 //   spp:order:receive   receive a batch                 admin, iMobile admin
+//   spp:product:create  create a New Product line's item in Zoho (also New Products)
+//                                                       admin, iMobile admin, iMobile purchase, warehouse
 //   spp:batch:view      read the batches                all three
 //   spp:batch:create    create a batch                  all three
 //   spp:batch:manage    edit tracking / date, cancel    all three
@@ -48,6 +50,8 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
 const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, ZOHO_VENDORS, vendorById } = require("../../utils/sppZoho");
 const { MAX_IMAGES, acceptImage, storeImage, removeImage } = require("../../utils/sppImages");
+const { refreshToken } = require("../../utils/zohoRequest");
+const zohoItem = require("../../utils/zohoNewItem");
 
 const ORDERS = "imb_spp_orders";
 const BATCHES = "imb_spp_batches";
@@ -370,6 +374,185 @@ router.delete("/orders/:id/images/:imageId", requireAny("spp:order:create", "spp
     return res.json({ success: true });
   } catch (error) {
     next(error);
+  }
+});
+
+// ── A New Product line → a Zoho item (user ask 2026-10-08) ──────────
+// The line is a product not in Zoho yet; the dialog on the Purchase Order
+// page creates it there (set up like the New Products page's items:
+// utils/zohoNewItem) and links the line to it.
+const PRODUCT_CREATE = requirePermission("spp:product:create");
+const jsonOr = (v, fallback) => {
+  if (typeof v !== "string") return v === undefined || v === null ? fallback : v;
+  if (!v.trim()) return fallback;
+  try { return JSON.parse(v); } catch (e) { return fallback; }
+};
+const listOf = (v) => (Array.isArray(v) ? v : String(v == null ? "" : v).split(/[;\n]/)).map((x) => str(x)).filter(Boolean);
+
+// GET /zoho-item/options?brand= — the dialog's pick lists, from the stock
+// register: classifications with their sub classifications, device brands
+// (by how many parts use them), and for a brand its series and models (each
+// model with every series its parts are filed under, most used first).
+router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
+  try {
+    const db = await connectToDatabase();
+    const items = db.collection(ITEMS);
+    const base = { active: { $ne: false }, scope: "parts" };
+    // only the agreed classifications (the register also holds stray values
+    // like "Phones" or "-"), each listed even when no part uses it yet
+    const cls = await items.aggregate([
+      { $match: { ...base, classification: { $in: CLASSIFICATIONS } } },
+      { $group: { _id: { c: "$classification", s: { $ifNull: ["$subClassification", ""] } }, n: { $sum: 1 } } },
+    ]).toArray();
+    const byClass = new Map(CLASSIFICATIONS.map((c) => [c, { value: c, count: 0, subs: [] }]));
+    for (const x of cls) {
+      const c = byClass.get(x._id.c) || { value: x._id.c, count: 0, subs: [] };
+      c.count += x.n;
+      if (x._id.s) c.subs.push({ value: x._id.s, count: x.n });
+      byClass.set(x._id.c, c);
+    }
+    const classifications = [...byClass.values()].sort((a, b) => b.count - a.count);
+    classifications.forEach((c) => c.subs.sort((a, b) => b.count - a.count));
+    const brands = (await items.aggregate([
+      { $match: { ...base, deviceBrand: { $nin: [null, ""] } } },
+      { $group: { _id: "$deviceBrand", n: { $sum: 1 } } },
+      { $sort: { n: -1 } },
+    ]).toArray()).map((x) => ({ value: x._id, count: x.n }));
+
+    let series = [];
+    let models = [];
+    const brand = str(req.query.brand);
+    if (brand) {
+      const rows = await items.find({ ...base, deviceBrand: brand }, { projection: { _id: 0, deviceSeries: 1, compatibleModels: 1 } }).toArray();
+      const seriesCount = new Map();
+      const modelSeries = new Map();
+      for (const r of rows) {
+        const ss = listOf(r.deviceSeries);
+        ss.forEach((x) => seriesCount.set(x, (seriesCount.get(x) || 0) + 1));
+        for (const m of r.compatibleModels || []) {
+          if (!modelSeries.has(m)) modelSeries.set(m, new Map());
+          ss.forEach((x) => modelSeries.get(m).set(x, (modelSeries.get(m).get(x) || 0) + 1));
+        }
+      }
+      series = [...seriesCount.entries()].sort((a, b) => b[1] - a[1]).map(([value, count]) => ({ value, count }));
+      models = [...modelSeries.entries()]
+        .map(([model, sm]) => ({ model, series: [...sm.entries()].sort((a, b) => b[1] - a[1]).map(([x]) => x) }))
+        .sort((a, b) => a.model.localeCompare(b.model, "en", { numeric: true }));
+    }
+    return res.json({
+      success: true,
+      classifications,
+      brands,
+      series,
+      models,
+      qualities: await zohoItem.qualityOptions(db),
+      placeholderRate: zohoItem.PLACEHOLDER_RATE,
+      priceLists: Object.entries(zohoItem.PRICE_LISTS).map(([key, v]) => ({ key, label: v.label })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /orders/:id/zoho-item — create the line's item in Zoho and link it.
+// multipart/form-data: name, sku?, quality, rate, prices (JSON),
+// classification, subClassification, deviceBrand, deviceSeries,
+// compatibleModels (JSON), order (JSON photo order: [{ id }] a photo already
+// on the line, [{ new: n }] the n-th file sent now) + "images".
+router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, async (req, res, next) => {
+  const _id = oid(req.params.id);
+  let db = null;
+  let claimed = false;
+  try {
+    if (!_id) return bad(res, "invalid id");
+    const b = req.body || {};
+    db = await connectToDatabase();
+    const order = await db.collection(ORDERS).findOne({ _id });
+    if (!order) return res.status(404).json({ success: false, message: "Order not found" });
+    if (order.category !== NEW_PRODUCT) return bad(res, "Only a New Product line is created in Zoho from here");
+    if (order.itemId) return bad(res, `This line is already linked to SKU ${order.sku || order.itemId}`);
+    if (order.status === "cancelled") return bad(res, "This line is cancelled");
+
+    const name = str(b.name).replace(/[\r\n]+/g, " ");
+    if (name.length < 5) return bad(res, "Item name is too short");
+    const { quality, error: qualityError } = zohoItem.cleanQuality(b.quality);
+    if (qualityError) return bad(res, qualityError);
+    const rate = hasVal(b.rate) ? Number(b.rate) : zohoItem.PLACEHOLDER_RATE;
+    if (!Number.isFinite(rate) || rate < 0) return bad(res, "Selling price must be 0 or more");
+    const { rates: listRates, error: priceError } = zohoItem.parsePriceLists(b.prices);
+    if (priceError) return bad(res, priceError);
+    const classification = str(b.classification);
+    if (!classification) return bad(res, "Pick a classification");
+    const subClassification = str(b.subClassification);
+    const deviceBrand = str(b.deviceBrand);
+    const deviceSeries = [...new Set(listOf(jsonOr(b.deviceSeries, [])))].join("; ");
+    const compatibleModels = [...new Set(listOf(jsonOr(b.compatibleModels, [])))];
+    let sku = str(b.sku);
+    if (sku && !/^\d{4,6}$/.test(sku)) return bad(res, "SKU must be a number");
+    const saved = order.images || [];
+    let photoOrder = jsonOr(b.order, null);
+    if (!Array.isArray(photoOrder)) photoOrder = [...saved.map((im) => ({ id: im.id })), ...(req.files || []).map((x, i) => ({ new: i }))];
+
+    // the SKU first — a refusal leaves the line untouched
+    await refreshToken();
+    if (sku) {
+      if (await zohoItem.skuTaken(sku)) return bad(res, `SKU ${sku} is already used in Zoho`);
+    } else {
+      sku = await zohoItem.nextFreeSku(db);
+    }
+    // one at a time per line — a double click must not make two items
+    const claim = await db.collection(ORDERS).updateOne(
+      { _id, itemId: { $in: [null, ""] }, zohoCreating: { $exists: false } },
+      { $set: { zohoCreating: new Date() } },
+    );
+    if (!claim.modifiedCount) return bad(res, "This line's item is being created already");
+    claimed = true;
+    const z = await zohoItem.createZohoItem({
+      name, sku, rate, quality, classification, subClassification, deviceBrand, deviceSeries,
+      compatibleModel: compatibleModels.join("; "),
+    });
+    if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
+    const itemId = String(z.item.item_id);
+    const finalSku = String(z.item.sku || sku);
+    const finalName = z.item.name || name;
+
+    // the photos, in the dialog's order: the line's own (read back from S3) and the new files
+    const files = [];
+    let unreadable = 0;
+    for (const o of photoOrder) {
+      if (o && o.id) {
+        const im = saved.find((x) => x.id === o.id);
+        if (!im) continue;
+        const r = await zohoItem.readImagesFromUrls([im]);
+        files.push(...r.files);
+        unreadable += r.errors.length;
+      } else if (o && Number.isInteger(o.new) && req.files && req.files[o.new]) {
+        files.push(req.files[o.new]);
+      }
+    }
+    const photos = files.length ? await zohoItem.uploadItemPhotos(itemId, files) : null;
+    if (unreadable) {
+      const note = `${unreadable} saved photo(s) could not be read`;
+      if (photos) photos.error = photos.error ? `${photos.error}; ${note}` : note;
+    }
+    const prices = Object.keys(listRates).length ? await zohoItem.setPriceLists(itemId, listRates) : null;
+
+    const now = new Date();
+    const by = actor(req);
+    await db.collection(ORDERS).updateOne(
+      { _id },
+      {
+        $set: { itemId, sku: finalSku, imageId: (photos && photos.imageId) || order.imageId || null, zohoItem: { at: now, by, name: finalName }, updatedAt: now },
+        $unset: { zohoCreating: "" },
+        $push: { history: hist("created in Zoho", by, { sku: finalSku, name: finalName }) },
+      },
+    );
+    claimed = false;
+    return res.json({ success: true, item: { itemId, sku: finalSku, name: finalName }, photos, prices });
+  } catch (error) {
+    next(error);
+  } finally {
+    if (claimed && db) await db.collection(ORDERS).updateOne({ _id }, { $unset: { zohoCreating: "" } }).catch(() => {});
   }
 });
 
