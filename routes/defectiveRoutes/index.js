@@ -478,11 +478,10 @@ const WRITE_LISTING_TOOL = {
       faults: { type: "string", description: "Known faults — every finding recorded faulty, with its note and what the photos show, one per line starting with '- '. Plain and specific." },
       included: { type: "string", description: "Only when the staff said something extra comes with it (charger, box, case…): what that is. Otherwise an empty string — the item alone needs no line and the section is not shown. Never ask about it." },
       condition: { type: "string", description: "The item description a buyer reads: what the item is and its condition, built only from the facts the staff gave (plus what the photos plainly show). Two to five plain lines that state the facts directly ('Screen is cracked at the top corner.') — never 'the staff say', 'as described', 'reported', 'according to' or any mention of who told you. No untested functions, assumptions or anything that was not given." },
-      conditionLabel: { type: "string", enum: CONDITIONS, description: "The one label that fits best." },
       openQuestions: { type: "array", items: { type: "string" }, description: "Only the basics still missing before it can go on sale — photos or a video, the price — one short line each, up to 2. Never what's included (unsaid means it comes alone). Nothing else: never ask for more tests or details; what the staff did not mention is simply left as untested." },
       photoNotes: { type: "array", items: { type: "object", properties: { photo: { type: "integer" }, note: { type: "string" } }, required: ["photo", "note"] }, description: "What each photo shows, numbered as given (one short line each)." },
     },
-    required: ["title", "summary", "works", "faults", "included", "condition", "conditionLabel", "openQuestions"],
+    required: ["title", "summary", "works", "faults", "included", "condition", "openQuestions"],
   },
 };
 const SYSTEM_PROMPT = `You write honest, plain-English sales listings for defective, old or faulty items sold as-is by an Australian phone repair shop — mostly phones and other devices, but it can be anything. Buyers are technicians, tinkerers and bargain hunters; they need to know exactly what is wrong.
@@ -543,7 +542,6 @@ function draftOf(i, photoCount) {
   const draft = {
     title: str(i.title, 120), summary: str(i.summary, 300),
     description: { works: str(i.works, 4000), faults: str(i.faults, 4000), included: str(i.included, 500), condition: str(i.condition, 4000) },
-    conditionLabel: CONDITIONS.includes(i.conditionLabel) ? i.conditionLabel : "",
     openQuestions: (Array.isArray(i.openQuestions) ? i.openQuestions : []).map((q) => str(q, 300)).filter(Boolean).slice(0, 3),
     photoNotes: (Array.isArray(i.photoNotes) ? i.photoNotes : []).map((p) => ({ photo: num(p && p.photo), note: str(p && p.note, 300) })).filter((p) => p.note),
   };
@@ -798,7 +796,7 @@ async function applyWriteTool(db, l, input, by) {
   const ai = { draftedAt: new Date(), by, model: AI_MODEL, promptVersion: AI_PROMPT_VERSION, photos, via: "chat", draft };
   const now = new Date();
   await db.collection(LISTINGS).updateOne({ _id: l._id }, {
-    $set: { ai, title: draft.title, summary: draft.summary, description: draft.description, conditionLabel: draft.conditionLabel, updatedAt: now, updatedBy: by },
+    $set: { ai, title: draft.title, summary: draft.summary, description: draft.description, updatedAt: now, updatedBy: by },   // the condition label stays the staff's (2026-10-09)
     $push: { history: hist("AI draft (chat)", by, { photos }) },
   });
   const after = await loadListing(db, l._id);
