@@ -48,6 +48,7 @@ function outOfScope(user, device) {
   return src !== null && (!device || device.stockSource !== src);
 }
 const DEVICES = "refurb_devices";
+const { recordTransfer, SNAPSHOT } = require("../../utils/refurbTransfers");
 const SUPPLY_BATCHES = "refurb_supply_batches";
 
 function escapeRegex(s) {
@@ -741,6 +742,8 @@ router.post("/bulk-location", MANAGE, async (req, res) => {
     const who = (req.user && req.user.username) || null;
     let moved = 0;
     const skipped = [];
+    const movedIds = [];
+    const from = new Map();   // device id → the shelf it left
     for (const d of devices) {
       if (d.status && d.status !== "In Stock") {
         skipped.push({ imei: d.imei, reason: `${d.status} — not movable` });
@@ -763,13 +766,25 @@ router.post("/bulk-location", MANAGE, async (req, res) => {
           },
         },
       );
-      if (r.modifiedCount) moved += 1;
+      if (r.modifiedCount) { moved += 1; movedIds.push(d._id); from.set(String(d._id), d.location || ""); }
       else skipped.push({ imei: d.imei, reason: "No longer In Stock" });
+    }
+    // the batch leaves a numbered transfer record (printable / downloadable)
+    let transfer = null;
+    if (movedIds.length) {
+      try {
+        const docs = await db.collection(DEVICES).find({ _id: { $in: movedIds } }, { projection: SNAPSHOT }).toArray();
+        const t = await recordTransfer(db, { to: location, devices: docs, from, who, note: body.note });
+        if (t) transfer = { _id: t._id, transferNo: t.transferNo, count: t.count, to: t.to };
+      } catch (e) {
+        console.error("Refurb transfer record error:", e);
+      }
     }
     return res.json({
       success: true,
       moved,
       skipped,
+      transfer,
       message: `${moved} device(s) moved to ${location}`,
     });
   } catch (e) {
