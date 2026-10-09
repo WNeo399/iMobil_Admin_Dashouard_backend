@@ -209,8 +209,8 @@ const ROLE_PERMISSIONS = {
   // columns — Admin (*:*:*) and iMobile Warehouse only (the user's choice).
   // Since 2026-10-08 also the whole Refurbished Device menu, like iMobile
   // Accountant / Front Desk: stock, sales, supply batches, repairs (view +
-  // manage) and Consignment — not the ExEngine scraper data
-  // (refurb:offer:view) or Incoming Stocks (Admin / iMobile Admin).
+  // manage), Consignment and, since 2026-10-09, Incoming Stocks (the user:
+  // full Refurbished Device) — not the ExEngine scraper data (refurb:offer:view).
   [ROLES.IMOBILE_WAREHOUSE]: [
     "zoho:stock:*", "zoho:collection:*", "zoho:salesOrder:create", "zoho:purchaseOrder:create",
     "svp:*:*",
@@ -221,6 +221,7 @@ const ROLE_PERMISSIONS = {
     "refurb:sale:view", "refurb:sale:manage",
     "refurb:supply:view", "refurb:supply:manage",
     "refurb:repair:view", "refurb:repair:manage",
+    "refurb:incoming:manage",   // Incoming Stocks too (2026-10-09, user: full Refurbished Device)
     "consign:*:*",
   ],
   // iMobile Front Desk (2026-10-05): SQT like TechElite Admin (every action,
