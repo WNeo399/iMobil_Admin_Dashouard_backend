@@ -55,6 +55,8 @@ var inflowWebhookRouter = require('./routes/inflowWebhookRoutes/index');
 var exengineRouter = require('./routes/exengineRoutes/index');
 // Exyon Accessories — Exyon's accessory orders (their exyon.accessory_orders table, read-only).
 var exyonAccessoryRouter = require('./routes/exyonAccessoryRoutes/index');
+// Defective devices for sale — one-off listings with AI-drafted text, photos and video (2026-10-09).
+var defectiveRouter = require('./routes/defectiveRoutes/index');
 var consignmentRouter = require('./routes/consignmentRoutes/index');
 var blackbeltRouter = require('./routes/blackbeltRoutes/index');
 var explodedRouter = require('./routes/explodedRoutes/index');
@@ -197,6 +199,7 @@ app.use('/aiQuery', authenticate, aiQueryRouter);
 app.use('/inflow', authenticate, inflowRouter);
 app.use('/exengine', authenticate, exengineRouter);
 app.use('/exyon-accessories', authenticate, exyonAccessoryRouter);
+app.use('/defective', authenticate, defectiveRouter);
 app.use('/consignment', authenticate, consignmentRouter);
 app.use('/blackbelt', authenticate, blackbeltRouter);
 app.use('/exploded', authenticate, explodedRouter);
