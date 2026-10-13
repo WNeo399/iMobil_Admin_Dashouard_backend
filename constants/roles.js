@@ -9,6 +9,9 @@ const ROLES = {
   IMOBILE_ADMIN: "imobile-admin",
   IMOBILE_REPAIR_ADMIN: "imobile-repair-admin",
   TECHELITE_ADMIN: "techelite-admin",
+  // SQT Call Center (2026-10-13): phones every new case's customer to
+  // explain the repair process — the SQT → Call Center page and nothing else.
+  SQT_CALL_CENTER: "sqt-call-center",
   SHOP_OWNER: "shop-owner",
   REPAIR_SHOP: "repair-shop",
   // Portal login for an InFlow customer — sees only their own statement.
@@ -39,6 +42,7 @@ const ROLE_LABELS = {
   [ROLES.IMOBILE_ADMIN]: "iMobile Admin",
   [ROLES.IMOBILE_REPAIR_ADMIN]: "iMobile Repair Admin",
   [ROLES.TECHELITE_ADMIN]: "TechElite Admin",
+  [ROLES.SQT_CALL_CENTER]: "SQT Call Center",
   [ROLES.SHOP_OWNER]: "Repair Shop Owner",
   [ROLES.REPAIR_SHOP]: "Repair Shop",
   [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
@@ -76,6 +80,7 @@ const ROLE_GROUP_OF = {
   [ROLES.IMOBILE_ADMIN]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_REPAIR_ADMIN]: ROLE_GROUPS.IMOBILE,
   [ROLES.TECHELITE_ADMIN]: ROLE_GROUPS.TECHELITE,
+  [ROLES.SQT_CALL_CENTER]: ROLE_GROUPS.TECHELITE,
   [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
   [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
   [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
@@ -130,6 +135,11 @@ const ROLE_PERMISSIONS = {
   // TechElite Admin owns the SQT domain. User management (System tab) was
   // revoked 2026-08 — system:user:manage is Admin-only now.
   [ROLES.TECHELITE_ADMIN]: ["sqt:*:*"],
+  // SQT Call Center: the Call Center page only — see the cases to call
+  // with the customer's details, mark a customer as contacted, leave a
+  // note. No Cases page, no shops / models. (Admin, TechElite Admin and
+  // iMobile Front Desk reach the page through their sqt wildcards.)
+  [ROLES.SQT_CALL_CENTER]: ["sqt:callcenter:view", "sqt:callcenter:contact"],
   [ROLES.SHOP_OWNER]: [...SHOP_CASE_PERMISSIONS],
   [ROLES.REPAIR_SHOP]: [...SHOP_CASE_PERMISSIONS],
   // InFlow Customer — a portal login for a customer; sees only their statement.
