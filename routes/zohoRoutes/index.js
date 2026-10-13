@@ -137,35 +137,9 @@ router.get("/collectionStocks", requirePermission("zoho:stock:view"), async func
 // pinned ids straight from Mongo (instant, no Zoho call, no Analytics
 // lag), and the nightly snapshot stamps its title into every member row's
 // `collections`, which feeds the Dashboard's Collection filter. It is
-// deliberately NOT in any collection group, so it stays out of the
-// category tree — the page pins it as a tab instead.
-const SEA_FREIGHT_TITLE = "海运";
-async function seaFreightDoc(db) {
-  const col = db.collection("productCollections");
-  let doc = await col.findOne({ seaFreight: true });
-  if (!doc) {
-    // Adopt a hand-made collection of the same name rather than shadow it.
-    doc = await col.findOne({ title: SEA_FREIGHT_TITLE });
-    if (doc) await col.updateOne({ _id: doc._id }, { $set: { seaFreight: true } });
-  }
-  if (!doc) {
-    const fresh = {
-      title: SEA_FREIGHT_TITLE,
-      seaFreight: true,
-      note: "Sea-freight list — pinned tab on Stock Monitoring",
-      type: "Selection",
-      status: "active",
-      rules: [],
-      children: [],
-      products: [],
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-    const r = await col.insertOne(fresh);
-    doc = { _id: r.insertedId, ...fresh };
-  }
-  return doc;
-}
+// (the doc helper and the bulk add live in utils/seaFreight — shared with
+// Stock Monitoring's "add everything shown" since 2026-10-13)
+const { seaFreightDoc, addSeaFreightItems } = require("../../utils/seaFreight");
 
 router.get("/seaFreight", requirePermission("zoho:stock:view"), async (req, res) => {
   try {
@@ -180,32 +154,19 @@ router.get("/seaFreight", requirePermission("zoho:stock:view"), async (req, res)
 });
 
 // Bulk add — body { items: [{ id, name, sku }] }. Already-listed items are
-// skipped, so re-adding is a no-op.
+// skipped, so re-adding is a no-op. The cap went 500 → 5,000 on 2026-10-13
+// for the lists' "Selected (N)" action (a page's worth at a time, kept
+// across pages).
 router.post("/seaFreight/items", requirePermission("zoho:stock:view"), async (req, res) => {
   try {
     const items = Array.isArray((req.body || {}).items) ? req.body.items : [];
-    const clean = items
-      .map((i) => ({
-        itemId: String((i && i.id) || "").trim(),
-        name: String((i && i.name) || "").trim(),
-        sku: String((i && i.sku) || "").trim(),
-        imageUrl: "",
-      }))
-      .filter((i) => /^\d{5,25}$/.test(i.itemId));
-    if (!clean.length) return res.status(400).json({ success: false, message: "No items to add." });
-    if (clean.length > 500) return res.status(400).json({ success: false, message: "Too many items (max 500)." });
+    const ids = items.filter((i) => /^\d{5,25}$/.test(String((i && i.id) || "").trim()));
+    if (!ids.length) return res.status(400).json({ success: false, message: "No items to add." });
+    if (ids.length > 5000) return res.status(400).json({ success: false, message: "Too many items (max 5,000)." });
 
     const db = await connectToDatabase();
-    const doc = await seaFreightDoc(db);
-    const existing = new Set((doc.products || []).map((p) => String(p.itemId)));
-    const fresh = clean.filter((i) => !existing.has(i.itemId));
-    if (fresh.length) {
-      await db.collection("productCollections").updateOne(
-        { _id: doc._id },
-        { $push: { products: { $each: fresh } }, $set: { updatedAt: new Date() } },
-      );
-    }
-    return res.json({ success: true, added: fresh.length, already: clean.length - fresh.length, total: existing.size + fresh.length });
+    const r = await addSeaFreightItems(db, ids);
+    return res.json({ success: true, ...r });
   } catch (error) {
     console.error("seaFreight add error:", error);
     return res.status(500).json({ success: false, message: "Failed to add to 海运" });
