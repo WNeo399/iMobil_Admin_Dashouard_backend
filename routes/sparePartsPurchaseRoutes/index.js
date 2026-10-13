@@ -259,7 +259,7 @@ router.get("/orders", VIEW, async (req, res, next) => {
 });
 
 // The pick lists on their own (the Batches page needs the suppliers).
-router.get("/meta", VIEW, async (req, res, next) => {
+router.get("/meta", requireAny("spp:order:view", "spp:batch:create"), async (req, res, next) => {
   try {
     const db = await connectToDatabase();
     return res.json({ success: true, categories: CATEGORIES, suppliers: await supplierOptions(db), zohoVendors: ZOHO_VENDORS });
@@ -307,7 +307,12 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
       .find({ status: { $in: ["ordered", "pending"] }, sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { history: 0 } })
       .toArray();
     const candidates = rows.filter((r) => !exclude.has(String(r._id)) && !awaitsQuote(r));
-    if (!candidates.length) return res.json({ success: true, match: null, hadWaiting: rows.length > 0 });
+    if (!candidates.length) {
+      // Not on any order (user ask 2026-10-13: such a scan is kept on the
+      // batch for adjustment): the register's name for the SKU, if known.
+      const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { _id: 0, sku: 1, name: 1, classification: 1 } });
+      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: item ? { sku: item.sku, name: item.name || "", classification: item.classification || "" } : null });
+    }
     candidates.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
     return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1 });
   } catch (error) {
@@ -1186,6 +1191,55 @@ router.post("/orders/:id/reopen", CREATE_OR_SUPPLY, (req, res, next) =>
   }),
 );
 
+// ── Mark a line as completed (user ask 2026-10-13) ─────────────────────
+// For lines that were sent and received before the system tracked them:
+// the line closes as received on its ordered quantity — no batch, no Zoho
+// purchase order — and sits under Received, flagged `completed`. Anyone who
+// can receive (spp:order:receive). A shipped line is received through its
+// batch instead.
+//   POST /orders/:id/complete  { receivedAt?: "YYYY-MM-DD", note? }
+router.post("/orders/:id/complete", RECEIVE, async (req, res, next) => {
+  try {
+    const _id = oid(req.params.id);
+    if (!_id) return bad(res, "invalid id");
+    const b = req.body || {};
+    const db = await connectToDatabase();
+    const col = db.collection(ORDERS);
+    const rec = await col.findOne({ _id });
+    if (!rec) return res.status(404).json({ success: false, message: "Order not found" });
+    if (!["pending", "toConfirm", "ordered", "shortage"].includes(rec.status)) {
+      return bad(res, rec.status === "shipped" ? `${rec.orderNo} is on batch ${rec.batchNo || ""} — receive the batch instead` : `${rec.orderNo} is ${rec.status}`);
+    }
+    const now = new Date();
+    const receivedAt = dayDate(b.receivedAt) || now;
+    const note = str(b.note).slice(0, 200);
+    const by = actor(req);
+    const set = {
+      status: "received",
+      shippedQty: rec.orderQty,
+      shippedAt: receivedAt,
+      receivedQty: rec.orderQty,
+      receivedAt,
+      receivedBy: by,
+      completed: true,
+      completedAt: now,
+      completedBy: by,
+      updatedAt: now,
+      receivedVia: { completed: true, note: note || "Marked as completed from the Purchase Order page (received outside the system, no batch)" },
+    };
+    if (!rec.orderedAt) { set.orderedAt = receivedAt; set.orderedBy = by; }
+    await col.updateOne({ _id, status: rec.status }, { $set: set, $push: { history: hist("completed", by, { from: rec.status, receivedQty: rec.orderQty, ...(note ? { note } : {}) }) } });
+    // a draft batch still listing the line could no longer ship it
+    const drafts = await db.collection(BATCHES).find({ status: "draft", "lines.orderId": _id }, { projection: { createdBy: 1, tracking: 1 } }).toArray();
+    return res.json({
+      success: true,
+      warnings: drafts.map((d) => `Also listed on a draft batch by ${d.createdBy || "?"}${d.tracking ? " (" + d.tracking + ")" : ""} — take it off there`),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Device Brand / Device Series of register items, for the part labels:
 // they print the product name without them (user ask 2026-09-30). Either
 // page's viewers print labels (Purchase Order, Order Batches, Batches).
@@ -1332,6 +1386,22 @@ async function draftPayload(db, b) {
   if (rawLines.length > 300) return { error: "Too many lines (max 300)" };
   const parsed = [];
   for (const l of rawLines) {
+    // A scan that matched no order (user ask 2026-10-13: "leave it as it
+    // is for future adjustment"): kept on the draft by SKU with no order
+    // behind it, until someone removes it or finds its order. It cannot
+    // ship (shipBatch refuses).
+    if (l.unmatched === true || !l.orderId) {
+      const sku = str(l.sku).slice(0, 80);
+      if (!sku) return { error: "An unmatched line needs a SKU" };
+      let uqty = null;
+      if (hasVal(l.qty)) {
+        uqty = num(l.qty);
+        if (uqty == null || uqty <= 0) return { error: "Shipped quantity must be a positive number" };
+        uqty = Math.round(uqty);
+      }
+      parsed.push({ unmatched: true, sku, productName: str(l.productName).slice(0, 200), category: str(l.category).slice(0, 40), reason: l.reason === "over" ? "over" : "none", qty: uqty });
+      continue;
+    }
     const _id = oid(l.orderId);
     if (!_id) return { error: `invalid order id: ${l.orderId}` };
     let qty = null;
@@ -1347,10 +1417,15 @@ async function draftPayload(db, b) {
     }
     parsed.push({ _id, qty, supplier: str(l.supplier), price });
   }
-  const recs = parsed.length ? await db.collection(ORDERS).find({ _id: { $in: parsed.map((p) => p._id) } }, { projection: { history: 0 } }).toArray() : [];
+  const ids = parsed.filter((p) => !p.unmatched).map((p) => p._id);
+  const recs = ids.length ? await db.collection(ORDERS).find({ _id: { $in: ids } }, { projection: { history: 0 } }).toArray() : [];
   const byId = new Map(recs.map((r) => [String(r._id), r]));
   const lines = [];
   for (const p of parsed) {
+    if (p.unmatched) {
+      lines.push({ orderId: null, orderNo: "", itemId: null, sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: "", orderedAt: null, orderQty: null, qty: p.qty, unitPrice: null, unmatched: true, reason: p.reason });
+      continue;
+    }
     const rec = byId.get(String(p._id));
     if (!rec) return { error: `Order not found: ${p._id}` };
     lines.push({
@@ -1371,7 +1446,7 @@ async function draftPayload(db, b) {
   const ship = shippingCostOf(b);
   if (ship.error) return { error: ship.error };
   const vendor = vendorById(b.zohoVendorId);
-  return { lines, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
+  return { lines, unmatchedCount: lines.filter((l) => l.unmatched).length, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
 }
 
 // Straight away, or a saved draft
@@ -1455,6 +1530,8 @@ async function shipBatch(db, req, b, draft) {
   const rawLines = Array.isArray(b.lines) ? b.lines : [];
   if (!rawLines.length) return { error: "No lines selected" };
   if (rawLines.length > 300) return { error: "Too many lines (max 300)" };
+  const stray = rawLines.filter((l) => l.unmatched === true || !l.orderId).length;
+  if (stray) return { error: `${stray} line(s) are not on any order — remove them or find their order before shipping` };
   const zohoVendor = vendorById(b.zohoVendorId);
   if (!zohoVendor) return { error: "Pick the Zoho vendor for this batch" };
   // the form's shipping cost; a caller that leaves the field out of the body

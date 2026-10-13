@@ -18,6 +18,7 @@ const express = require("express");
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { hasPermission } = require("../../constants/roles");
 
 const router = express.Router();
 const VIEW = requirePermission("sqt:callcenter:view");
@@ -43,6 +44,23 @@ const PROJECTION = {
   customer: 1, device: 1, describedFault: 1, shopName: 1, shopId: 1, retailer: 1,
   notes: 1, callCenter: 1, source: 1,
 };
+
+// The Solvup hand-off is internal (user 2026-10-13): only admin-side SQT
+// users — those who may move a case through it (sqt:case:changeStatus:
+// Admin, TechElite Admin, iMobile Front Desk) — see its history entries or
+// a case sitting in that status. Everyone else (the call center) gets the
+// history without them and the status shown as "in-progress".
+const SOLVUP = ["waiting-solvup", "issue-with-solvup"];
+function canSeeSolvup(req) {
+  return hasPermission((req.user && req.user.permissions) || [], "sqt:case:changeStatus");
+}
+function redact(c, req) {
+  if (!c || canSeeSolvup(req)) return c;
+  const out = { ...c };
+  if (Array.isArray(out.statusHistory)) out.statusHistory = out.statusHistory.filter((h) => !SOLVUP.includes(h && h.status));
+  if (SOLVUP.includes(out.status)) out.status = "in-progress";
+  return out;
+}
 
 function tabMatch(tab) {
   if (tab === "contacted") return { "callCenter.contacted": true };
@@ -83,7 +101,7 @@ router.get("/cases", VIEW, async (req, res) => {
       col.countDocuments(tabMatch("todo")),
       col.countDocuments(tabMatch("contacted")),
     ]);
-    return res.json({ success: true, rows, total, page, pageSize, counts: { todo, contacted } });
+    return res.json({ success: true, rows: rows.map((r) => redact(r, req)), total, page, pageSize, counts: { todo, contacted } });
   } catch (e) {
     console.error("call center list error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the cases" });
@@ -96,7 +114,7 @@ router.get("/cases/:id", VIEW, async (req, res) => {
     const db = await connectToDatabase();
     const c = await db.collection(COLLECTION).findOne({ _id: new ObjectId(req.params.id) }, { projection: PROJECTION });
     if (!c) return res.status(404).json({ success: false, message: "Case not found" });
-    return res.json({ success: true, data: c });
+    return res.json({ success: true, data: redact(c, req) });
   } catch (e) {
     console.error("call center case error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the case" });
@@ -129,7 +147,7 @@ router.post("/cases/:id/contacted", CONTACT, async (req, res) => {
     const updated = await logCall(col, _id, req, text, (now, by) => ({
       "callCenter.contacted": true, "callCenter.noCall": false, "callCenter.at": now, "callCenter.by": by, "callCenter.note": note,
     }));
-    return res.json({ success: true, message: "Marked as contacted", data: updated });
+    return res.json({ success: true, message: "Marked as contacted", data: redact(updated, req) });
   } catch (e) {
     console.error("call center contacted error:", e);
     return res.status(500).json({ success: false, message: "Failed to mark the case" });
@@ -147,7 +165,7 @@ router.post("/cases/:id/uncontacted", CONTACT, async (req, res) => {
     const updated = await logCall(col, _id, req, "Call center: put on the call list", () => ({
       "callCenter.contacted": false, "callCenter.noCall": false, "callCenter.at": null, "callCenter.by": null,
     }));
-    return res.json({ success: true, message: "Back on the call list", data: updated });
+    return res.json({ success: true, message: "Back on the call list", data: redact(updated, req) });
   } catch (e) {
     console.error("call center uncontacted error:", e);
     return res.status(500).json({ success: false, message: "Failed to update the case" });
@@ -167,7 +185,7 @@ router.post("/cases/:id/no-call", CONTACT, async (req, res) => {
     const updated = await logCall(col, _id, req, `Call center: no call needed${note ? " — " + note : ""}`, (now, by) => ({
       "callCenter.noCall": true, "callCenter.contacted": false, "callCenter.at": now, "callCenter.by": by, "callCenter.note": note,
     }));
-    return res.json({ success: true, message: "Marked as no call needed", data: updated });
+    return res.json({ success: true, message: "Marked as no call needed", data: redact(updated, req) });
   } catch (e) {
     console.error("call center no-call error:", e);
     return res.status(500).json({ success: false, message: "Failed to update the case" });
@@ -185,7 +203,7 @@ router.post("/cases/:id/notes", CONTACT, async (req, res) => {
     const cur = await col.findOne({ _id }, { projection: { _id: 1 } });
     if (!cur) return res.status(404).json({ success: false, message: "Case not found" });
     const updated = await logCall(col, _id, req, `Call center: ${text}`, () => ({}));
-    return res.json({ success: true, message: "Note added", data: updated });
+    return res.json({ success: true, message: "Note added", data: redact(updated, req) });
   } catch (e) {
     console.error("call center note error:", e);
     return res.status(500).json({ success: false, message: "Failed to add the note" });
@@ -193,3 +211,4 @@ router.post("/cases/:id/notes", CONTACT, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.redact = redact;

@@ -27,6 +27,9 @@ const ROLES = {
   // The spare-parts purchase partner (buys from the factories, ships the
   // batches to iMobile) — Spare Parts Purchase only.
   PARTS_SUPPLIER: "parts-supplier",
+  // The supplier's warehouse staff (2026-10-13) — scan the parcels into
+  // shipment batches on their phones: the Batches page and nothing else.
+  SUPPLIER_WAREHOUSE: "supplier-warehouse",
   IMOBILE_ACCOUNTANT: "imobile-accountant",
   // Warehouse staff — iMobile Spare Parts, Spare Parts Purchase, InFlow and Tools.
   IMOBILE_WAREHOUSE: "imobile-warehouse",
@@ -50,6 +53,7 @@ const ROLE_LABELS = {
   [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
   [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
   [ROLES.PARTS_SUPPLIER]: "Parts Supplier",
+  [ROLES.SUPPLIER_WAREHOUSE]: "Supplier Warehouse",
   [ROLES.IMOBILE_ACCOUNTANT]: "iMobile Accountant",
   [ROLES.IMOBILE_WAREHOUSE]: "iMobile Warehouse",
   [ROLES.IMOBILE_FRONT_DESK]: "iMobile Front Desk",
@@ -88,6 +92,7 @@ const ROLE_GROUP_OF = {
   [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
   [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
   [ROLES.PARTS_SUPPLIER]: ROLE_GROUPS.IMOBILE,
+  [ROLES.SUPPLIER_WAREHOUSE]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_ACCOUNTANT]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_WAREHOUSE]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_FRONT_DESK]: ROLE_GROUPS.IMOBILE,
@@ -187,6 +192,10 @@ const ROLE_PERMISSIONS = {
     "spp:image:view",
     "spp:image:upload",
   ],
+  // Supplier Warehouse (2026-10-13): builds and saves the batches (drafts,
+  // scanning, the price sheet) — the Batches page only. No order view, no
+  // receiving, no batch management (Zoho retry / cancel).
+  [ROLES.SUPPLIER_WAREHOUSE]: ["spp:batch:view", "spp:batch:create"],
   // iMobile Accountant (2026-09-30): the iMobile Accountant menu — what
   // customers owe, from Zoho Inventory. Nobody else holds acct:* (admin
   // sees it through *:*:*). Since 2026-10-05 also InFlow — view orders and
