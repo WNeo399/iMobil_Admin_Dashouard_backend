@@ -121,6 +121,8 @@ const ROLE_PERMISSIONS = {
     "inflow:order:view", "inflow:customer:view",
     // iMobile Website (banners for the storefront carousel)
     "web:*:*",
+    // iMobile → Screen Buyback: the ABCD grade price list (2026-10-13)
+    "buyback:price:view", "buyback:price:manage",
   ],
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
@@ -223,6 +225,8 @@ const ROLE_PERMISSIONS = {
     "refurb:repair:view", "refurb:repair:manage",
     "refurb:incoming:manage",   // Incoming Stocks too (2026-10-09, user: full Refurbished Device)
     "consign:*:*",
+    // iMobile → Screen Buyback: the ABCD grade price list (2026-10-13)
+    "buyback:price:view", "buyback:price:manage",
   ],
   // iMobile Front Desk (2026-10-05): SQT like TechElite Admin (every action,
   // and the admin-side view the frontend / the group filter give by role:
@@ -243,6 +247,8 @@ const ROLE_PERMISSIONS = {
     "refurb:repair:view", "refurb:repair:manage",
     "consign:*:*",
     "zoho:salesOrder:create", "zoho:purchaseOrder:create",
+    // iMobile → Screen Buyback: the ABCD grade price list (2026-10-13)
+    "buyback:price:view", "buyback:price:manage",
   ],
   // Exyon Operation (2026-10-08): the Exyon Accessories menu — Orders,
   // Dispatch (processing orders: tracking numbers, shipping labels) and Pick

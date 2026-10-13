@@ -19,6 +19,7 @@ var repairRouter = require('./routes/repairRoutes/index');
 // Credit Note OCR submission — forwards PDFs to HandwritingOCR using
 // the bearer token kept in .env, so credentials stay server-side.
 var creditNoteRouter = require('./routes/creditNoteRoutes/index');
+var screenBuybackRouter = require('./routes/screenBuybackRoutes/index');   // iMobile → Screen Buyback (2026-10-13)
 // Admin-side endpoints for reviewing widget Special Order
 // submissions. Same gate as Credit Note (zoho:salesOrder:create) so
 // the same role can triage what came in via the embedded widget.
@@ -181,6 +182,7 @@ app.use('/dashboard', authenticate, dashboardRouter);
 app.use('/users', authenticate, usersRouter);
 app.use('/repair', authenticate, repairRouter);
 app.use('/creditNote', authenticate, creditNoteRouter);
+app.use('/screen-buyback', authenticate, screenBuybackRouter);
 // (/specialOrder — the iMobile → Special Order review page's API — was
 // removed on 2026-10-07 with the page; the public form POST /widget/specialOrder
 // and the WhatsApp flow still store requests in imb_special_orders.)
