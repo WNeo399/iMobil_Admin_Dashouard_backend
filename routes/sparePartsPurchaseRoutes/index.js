@@ -589,10 +589,34 @@ router.post("/orders", ADD, async (req, res, next) => {
     const now = new Date();
     const by = actor(req);
     const docs = [];
+    const skipped = [];
     for (const l of lines) {
+      let itemId = str(l.itemId) || null;
+      let productName = str(l.productName);
+      // Lines raised from InFlow (Order Dispatch / Owing Stocks, 2026-10-14)
+      // come with the iMobile SKU only: the register names the item. They
+      // also say whose order they serve (forCustomer, e.g. OSCAR) and keep
+      // the dispatch line as the customer wrote it, for the labels.
+      if (!itemId && str(l.sku)) {
+        const it = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(str(l.sku))}$`, "i") }, { projection: { _id: 0, itemId: 1, name: 1 } });
+        if (it) { itemId = it.itemId; if (!productName) productName = it.name || ""; }
+      }
+      const forCustomer = str(l.forCustomer).toUpperCase().slice(0, 40);
+      const dr = l.dispatchRef && typeof l.dispatchRef === "object" ? l.dispatchRef : null;
+      const dispatchRef = dr ? {
+        recordId: str(dr.recordId).slice(0, 40), invoiceNumber: str(dr.invoiceNumber).slice(0, 80), customerName: str(dr.customerName).slice(0, 120),
+        faultyCodePrefix: str(dr.faultyCodePrefix).slice(0, 40), customerSku: str(dr.customerSku).slice(0, 80), customerDescription: str(dr.customerDescription).slice(0, 200),
+      } : null;
+      // the same dispatch line raised twice: the open line stands
+      if (dispatchRef && dispatchRef.recordId && dispatchRef.customerSku) {
+        const open = await db.collection(ORDERS).findOne(
+          { "dispatchRef.recordId": dispatchRef.recordId, "dispatchRef.customerSku": dispatchRef.customerSku, status: { $nin: ["cancelled", "received"] } },
+          { projection: { orderNo: 1 } },
+        );
+        if (open) { skipped.push({ sku: str(l.sku), customerSku: dispatchRef.customerSku, orderNo: open.orderNo }); continue; }
+      }
       const { seq, no } = await nextNo(db, "order", "SP", 10001, ORDERS);
       const orderQty = Math.round(num(l.orderQty));
-      const itemId = str(l.itemId) || null;
       const asked = str(l.category);
       const reg = itemId ? await registerFacts(db, itemId) : null;
       const category = isChannel(asked) ? asked : reg ? reg.category : CLASSIFICATIONS.includes(asked) ? asked : "Other";
@@ -601,7 +625,9 @@ router.post("/orders", ADD, async (req, res, next) => {
         seq,
         itemId,
         sku: str(l.sku),
-        productName: str(l.productName),
+        productName,
+        ...(forCustomer ? { forCustomer } : {}),
+        ...(dispatchRef ? { dispatchRef } : {}),
         imageId: str(l.imageId) || (reg && reg.imageId) || null,
         category,
         orderQty,
@@ -631,7 +657,7 @@ router.post("/orders", ADD, async (req, res, next) => {
       });
     }
     await db.collection(ORDERS).insertMany(docs);
-    return res.json({ success: true, created: docs.length, orderNos: docs.map((d) => d.orderNo), ids: docs.map((d) => String(d._id)) });
+    return res.json({ success: true, created: docs.length, orderNos: docs.map((d) => d.orderNo), ids: docs.map((d) => String(d._id)), skipped });
   } catch (error) {
     next(error);
   }
@@ -1743,6 +1769,12 @@ async function shipBatch(db, req, b, draft) {
         unitPrice: p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : null,
         receivedQty: null,
         ...(p.warranty || rec.warranty || rec.category === WARRANTY ? { warranty: true } : {}),
+        ...(rec.forCustomer ? {
+          forCustomer: rec.forCustomer,
+          customerSku: (rec.dispatchRef && rec.dispatchRef.customerSku) || "",
+          customerDescription: (rec.dispatchRef && rec.dispatchRef.customerDescription) || "",
+          oscarPrefix: (rec.dispatchRef && rec.dispatchRef.faultyCodePrefix) || "",
+        } : {}),
         // where the line came from — a cancelled batch puts it back there
         prevStatus: rec.status,
       });

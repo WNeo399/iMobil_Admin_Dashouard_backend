@@ -2259,12 +2259,38 @@ router.get("/salesorders/:id/dispatch", VIEW_ORDERS, async (req, res) => {
 // and the contributing records listed. Mirrors the dispatch page — manual
 // upload records only, and not the closed ones (what they still lack was
 // let go when they were closed).
+// The Spare Parts Purchase lines raised from one dispatch record (they keep
+// dispatchRef.recordId / customerSku), so the dispatch dialog can show each
+// line's purchase status (user ask 2026-10-14).
+router.get("/dispatch/:id/po-lines", VIEW_ORDERS, async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ success: false, message: "invalid id" });
+    const db = await connectToDatabase();
+    const lines = await db
+      .collection("imb_spp_orders")
+      .find({ "dispatchRef.recordId": id }, { projection: { orderNo: 1, status: 1, orderQty: 1, shippedQty: 1, receivedQty: 1, batchNo: 1, sku: 1, forCustomer: 1, createdAt: 1, "dispatchRef.customerSku": 1 } })
+      .sort({ createdAt: 1 })
+      .toArray();
+    return res.json({
+      success: true,
+      lines: lines.map((l) => ({
+        orderNo: l.orderNo, status: l.status, orderQty: l.orderQty, shippedQty: l.shippedQty, receivedQty: l.receivedQty, batchNo: l.batchNo || "",
+        sku: l.sku || "", forCustomer: l.forCustomer || "", createdAt: l.createdAt, customerSku: (l.dispatchRef && l.dispatchRef.customerSku) || "",
+      })),
+    });
+  } catch (e) {
+    console.error("InFlow dispatch po-lines error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load the purchase order lines" });
+  }
+});
+
 router.get("/dispatch/owing", VIEW_ORDERS, async (req, res) => {
   try {
     const db = await connectToDatabase();
     const uploads = await db
       .collection(DISPATCH_UPLOADS)
-      .find({ closed: null }, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1 } })
+      .find({ closed: null }, { projection: { invoiceNumber: 1, linkedInvoiceNumber: 1, lineItems: 1, customerName: 1, faultyCodePrefix: 1 } })
       .toArray();
 
     // Group by iMobile SKU; lines without one fall back to barcode +
@@ -2303,6 +2329,12 @@ router.get("/dispatch/owing", VIEW_ORDERS, async (req, res) => {
           invoiceNumber: rec.invoiceNumber || "",
           type,
           owing,
+          // whose order it is, and the line as the customer wrote it — a
+          // purchase order line raised from here keeps both (2026-10-14)
+          customerName: rec.customerName || "",
+          faultyCodePrefix: rec.faultyCodePrefix || "",
+          sku: li.sku || "",
+          description: li.description || "",
         });
       }
     };
