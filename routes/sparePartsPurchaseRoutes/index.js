@@ -85,7 +85,11 @@ const OPEN = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
 // (set automatically on create, 2026-09-22), or one of the two channels the
 // team keeps apart — sea-freight orders (海运) and customer special orders.
 const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "IC", "Tools", "Other"];
-const CHANNELS = ["海运", "Special Order", "New Product"];
+// Warranty (2026-10-14): replacement parts claimed from the supplier — a
+// pinned list on the Purchase Order page; its lines carry price 0 and ship
+// as warranty (no charge on the Zoho PO).
+const WARRANTY = "Warranty";
+const CHANNELS = ["海运", "Special Order", "New Product", WARRANTY];
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
 // A New Product or Special Order line (user rules 2026-10-06) is quoted
@@ -603,11 +607,12 @@ router.post("/orders", ADD, async (req, res, next) => {
         orderQty,
         note: str(l.note),
         ...(category === SPECIAL_ORDER ? { requestedFor: forOf(l.requestedFor), urgent: !!l.urgent, needsQuote: l.needsQuote === undefined ? true : !!l.needsQuote } : {}),
+        ...(category === WARRANTY ? { warranty: true } : {}),
         status: "pending",
         quotedPrice: null,
         supplier: "",
-        unitPrice: null,
-        lineTotal: null,
+        unitPrice: category === WARRANTY ? 0 : null,
+        lineTotal: category === WARRANTY ? 0 : null,
         orderedAt: null,
         orderedBy: null,
         shippedQty: null,
@@ -1637,7 +1642,7 @@ async function shipBatch(db, req, b, draft) {
       return { error: `${rec.sku || rec.orderNo} is ${rec.status}; only ordered or pending lines can ship` };
     }
     if (awaitsQuote(rec)) return { error: `${rec.productName || rec.orderNo}: a ${rec.category} line is quoted and confirmed before it ships` };
-    if (rec.status === "pending" && !p.supplier && !rec.supplier && rec.category !== SPECIAL_ORDER) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
+    if (rec.status === "pending" && !p.supplier && !rec.supplier && rec.category !== SPECIAL_ORDER && rec.category !== WARRANTY) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
     // The price may be left off when placing, but every shipped line must
     // carry one — from the batch form or already on the line.
     if (p.price == null && rec.unitPrice == null) return { error: `${rec.sku || rec.orderNo}: unit price is required to ship` };
@@ -1653,6 +1658,7 @@ async function shipBatch(db, req, b, draft) {
     // the not-in-PO lines become SP- lines of their own, then ship like the rest
     for (const x of extras) {
       const facts = x.special ? { category: SPECIAL_ORDER, imageId: null } : await registerFacts(db, x.itemId);
+      if (x.warranty) facts.category = WARRANTY; // on the Warranty list, like one added there
       const { seq: xSeq, no: xNo } = await nextNo(db, "order", "SP", 10001, ORDERS);
       const doc = {
         // a typed Special Order: no quote step (needsQuote false), so it ships in this same pass
@@ -1736,7 +1742,7 @@ async function shipBatch(db, req, b, draft) {
         shippedQty: p.qty,
         unitPrice: p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : null,
         receivedQty: null,
-        ...(p.warranty ? { warranty: true } : {}),
+        ...(p.warranty || rec.warranty || rec.category === WARRANTY ? { warranty: true } : {}),
         // where the line came from — a cancelled batch puts it back there
         prevStatus: rec.status,
       });
