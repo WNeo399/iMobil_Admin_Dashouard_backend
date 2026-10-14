@@ -313,7 +313,7 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
       // Not on any order (user ask 2026-10-13: such a scan is kept on the
       // batch for adjustment): the register's name for the SKU, if known.
       const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, imageId: 1 } });
-      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other", imageId: item.imageId || null } : null });
+      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other", imageId: item.imageId || null, imageUrl: imageUrlFromId(item.imageId) } : null });
     }
     candidates.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
     return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1 });
@@ -1428,7 +1428,7 @@ async function draftPayload(db, b) {
     }
     if (l.unmatched === true || !l.orderId) {
       const sku = str(l.sku).slice(0, 80);
-      if (!sku) return { error: "An unmatched line needs a SKU" };
+      if (!sku && !str(l.itemId) && !str(l.productName)) return { error: "A not-in-PO line needs a product or a SKU" };
       let uqty = null;
       if (hasVal(l.qty)) {
         uqty = num(l.qty);
@@ -1470,7 +1470,7 @@ async function draftPayload(db, b) {
       continue;
     }
     if (p.unmatched) {
-      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, key: p.key });
+      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, key: p.key });
       continue;
     }
     const rec = byId.get(String(p._id));
