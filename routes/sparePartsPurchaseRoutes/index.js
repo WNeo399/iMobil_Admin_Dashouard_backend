@@ -60,6 +60,9 @@ const BATCHES = "imb_spp_batches";
 const ORDER_BATCHES = "imb_spp_order_batches";
 const COUNTERS = "imb_spp_counters";
 const ITEMS = "imb_stock_items";
+// InFlow's Order Dispatch records — read for an Oscar return code scanned
+// with no purchase line behind it (the record maps Oscar's SKU to ours)
+const DISPATCH_UPLOADS = "inflow_dispatch_uploads";
 
 const VIEW = requirePermission("spp:order:view");
 const CREATE = requirePermission("spp:order:create");
@@ -120,6 +123,30 @@ const str = (v) => String(v == null ? "" : v).trim();
 const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
 const round2 = (n) => Math.round(n * 100) / 100;
 const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Oscar's return code "SS-<prefix>-<customer SKU>" — the supplier card of the
+// Oscar label set; the prefix is the dispatch record's faultyCodePrefix
+// (normally six digits). The team scans it on a dispatch batch (user
+// 2026-10-14): prefix + customer SKU name the purchase line raised for
+// OSCAR from that dispatch.
+const OSCAR_CODE = /^SS-(\d+)-(.+)$/i;
+// what a line raised for a customer carries onto a batch line (its labels)
+const oscarFacts = (rec) => (rec && rec.forCustomer ? {
+  forCustomer: rec.forCustomer,
+  customerSku: (rec.dispatchRef && rec.dispatchRef.customerSku) || "",
+  customerDescription: (rec.dispatchRef && rec.dispatchRef.customerDescription) || "",
+  oscarPrefix: (rec.dispatchRef && rec.dispatchRef.faultyCodePrefix) || "",
+} : {});
+// a not-in-PO line scanned as an Oscar return code: the line it raises is marked for OSCAR
+const oscarRefOf = (code) => {
+  const m = str(code).match(OSCAR_CODE);
+  if (!m) return {};
+  return { forCustomer: "OSCAR", dispatchRef: { recordId: "", invoiceNumber: "", customerName: "Oscar Mobile Pty Ltd", faultyCodePrefix: m[1], customerSku: str(m[2]).slice(0, 80), customerDescription: "" } };
+};
+// the register item as the scan lookup answers it
+const ITEM_BRIEF = { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, imageId: 1 };
+const itemBrief = (item) => (item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other", imageId: item.imageId || null, imageUrl: imageUrlFromId(item.imageId) } : null);
+// ordered lines before pending ones, oldest first
+const openFirst = (a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt);
 const hasVal = (v) => v !== undefined && v !== null && String(v).trim() !== "";
 const bad = (res, message) => res.status(400).json({ success: false, message });
 
@@ -308,18 +335,43 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
     if (!sku) return bad(res, "sku is required");
     const exclude = new Set(str(req.query.exclude).split(",").map((s) => s.trim()).filter(Boolean));
     const db = await connectToDatabase();
+    const openOnes = (list) => list.filter((r) => !exclude.has(String(r._id)) && !awaitsQuote(r)).sort(openFirst);
+    const oc = sku.match(OSCAR_CODE);
+    if (oc) {
+      // Oscar's return code (user 2026-10-14): the line raised for OSCAR
+      // from that dispatch record, by prefix + customer SKU
+      const prefix = oc[1];
+      const customerSku = str(oc[2]);
+      const oscar = { prefix, customerSku };
+      const ref = { "dispatchRef.faultyCodePrefix": prefix, "dispatchRef.customerSku": new RegExp(`^${escapeRegex(customerSku)}$`, "i") };
+      const rows = await db.collection(ORDERS).find({ status: { $in: ["ordered", "pending"] }, ...ref }, { projection: { history: 0 } }).toArray();
+      const candidates = openOnes(rows);
+      if (candidates.length) return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1, oscar });
+      // no open line behind the code: the product it stands for — from the
+      // last line raised for it, else the dispatch record's own SKU mapping
+      const prev = await db.collection(ORDERS).find(ref, { projection: { itemId: 1, sku: 1, createdAt: 1 } }).sort({ createdAt: -1 }).limit(1).toArray();
+      let q = null;
+      if (prev[0] && prev[0].itemId) q = { itemId: String(prev[0].itemId) };
+      else {
+        const rec = await db.collection(DISPATCH_UPLOADS).findOne({ faultyCodePrefix: prefix }, { projection: { lineItems: 1 } });
+        const li = rec && (rec.lineItems || []).find((l) => str(l.sku).toLowerCase() === customerSku.toLowerCase());
+        const imbSku = li ? str(li.imbSku) : (prev[0] && str(prev[0].sku)) || "";
+        if (imbSku) q = { sku: new RegExp(`^${escapeRegex(imbSku)}$`, "i") };
+      }
+      const item = q ? await db.collection(ITEMS).findOne(q, { projection: ITEM_BRIEF }) : null;
+      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, oscar, item: itemBrief(item) });
+    }
     const rows = await db
       .collection(ORDERS)
       .find({ status: { $in: ["ordered", "pending"] }, sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { history: 0 } })
       .toArray();
-    const candidates = rows.filter((r) => !exclude.has(String(r._id)) && !awaitsQuote(r));
+    const candidates = openOnes(rows);
     if (!candidates.length) {
       // Not on any order (user ask 2026-10-13: such a scan is kept on the
       // batch for adjustment): the register's name for the SKU, if known.
-      const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, imageId: 1 } });
-      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other", imageId: item.imageId || null, imageUrl: imageUrlFromId(item.imageId) } : null });
+      const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: ITEM_BRIEF });
+      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: itemBrief(item) });
     }
-    candidates.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
     return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1 });
   } catch (error) {
     next(error);
@@ -1473,7 +1525,7 @@ async function draftPayload(db, b) {
       }
       // since 2026-10-14 the line can carry the product picked for it (register itemId), a supplier and a price
       parsed.push({ unmatched: true, sku, productName: str(l.productName).slice(0, 200), category: str(l.category).slice(0, 40), reason: l.reason === "over" ? "over" : "none", qty: uqty,
-        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: l.warranty === true ? 0 : uprice, warranty: l.warranty === true, key: str(l.key).slice(0, 40) });
+        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: l.warranty === true ? 0 : uprice, warranty: l.warranty === true, oscarCode: str(l.oscarCode).slice(0, 80), key: str(l.key).slice(0, 40) });
       continue;
     }
     const _id = oid(l.orderId);
@@ -1501,7 +1553,7 @@ async function draftPayload(db, b) {
       continue;
     }
     if (p.unmatched) {
-      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, warranty: !!p.warranty, key: p.key });
+      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, warranty: !!p.warranty, oscarCode: p.oscarCode || "", key: p.key });
       continue;
     }
     const rec = byId.get(String(p._id));
@@ -1519,6 +1571,8 @@ async function draftPayload(db, b) {
       orderQty: rec.orderQty,
       qty: p.qty,
       unitPrice: p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : rec.quotedPrice != null ? rec.quotedPrice : null,
+      // a line raised for OSCAR: the return code answers to it on re-scans
+      ...oscarFacts(rec),
     });
   }
   const ship = shippingCostOf(b);
@@ -1636,7 +1690,7 @@ async function shipBatch(db, req, b, draft) {
     const warranty = l.warranty === true; // a warranty replacement: no charge (user 2026-10-14)
     const price = warranty ? 0 : hasVal(l.unitPrice) ? num(l.unitPrice) : null;
     if (price == null || price < 0) return { error: `${label}: unit price is required to ship` };
-    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price, warranty });
+    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price, warranty, oscarCode: str(l.oscarCode).slice(0, 80) });
   }
   const zohoVendor = vendorById(b.zohoVendorId);
   if (!zohoVendor) return { error: "Pick the Zoho vendor for this batch" };
@@ -1690,6 +1744,8 @@ async function shipBatch(db, req, b, draft) {
         // a typed Special Order: no quote step (needsQuote false), so it ships in this same pass
         ...(x.special ? { requestedFor: x.requestedFor || "", urgent: false, needsQuote: false } : {}),
         ...(x.warranty ? { warranty: true } : {}),
+        // scanned as an Oscar return code: marked for OSCAR with the code's facts (labels)
+        ...oscarRefOf(x.oscarCode),
         orderNo: xNo, seq: xSeq, itemId: x.itemId, sku: x.sku, productName: x.productName, imageId: facts.imageId, category: facts.category,
         orderQty: x.qty, note: x.warranty ? "Warranty replacement" : "", status: "pending", quotedPrice: null, supplier: x.supplier, unitPrice: round2(x.price), lineTotal: round2(x.qty * x.price),
         orderedAt: null, orderedBy: null, shippedQty: null, shippedAt: null, batchId: null, batchNo: "", tracking: "",
@@ -1769,12 +1825,7 @@ async function shipBatch(db, req, b, draft) {
         unitPrice: p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : null,
         receivedQty: null,
         ...(p.warranty || rec.warranty || rec.category === WARRANTY ? { warranty: true } : {}),
-        ...(rec.forCustomer ? {
-          forCustomer: rec.forCustomer,
-          customerSku: (rec.dispatchRef && rec.dispatchRef.customerSku) || "",
-          customerDescription: (rec.dispatchRef && rec.dispatchRef.customerDescription) || "",
-          oscarPrefix: (rec.dispatchRef && rec.dispatchRef.faultyCodePrefix) || "",
-        } : {}),
+        ...oscarFacts(rec),
         // where the line came from — a cancelled batch puts it back there
         prevStatus: rec.status,
       });
