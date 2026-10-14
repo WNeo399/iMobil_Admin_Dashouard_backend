@@ -26,13 +26,13 @@
 //
 // Permissions (constants/roles.js)
 //   spp:order:view      read the orders                 admin, iMobile admin, parts supplier
-//   spp:order:create    create / edit / cancel          admin, iMobile admin
+//   spp:order:create    create / edit / cancel          admin, iMobile admin, parts supplier (since 2026-10-14)
 //   spp:order:add       add lines (Add Item, New Product — not Special Order)
 //                                                       admin, iMobile admin, parts supplier
 //   spp:order:supply    quote / place / shortage        admin, iMobile admin, parts supplier
-//   spp:order:receive   receive a batch                 admin, iMobile admin
+//   spp:order:receive   receive a batch / mark completed admin, iMobile admin (NOT the parts supplier)
 //   spp:product:create  create a New Product line's item in Zoho (also New Products)
-//                                                       admin, iMobile admin, iMobile purchase, warehouse
+//                                                       admin, iMobile admin, iMobile purchase, warehouse, parts supplier
 //   spp:batch:view      read the batches                all three
 //   spp:batch:create    create a batch                  all three
 //   spp:batch:manage    edit tracking / date, cancel    all three
@@ -95,7 +95,9 @@ const isChannel = (c) => CHANNELS.includes(c);
 const NEW_PRODUCT = "New Product";
 const SPECIAL_ORDER = "Special Order";
 const QUOTE_FIRST = [NEW_PRODUCT, SPECIAL_ORDER];
-const awaitsQuote = (r) => !!r && QUOTE_FIRST.includes(r.category) && ["pending", "shortage"].includes(r.status) && !r.confirmed;
+// A Special Order raised with "Needs a quote first" unticked (needsQuote:
+// false, 2026-10-14) skips the quote step and is ordered like any other line.
+const awaitsQuote = (r) => !!r && QUOTE_FIRST.includes(r.category) && ["pending", "shortage"].includes(r.status) && !r.confirmed && r.needsQuote !== false;
 // A Special Order says who it is for (a preset name or one typed) and
 // whether it is urgent.
 const forOf = (v) => str(v).slice(0, 60);
@@ -173,7 +175,7 @@ async function supplierOptions(db) {
 
 // ── Products (for Create PO) ────────────────────────────────────────
 // Live parts from the stock register, by name or SKU. Exact SKU first.
-router.get("/products/search", VIEW, async (req, res, next) => {
+router.get("/products/search", requireAny("spp:order:view", "spp:batch:create"), async (req, res, next) => {
   try {
     const q = str(req.query.q);
     if (!q) return res.json({ success: true, products: [] });
@@ -310,8 +312,8 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
     if (!candidates.length) {
       // Not on any order (user ask 2026-10-13: such a scan is kept on the
       // batch for adjustment): the register's name for the SKU, if known.
-      const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { _id: 0, sku: 1, name: 1, classification: 1 } });
-      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: item ? { sku: item.sku, name: item.name || "", classification: item.classification || "" } : null });
+      const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, imageId: 1 } });
+      return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other", imageId: item.imageId || null } : null });
     }
     candidates.sort((a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt));
     return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1 });
@@ -600,7 +602,7 @@ router.post("/orders", ADD, async (req, res, next) => {
         category,
         orderQty,
         note: str(l.note),
-        ...(category === SPECIAL_ORDER ? { requestedFor: forOf(l.requestedFor), urgent: !!l.urgent } : {}),
+        ...(category === SPECIAL_ORDER ? { requestedFor: forOf(l.requestedFor), urgent: !!l.urgent, needsQuote: l.needsQuote === undefined ? true : !!l.needsQuote } : {}),
         status: "pending",
         quotedPrice: null,
         supplier: "",
@@ -661,6 +663,20 @@ router.put("/orders/:id", CREATE, async (req, res, next) => {
       if (b.urgent !== undefined && !!b.urgent !== !!rec.urgent) {
         set.urgent = !!b.urgent;
         changes.urgent = set.urgent;
+      }
+      // the name can be corrected after creation (user ask 2026-10-14) while the line is still open
+      if (b.productName !== undefined && !["received", "cancelled"].includes(rec.status)) {
+        const name = str(b.productName).slice(0, 200);
+        if (!name) return bad(res, "The product name cannot be empty");
+        if (name !== rec.productName) {
+          set.productName = name;
+          changes.productName = { from: rec.productName, to: name };
+        }
+      }
+      // whether it must be quoted before it is ordered — while it still waits
+      if (b.needsQuote !== undefined && ["pending", "shortage"].includes(rec.status) && !rec.confirmed && !!b.needsQuote !== (rec.needsQuote !== false)) {
+        set.needsQuote = !!b.needsQuote;
+        changes.needsQuote = set.needsQuote;
       }
     }
     if (hasVal(b.category) && rec.status === "pending" && str(b.category) !== rec.category) {
@@ -800,7 +816,7 @@ router.post("/orders/:id/confirm", CREATE_OR_SUPPLY, (req, res, next) =>
     to: "pending",
     action: "confirmed",
     build: (rec, b, by) => {
-      if (QUOTE_FIRST.includes(rec.category) && rec.quotedPrice == null) return { error: `Quote this ${rec.category} line before confirming it` };
+      if (QUOTE_FIRST.includes(rec.category) && rec.needsQuote !== false && rec.quotedPrice == null) return { error: `Quote this ${rec.category} line before confirming it` };
       const note = str(b.note);
       return {
         set: {
@@ -1390,6 +1406,26 @@ async function draftPayload(db, b) {
     // is for future adjustment"): kept on the draft by SKU with no order
     // behind it, until someone removes it or finds its order. It cannot
     // ship (shipBatch refuses).
+    // A Special Order typed straight into the batch (user ask 2026-10-14): no
+    // order yet — kept on the draft by its description; it becomes an SP-
+    // line (category Special Order) as the batch ships.
+    if (l.special === true) {
+      const productName = str(l.productName).slice(0, 200);
+      if (!productName) return { error: "A Special Order line needs a description" };
+      let sqty = null;
+      if (hasVal(l.qty)) {
+        sqty = num(l.qty);
+        if (sqty == null || sqty <= 0) return { error: "Shipped quantity must be a positive number" };
+        sqty = Math.round(sqty);
+      }
+      let sprice = null;
+      if (hasVal(l.unitPrice)) {
+        sprice = num(l.unitPrice);
+        if (sprice == null || sprice < 0) return { error: "Unit price must be 0 or more" };
+      }
+      parsed.push({ special: true, productName, requestedFor: forOf(l.requestedFor), supplier: str(l.supplier), price: sprice, qty: sqty, key: str(l.key).slice(0, 40) });
+      continue;
+    }
     if (l.unmatched === true || !l.orderId) {
       const sku = str(l.sku).slice(0, 80);
       if (!sku) return { error: "An unmatched line needs a SKU" };
@@ -1399,7 +1435,14 @@ async function draftPayload(db, b) {
         if (uqty == null || uqty <= 0) return { error: "Shipped quantity must be a positive number" };
         uqty = Math.round(uqty);
       }
-      parsed.push({ unmatched: true, sku, productName: str(l.productName).slice(0, 200), category: str(l.category).slice(0, 40), reason: l.reason === "over" ? "over" : "none", qty: uqty });
+      let uprice = null;
+      if (hasVal(l.unitPrice)) {
+        uprice = num(l.unitPrice);
+        if (uprice == null || uprice < 0) return { error: "Unit price must be 0 or more" };
+      }
+      // since 2026-10-14 the line can carry the product picked for it (register itemId), a supplier and a price
+      parsed.push({ unmatched: true, sku, productName: str(l.productName).slice(0, 200), category: str(l.category).slice(0, 40), reason: l.reason === "over" ? "over" : "none", qty: uqty,
+        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: uprice, key: str(l.key).slice(0, 40) });
       continue;
     }
     const _id = oid(l.orderId);
@@ -1422,8 +1465,12 @@ async function draftPayload(db, b) {
   const byId = new Map(recs.map((r) => [String(r._id), r]));
   const lines = [];
   for (const p of parsed) {
+    if (p.special) {
+      lines.push({ orderId: null, orderNo: "", itemId: null, sku: "", productName: p.productName, category: SPECIAL_ORDER, status: "special", supplier: p.supplier, requestedFor: p.requestedFor, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, special: true, key: p.key });
+      continue;
+    }
     if (p.unmatched) {
-      lines.push({ orderId: null, orderNo: "", itemId: null, sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: "", orderedAt: null, orderQty: null, qty: p.qty, unitPrice: null, unmatched: true, reason: p.reason });
+      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, key: p.key });
       continue;
     }
     const rec = byId.get(String(p._id));
@@ -1530,8 +1577,35 @@ async function shipBatch(db, req, b, draft) {
   const rawLines = Array.isArray(b.lines) ? b.lines : [];
   if (!rawLines.length) return { error: "No lines selected" };
   if (rawLines.length > 300) return { error: "Too many lines (max 300)" };
-  const stray = rawLines.filter((l) => l.unmatched === true || !l.orderId).length;
-  if (stray) return { error: `${stray} line(s) are not on any order — remove them or find their order before shipping` };
+  // Lines scanned with no order behind them (user ask 2026-10-14): once a
+  // product, a supplier, a price and a quantity are on them, they ship too —
+  // each becomes an SP- line of its own as the batch ships. Without a
+  // product the batch cannot ship.
+  const extras = [];
+  for (const l of rawLines) {
+    if (!(l.unmatched === true || l.special === true || !l.orderId)) continue;
+    if (l.special === true) {
+      const productName = str(l.productName).slice(0, 200);
+      if (!productName) return { error: "A Special Order line needs a description before it ships" };
+      const sq = num(l.qty);
+      if (sq == null || sq <= 0) return { error: `${productName}: shipped quantity must be a positive number` };
+      const ssupplier = str(l.supplier); // optional on a Special Order (user 2026-10-14)
+      const sprice = hasVal(l.unitPrice) ? num(l.unitPrice) : null;
+      if (sprice == null || sprice < 0) return { error: `${productName}: unit price is required to ship` };
+      extras.push({ special: true, itemId: null, sku: "", productName, requestedFor: forOf(l.requestedFor), qty: Math.round(sq), supplier: ssupplier, price: sprice });
+      continue;
+    }
+    const label = str(l.sku) || str(l.productName) || "A scanned line";
+    const itemId = str(l.itemId);
+    if (!itemId) return { error: `${label} is not on any order — pick a product for it or remove it before shipping` };
+    const xq = num(l.qty);
+    if (xq == null || xq <= 0) return { error: `${label}: shipped quantity must be a positive number` };
+    const supplier = str(l.supplier);
+    if (!supplier) return { error: `${label} needs a supplier before it ships` };
+    const price = hasVal(l.unitPrice) ? num(l.unitPrice) : null;
+    if (price == null || price < 0) return { error: `${label}: unit price is required to ship` };
+    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price });
+  }
   const zohoVendor = vendorById(b.zohoVendorId);
   if (!zohoVendor) return { error: "Pick the Zoho vendor for this batch" };
   // the form's shipping cost; a caller that leaves the field out of the body
@@ -1540,6 +1614,7 @@ async function shipBatch(db, req, b, draft) {
   if (ship.error) return { error: ship.error };
   const parsed = [];
   for (const l of rawLines) {
+    if (l.unmatched === true || l.special === true || !l.orderId) continue; // handled above
     const _id = oid(l.orderId);
     if (!_id) return { error: `invalid order id: ${l.orderId}` };
     const qty = num(l.qty);
@@ -1561,7 +1636,7 @@ async function shipBatch(db, req, b, draft) {
       return { error: `${rec.sku || rec.orderNo} is ${rec.status}; only ordered or pending lines can ship` };
     }
     if (awaitsQuote(rec)) return { error: `${rec.productName || rec.orderNo}: a ${rec.category} line is quoted and confirmed before it ships` };
-    if (rec.status === "pending" && !p.supplier && !rec.supplier) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
+    if (rec.status === "pending" && !p.supplier && !rec.supplier && rec.category !== SPECIAL_ORDER) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
     // The price may be left off when placing, but every shipped line must
     // carry one — from the batch form or already on the line.
     if (p.price == null && rec.unitPrice == null) return { error: `${rec.sku || rec.orderNo}: unit price is required to ship` };
@@ -1574,6 +1649,25 @@ async function shipBatch(db, req, b, draft) {
     const tracking = str(b.tracking);
     const { seq, no: batchNo } = await nextNo(db, "batch", "PB", 10001, BATCHES);
     const batchId = draft ? draft._id : new ObjectId();
+    // the not-in-PO lines become SP- lines of their own, then ship like the rest
+    for (const x of extras) {
+      const facts = x.special ? { category: SPECIAL_ORDER, imageId: null } : await registerFacts(db, x.itemId);
+      const { seq: xSeq, no: xNo } = await nextNo(db, "order", "SP", 10001, ORDERS);
+      const doc = {
+        // a typed Special Order: no quote step (needsQuote false), so it ships in this same pass
+        ...(x.special ? { requestedFor: x.requestedFor || "", urgent: false, needsQuote: false } : {}),
+        orderNo: xNo, seq: xSeq, itemId: x.itemId, sku: x.sku, productName: x.productName, imageId: facts.imageId, category: facts.category,
+        orderQty: x.qty, note: "", status: "pending", quotedPrice: null, supplier: x.supplier, unitPrice: round2(x.price), lineTotal: round2(x.qty * x.price),
+        orderedAt: null, orderedBy: null, shippedQty: null, shippedAt: null, batchId: null, batchNo: "", tracking: "",
+        receivedQty: null, receivedAt: null, receivedBy: null, source: "app", createdFrom: { batch: batchNo },
+        createdAt: now, createdBy: by, updatedAt: now,
+        history: [hist("created", by, { orderQty: x.qty, batchNo, reason: x.special ? "Special Order typed into the batch" : "scanned into the batch without an order" })],
+      };
+      const ins = await col.insertOne(doc);
+      doc._id = ins.insertedId;
+      byId.set(String(ins.insertedId), { ...doc }); // a copy: the ship loop reads prevStatus from it
+      parsed.push({ _id: ins.insertedId, qty: x.qty, supplier: x.supplier, price: x.price });
+    }
     const lines = [];
     const remainders = [];
     for (const p of parsed) {

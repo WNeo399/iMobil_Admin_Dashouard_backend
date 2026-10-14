@@ -182,8 +182,13 @@ const ROLE_PERMISSIONS = {
   // images for them (not archiving — that is a stock-edit action). Since
   // 2026-10-07 also adding lines (spp:order:add): Add Item and Order New
   // Product — not Special Orders, which are iMobile's own.
+  // 2026-10-14 (user): everything in Spare Parts Purchase except receiving —
+  // Special Orders, line edits, the New Products page and "Create in Zoho"
+  // included. Only spp:order:receive (receive a batch, Mark as completed)
+  // stays with iMobile.
   [ROLES.PARTS_SUPPLIER]: [
     "spp:order:view",
+    "spp:order:create",
     "spp:order:add",
     "spp:order:supply",
     "spp:batch:view",
@@ -191,6 +196,8 @@ const ROLE_PERMISSIONS = {
     "spp:batch:manage",
     "spp:image:view",
     "spp:image:upload",
+    "spp:product:view",
+    "spp:product:create",
   ],
   // Supplier Warehouse (2026-10-13): builds and saves the batches (drafts,
   // scanning, the price sheet) — the Batches page only. No order view, no

@@ -21,6 +21,22 @@ const VENDOR_TTL_MS = 60 * 60 * 1000;
 // Zoho's "Shipping fee" item (SKU 10807) — the line a batch's shipping cost
 // is booked on, as on the team's hand-made purchase orders.
 const SHIPPING_ITEM_ID = "2591985000010307946";
+// "Domestic Special Order" (SKU 15761): a Special Order has no Zoho item of
+// its own, so every Special Order line goes under this item with its own
+// description, price and quantity (user 2026-10-14; was "Special Order -
+// Physical Stock" 2591985000052872989 for a few hours that day).
+const SPECIAL_ORDER_ITEM_ID = "2591985000052872953";
+const SPECIAL_ORDER_ITEM_NAME = "Domestic Special Order";
+// Zoho takes the line's name from the request once a description is sent, so
+// the item's own name goes with it (the register's copy, else the constant).
+async function specialItemName(db) {
+  try {
+    const it = await db.collection("imb_stock_items").findOne({ itemId: SPECIAL_ORDER_ITEM_ID }, { projection: { _id: 0, name: 1 } });
+    return (it && it.name) || SPECIAL_ORDER_ITEM_NAME;
+  } catch (e) {
+    return SPECIAL_ORDER_ITEM_NAME;
+  }
+}
 
 // The Zoho vendors a batch may be booked to (the user's list). A test
 // vendor can be added for a local run with SPP_ZOHO_TEST_VENDOR_ID.
@@ -84,8 +100,9 @@ async function createBatchPurchaseOrders(db, batch, existing) {
     const vendor = { id: picked.id, name: (live && live.name) || picked.name, currency: (live && live.currency) || "CNY" };
 
     const lines = [];
+    const specialName = (batch.lines || []).some((l) => !l.itemId && l.category === "Special Order") ? await specialItemName(db) : SPECIAL_ORDER_ITEM_NAME;
     for (const l of batch.lines || []) {
-      if (!l.itemId) { result.skipped.push({ sku: l.sku, productName: l.productName, reason: "no Zoho item" }); continue; }
+      if (!l.itemId && l.category !== "Special Order") { result.skipped.push({ sku: l.sku, productName: l.productName, reason: "no Zoho item" }); continue; }
       lines.push(l);
     }
     const groups = new Map(lines.length ? [[vendor.id, { vendor, lines }]] : []);
@@ -107,7 +124,10 @@ async function createBatchPurchaseOrders(db, batch, existing) {
         ].filter(Boolean).join("\n"),
         line_items: [
           ...g.lines.map((l) => {
-            const li = { item_id: String(l.itemId), quantity: Number(l.shippedQty) || 0, tax_id: taxId };
+            const special = !l.itemId && l.category === "Special Order";
+            const li = { item_id: special ? SPECIAL_ORDER_ITEM_ID : String(l.itemId), quantity: Number(l.shippedQty) || 0, tax_id: taxId };
+            // the shared Special Order item carries the line's own title as its description (just the title — user 2026-10-14)
+            if (special) { li.name = specialName; li.description = String(l.productName || "").trim().slice(0, 2000); }
             if (cny && l.unitPrice != null && Number.isFinite(Number(l.unitPrice))) li.rate = Number(l.unitPrice);
             return li;
           }),
