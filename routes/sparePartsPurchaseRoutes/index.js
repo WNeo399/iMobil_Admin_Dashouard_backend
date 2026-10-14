@@ -1442,7 +1442,7 @@ async function draftPayload(db, b) {
       }
       // since 2026-10-14 the line can carry the product picked for it (register itemId), a supplier and a price
       parsed.push({ unmatched: true, sku, productName: str(l.productName).slice(0, 200), category: str(l.category).slice(0, 40), reason: l.reason === "over" ? "over" : "none", qty: uqty,
-        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: uprice, key: str(l.key).slice(0, 40) });
+        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: l.warranty === true ? 0 : uprice, warranty: l.warranty === true, key: str(l.key).slice(0, 40) });
       continue;
     }
     const _id = oid(l.orderId);
@@ -1470,7 +1470,7 @@ async function draftPayload(db, b) {
       continue;
     }
     if (p.unmatched) {
-      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, key: p.key });
+      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, warranty: !!p.warranty, key: p.key });
       continue;
     }
     const rec = byId.get(String(p._id));
@@ -1602,9 +1602,10 @@ async function shipBatch(db, req, b, draft) {
     if (xq == null || xq <= 0) return { error: `${label}: shipped quantity must be a positive number` };
     const supplier = str(l.supplier);
     if (!supplier) return { error: `${label} needs a supplier before it ships` };
-    const price = hasVal(l.unitPrice) ? num(l.unitPrice) : null;
+    const warranty = l.warranty === true; // a warranty replacement: no charge (user 2026-10-14)
+    const price = warranty ? 0 : hasVal(l.unitPrice) ? num(l.unitPrice) : null;
     if (price == null || price < 0) return { error: `${label}: unit price is required to ship` };
-    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price });
+    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price, warranty });
   }
   const zohoVendor = vendorById(b.zohoVendorId);
   if (!zohoVendor) return { error: "Pick the Zoho vendor for this batch" };
@@ -1656,8 +1657,9 @@ async function shipBatch(db, req, b, draft) {
       const doc = {
         // a typed Special Order: no quote step (needsQuote false), so it ships in this same pass
         ...(x.special ? { requestedFor: x.requestedFor || "", urgent: false, needsQuote: false } : {}),
+        ...(x.warranty ? { warranty: true } : {}),
         orderNo: xNo, seq: xSeq, itemId: x.itemId, sku: x.sku, productName: x.productName, imageId: facts.imageId, category: facts.category,
-        orderQty: x.qty, note: "", status: "pending", quotedPrice: null, supplier: x.supplier, unitPrice: round2(x.price), lineTotal: round2(x.qty * x.price),
+        orderQty: x.qty, note: x.warranty ? "Warranty replacement" : "", status: "pending", quotedPrice: null, supplier: x.supplier, unitPrice: round2(x.price), lineTotal: round2(x.qty * x.price),
         orderedAt: null, orderedBy: null, shippedQty: null, shippedAt: null, batchId: null, batchNo: "", tracking: "",
         receivedQty: null, receivedAt: null, receivedBy: null, source: "app", createdFrom: { batch: batchNo },
         createdAt: now, createdBy: by, updatedAt: now,
@@ -1666,7 +1668,7 @@ async function shipBatch(db, req, b, draft) {
       const ins = await col.insertOne(doc);
       doc._id = ins.insertedId;
       byId.set(String(ins.insertedId), { ...doc }); // a copy: the ship loop reads prevStatus from it
-      parsed.push({ _id: ins.insertedId, qty: x.qty, supplier: x.supplier, price: x.price });
+      parsed.push({ _id: ins.insertedId, qty: x.qty, supplier: x.supplier, price: x.price, warranty: !!x.warranty });
     }
     const lines = [];
     const remainders = [];
@@ -1734,6 +1736,7 @@ async function shipBatch(db, req, b, draft) {
         shippedQty: p.qty,
         unitPrice: p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : null,
         receivedQty: null,
+        ...(p.warranty ? { warranty: true } : {}),
         // where the line came from — a cancelled batch puts it back there
         prevStatus: rec.status,
       });

@@ -129,6 +129,8 @@ async function createBatchPurchaseOrders(db, batch, existing) {
             // the shared Special Order item carries the line's own title as its description (just the title — user 2026-10-14)
             if (special) { li.name = specialName; li.description = String(l.productName || "").trim().slice(0, 2000); }
             if (cny && l.unitPrice != null && Number.isFinite(Number(l.unitPrice))) li.rate = Number(l.unitPrice);
+            // a warranty replacement: no charge, said so on the line (the name goes with any description)
+            if (l.warranty) { li.rate = 0; li.name = String(l.productName || "").slice(0, 200); li.description = "Warranty replacement"; }
             return li;
           }),
           ...(shippingCost ? [{ item_id: SHIPPING_ITEM_ID, quantity: 1, rate: shippingCost, tax_id: taxId }] : []),
