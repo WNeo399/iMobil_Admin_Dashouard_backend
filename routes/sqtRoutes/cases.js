@@ -839,12 +839,15 @@ router.post(
 // declared unrepairable. Writes `unrepairableReview` {reason, reviewedAt,
 // reviewedBy} — the flag the scheduled processor of reviewed cases will
 // query on. Re-running adjusts the reason and re-stamps who/when.
-// ADMIN ONLY by explicit role check: a permission string can't express
-// this, because TechElite Admin's sqt:*:* would match any sqt permission.
+// Admin, iMobile Front Desk and TechElite Admin (the latter two added
+// 2026-10-15), by explicit role check — the same admin-side list the group
+// filter uses; shop roles never review.
+const UNREPAIRABLE_REVIEW_ROLES = ["admin", "imobile-front-desk", "techelite-admin"];
 router.post("/review-unrepairable/:id", async (req, res) => {
   try {
-    if (!req.user || !(req.user.roles || [req.user.role]).includes("admin")) {
-      return res.status(403).json({ success: false, message: "Only an admin can review unrepairable cases" });
+    const roles = (req.user && (req.user.roles || [req.user.role])) || [];
+    if (!roles.some((r) => UNREPAIRABLE_REVIEW_ROLES.includes(r))) {
+      return res.status(403).json({ success: false, message: "Only admin-side roles can review unrepairable cases" });
     }
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
