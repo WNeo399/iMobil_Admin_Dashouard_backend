@@ -48,7 +48,7 @@ const { requirePermission } = require("../../middleware/auth");
 const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
-const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, ZOHO_VENDORS, vendorById } = require("../../utils/sppZoho");
+const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference, ZOHO_VENDORS, vendorById } = require("../../utils/sppZoho");
 const { MAX_IMAGES, acceptImage, storeImage, removeImage } = require("../../utils/sppImages");
 const { refreshToken } = require("../../utils/zohoRequest");
 const zohoItem = require("../../utils/zohoNewItem");
@@ -1878,6 +1878,7 @@ router.put("/batches/:id", BATCH_MANAGE, async (req, res, next) => {
     if (batch.status === "cancelled") return bad(res, "This batch was cancelled");
     const set = {};
     const lineSet = { updatedAt: new Date() };
+    const prevTracking = str(batch.tracking); // before the write — the PO sync keys on a change
     if (b.tracking !== undefined) { set.tracking = str(b.tracking); lineSet.tracking = set.tracking; }
     if (hasVal(b.shippedAt)) { set.shippedAt = dayDate(b.shippedAt); lineSet.shippedAt = set.shippedAt; }
     if (b.note !== undefined) set.note = str(b.note);
@@ -1886,7 +1887,15 @@ router.put("/batches/:id", BATCH_MANAGE, async (req, res, next) => {
     if (lineSet.tracking !== undefined || lineSet.shippedAt !== undefined) {
       await db.collection(ORDERS).updateMany({ _id: { $in: (batch.lines || []).map((l) => l.orderId) } }, { $set: lineSet });
     }
-    return res.json({ success: true, ...set });
+    // A tracking number entered or changed after the Zoho PO exists goes
+    // onto the PO's Reference# (user 2026-10-15). Non-fatal: the batch is
+    // saved either way, the outcome rides back for the page to say.
+    let zohoReference = null;
+    if (set.tracking !== undefined && set.tracking !== prevTracking && batch.zoho && (batch.zoho.pos || []).some((p) => p.purchaseorderId)) {
+      zohoReference = await syncBatchReference({ ...batch, tracking: set.tracking });
+      await db.collection(BATCHES).updateOne({ _id }, { $set: { "zoho.reference": { ...zohoReference, at: new Date() } } });
+    }
+    return res.json({ success: true, ...set, ...(zohoReference ? { zohoReference } : {}) });
   } catch (error) {
     next(error);
   }

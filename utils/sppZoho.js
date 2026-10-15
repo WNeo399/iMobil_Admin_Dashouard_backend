@@ -13,7 +13,7 @@
 // Everything here is non-fatal for the batch: the outcome is stored on the
 // batch (`zoho`) and can be retried from the Batches page.
 
-const { handleZohoInventoryRequest, handleZohoInventoryPostRequest, refreshToken } = require("./zohoRequest");
+const { handleZohoInventoryRequest, handleZohoInventoryPostRequest, handleZohoInventoryPutRequest, refreshToken } = require("./zohoRequest");
 
 const ORG = "746138234";
 const BASE = "https://www.zohoapis.com/inventory/v1";
@@ -115,7 +115,9 @@ async function createBatchPurchaseOrders(db, batch, existing) {
       const body = {
         vendor_id: vendorId,
         date: ymd(batch.shippedAt),
-        reference_number: batch.batchNo,
+        // the courier's tracking number is the PO's Reference# (user
+        // 2026-10-15); the batch number stands in until one is entered
+        reference_number: poReference(batch),
         notes: [
           `Spare Parts Purchase ${batch.batchNo}`,
           batch.tracking ? `Tracking ${batch.tracking}` : "",
@@ -168,6 +170,33 @@ async function createBatchPurchaseOrders(db, batch, existing) {
   return result;
 }
 
+// What the PO's Reference# reads: the tracking number, else the batch number.
+function poReference(batch) {
+  const t = String((batch && batch.tracking) || "").trim();
+  return (t || (batch && batch.batchNo) || "").slice(0, 100);
+}
+
+// The tracking number entered (or changed) after the PO exists goes onto
+// the PO's Reference# too (user 2026-10-15). Zoho takes a reference-only
+// update on an issued — even a received — PO (checked 2026-10-15).
+// Returns { reference, updated: [PO numbers], failed: [{ number, message }] }.
+async function syncBatchReference(batch) {
+  const pos = ((batch && batch.zoho && batch.zoho.pos) || []).filter((p) => p.purchaseorderId);
+  const out = { reference: poReference(batch), updated: [], failed: [] };
+  if (!pos.length) return out;
+  try { await refreshToken(); } catch (e) { /* the call refreshes reactively too */ }
+  for (const p of pos) {
+    try {
+      const r = await handleZohoInventoryPutRequest(`${BASE}/purchaseorders/${p.purchaseorderId}?organization_id=${ORG}`, { reference_number: out.reference });
+      if (r && r.code === 0) out.updated.push(p.number);
+      else out.failed.push({ number: p.number, message: (r && (r.message || (r.error && r.error.message))) || "Zoho refused the update" });
+    } catch (e) {
+      out.failed.push({ number: p.number, message: (e && e.message) || String(e) });
+    }
+  }
+  return out;
+}
+
 // A cancelled batch cancels its Zoho PO(s) too (marked cancelled, not
 // deleted — our token may not delete, and a cancelled PO keeps the trail).
 // Returns what Zoho refused.
@@ -188,4 +217,4 @@ async function cancelBatchPurchaseOrders(batch) {
   return failed;
 }
 
-module.exports = { createBatchPurchaseOrders, cancelBatchPurchaseOrders, loadVendors, gstTaxId, ZOHO_VENDORS, vendorById };
+module.exports = { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference, poReference, loadVendors, gstTaxId, ZOHO_VENDORS, vendorById };
