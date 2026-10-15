@@ -184,9 +184,11 @@ const ROLE_PERMISSIONS = {
   // Product — not Special Orders, which are iMobile's own.
   // 2026-10-14 (user): everything in Spare Parts Purchase except receiving —
   // Special Orders, line edits, the New Products page and "Create in Zoho"
-  // included. Only spp:order:receive (receive a batch, Mark as completed)
-  // stays with iMobile.
+  // included. Only spp:order:receive (receive a batch) stays with iMobile;
+  // since 2026-10-15 "Mark as completed" on a line is its own permission,
+  // spp:order:complete, which the supplier holds.
   [ROLES.PARTS_SUPPLIER]: [
+    "spp:order:complete",
     "spp:order:view",
     "spp:order:create",
     "spp:order:add",

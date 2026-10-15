@@ -30,7 +30,8 @@
 //   spp:order:add       add lines (Add Item, New Product — not Special Order)
 //                                                       admin, iMobile admin, parts supplier
 //   spp:order:supply    quote / place / shortage        admin, iMobile admin, parts supplier
-//   spp:order:receive   receive a batch / mark completed admin, iMobile admin (NOT the parts supplier)
+//   spp:order:receive   receive a batch                  admin, iMobile admin (NOT the parts supplier)
+//   spp:order:complete  Mark as completed on a line      the parts supplier too (2026-10-15); receivers via spp:*:*
 //   spp:product:create  create a New Product line's item in Zoho (also New Products)
 //                                                       admin, iMobile admin, iMobile purchase, warehouse, parts supplier
 //   spp:batch:view      read the batches                all three
@@ -1294,10 +1295,11 @@ router.post("/orders/:id/reopen", CREATE_OR_SUPPLY, (req, res, next) =>
 // For lines that were sent and received before the system tracked them:
 // the line closes as received on its ordered quantity — no batch, no Zoho
 // purchase order — and sits under Received, flagged `completed`. Anyone who
-// can receive (spp:order:receive). A shipped line is received through its
-// batch instead.
+// can receive (spp:order:receive) or complete (spp:order:complete — the parts
+// supplier since 2026-10-15). A shipped line is received through its batch
+// instead.
 //   POST /orders/:id/complete  { receivedAt?: "YYYY-MM-DD", note? }
-router.post("/orders/:id/complete", RECEIVE, async (req, res, next) => {
+router.post("/orders/:id/complete", requireAny("spp:order:receive", "spp:order:complete"), async (req, res, next) => {
   try {
     const _id = oid(req.params.id);
     if (!_id) return bad(res, "invalid id");
