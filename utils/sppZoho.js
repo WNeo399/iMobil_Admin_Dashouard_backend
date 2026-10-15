@@ -197,6 +197,50 @@ async function syncBatchReference(batch) {
   return out;
 }
 
+// A shipping cost changed after the PO exists (user 2026-10-15, while the
+// batch is shipped but not received) goes onto the PO's "Shipping fee"
+// line: re-rated, added, or removed when the cost is cleared. Only CNY
+// vendors carry the line (the cost is typed in CNY, as at creation). The
+// PO's other lines are sent back exactly as Zoho holds them — Zoho keeps
+// line ids and totals on such a PUT (checked 2026-10-15) — so lines the
+// warehouse added by hand in Zoho survive.
+// Returns { shippingCost, updated: [{ number, from, to, total }], skipped: [{ number, reason }], failed: [{ number, message }] }.
+async function syncBatchShipping(batch) {
+  const pos = ((batch && batch.zoho && batch.zoho.pos) || []).filter((p) => p.purchaseorderId);
+  const n = Number(batch && batch.shippingCost);
+  const cost = Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0;
+  const out = { shippingCost: cost, updated: [], skipped: [], failed: [] };
+  if (!pos.length) return out;
+  try { await refreshToken(); } catch (e) { /* the calls refresh reactively too */ }
+  let taxId = null;
+  for (const p of pos) {
+    if (p.currency !== "CNY") { out.skipped.push({ number: p.number, reason: "not a CNY vendor — no shipping line on this PO" }); continue; }
+    try {
+      const url = `${BASE}/purchaseorders/${p.purchaseorderId}?organization_id=${ORG}`;
+      const g = await handleZohoInventoryRequest(url);
+      const po = g && g.purchaseorder;
+      if (!po) { out.failed.push({ number: p.number, message: (g && g.message) || "Zoho did not return the purchase order" }); continue; }
+      if (taxId == null) taxId = await gstTaxId();
+      const lines = (po.line_items || []).map((l) => ({ line_item_id: l.line_item_id, item_id: l.item_id, name: l.name, description: l.description || "", quantity: l.quantity, rate: l.rate, tax_id: l.tax_id || taxId }));
+      const i = lines.findIndex((l) => String(l.item_id) === SHIPPING_ITEM_ID);
+      const from = i >= 0 ? Number(lines[i].rate) || 0 : 0;
+      if (from === cost) { out.updated.push({ number: p.number, from, to: cost, total: po.total, unchanged: true }); continue; }
+      if (cost > 0) {
+        if (i >= 0) lines[i].rate = cost;
+        else lines.push({ item_id: SHIPPING_ITEM_ID, quantity: 1, rate: cost, tax_id: taxId });
+      } else {
+        lines.splice(i, 1);
+      }
+      const r = await handleZohoInventoryPutRequest(url, { line_items: lines });
+      if (r && r.code === 0 && r.purchaseorder) out.updated.push({ number: p.number, from, to: cost, total: r.purchaseorder.total });
+      else out.failed.push({ number: p.number, message: (r && (r.message || (r.error && r.error.message))) || "Zoho refused the update" });
+    } catch (e) {
+      out.failed.push({ number: p.number, message: (e && e.message) || String(e) });
+    }
+  }
+  return out;
+}
+
 // A cancelled batch cancels its Zoho PO(s) too (marked cancelled, not
 // deleted — our token may not delete, and a cancelled PO keeps the trail).
 // Returns what Zoho refused.
@@ -217,4 +261,4 @@ async function cancelBatchPurchaseOrders(batch) {
   return failed;
 }
 
-module.exports = { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference, poReference, loadVendors, gstTaxId, ZOHO_VENDORS, vendorById };
+module.exports = { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference, syncBatchShipping, poReference, loadVendors, gstTaxId, ZOHO_VENDORS, vendorById };

@@ -48,7 +48,7 @@ const { requirePermission } = require("../../middleware/auth");
 const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
-const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference, ZOHO_VENDORS, vendorById } = require("../../utils/sppZoho");
+const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference, syncBatchShipping, ZOHO_VENDORS, vendorById } = require("../../utils/sppZoho");
 const { MAX_IMAGES, acceptImage, storeImage, removeImage } = require("../../utils/sppImages");
 const { refreshToken } = require("../../utils/zohoRequest");
 const zohoItem = require("../../utils/zohoNewItem");
@@ -1866,7 +1866,9 @@ async function shipBatch(db, req, b, draft) {
 }
 
 // Tracking / ship date / note can be fixed after the fact (a tracking number
-// often arrives later). Mirrored onto the lines.
+// often arrives later). Mirrored onto the lines. The shipping cost too, while
+// the batch is shipped but not yet received (user 2026-10-15) — and onto the
+// Zoho PO's shipping line.
 router.put("/batches/:id", BATCH_MANAGE, async (req, res, next) => {
   try {
     const _id = oid(req.params.id);
@@ -1879,7 +1881,14 @@ router.put("/batches/:id", BATCH_MANAGE, async (req, res, next) => {
     const set = {};
     const lineSet = { updatedAt: new Date() };
     const prevTracking = str(batch.tracking); // before the write — the PO sync keys on a change
+    const prevShipping = batch.shippingCost == null ? null : round2(Number(batch.shippingCost));
     if (b.tracking !== undefined) { set.tracking = str(b.tracking); lineSet.tracking = set.tracking; }
+    if (b.shippingCost !== undefined) {
+      if (batch.status !== "shipped") return bad(res, "The shipping cost can only be changed while the batch is shipped and not yet received");
+      const ship = shippingCostOf(b);
+      if (ship.error) return bad(res, ship.error);
+      set.shippingCost = ship.value;
+    }
     if (hasVal(b.shippedAt)) { set.shippedAt = dayDate(b.shippedAt); lineSet.shippedAt = set.shippedAt; }
     if (b.note !== undefined) set.note = str(b.note);
     if (!Object.keys(set).length) return bad(res, "Nothing to change");
@@ -1895,7 +1904,20 @@ router.put("/batches/:id", BATCH_MANAGE, async (req, res, next) => {
       zohoReference = await syncBatchReference({ ...batch, tracking: set.tracking });
       await db.collection(BATCHES).updateOne({ _id }, { $set: { "zoho.reference": { ...zohoReference, at: new Date() } } });
     }
-    return res.json({ success: true, ...set, ...(zohoReference ? { zohoReference } : {}) });
+    // A changed shipping cost goes onto the PO's shipping line (CNY vendors);
+    // the batch's PO summary follows (total, shippingCost). Non-fatal too.
+    let zohoShipping = null;
+    if (set.shippingCost !== undefined && set.shippingCost !== prevShipping && batch.zoho && (batch.zoho.pos || []).some((p) => p.purchaseorderId)) {
+      zohoShipping = await syncBatchShipping({ ...batch, shippingCost: set.shippingCost });
+      const pos = (batch.zoho.pos || []).map((p) => {
+        const u = zohoShipping.updated.find((x) => x.number === p.number);
+        if (!u) return p;
+        const { shippingCost: _old, ...rest } = p;
+        return { ...rest, ...(u.total != null ? { total: u.total } : {}), ...(set.shippingCost > 0 ? { shippingCost: set.shippingCost } : {}) };
+      });
+      await db.collection(BATCHES).updateOne({ _id }, { $set: { "zoho.pos": pos, "zoho.shipping": { ...zohoShipping, at: new Date() } } });
+    }
+    return res.json({ success: true, ...set, ...(zohoReference ? { zohoReference } : {}), ...(zohoShipping ? { zohoShipping } : {}) });
   } catch (error) {
     next(error);
   }
