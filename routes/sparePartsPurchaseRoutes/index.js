@@ -88,7 +88,19 @@ const OPEN = ["pending", "toConfirm", "ordered", "shipped", "shortage"];
 // Where a line files in the tree: the register classification of its item
 // (set automatically on create, 2026-09-22), or one of the two channels the
 // team keeps apart — sea-freight orders (海运) and customer special orders.
-const CLASSIFICATIONS = ["Screen", "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "IC", "Tools", "Other"];
+// MacBook Screen (2026-10-15, user): MacBook screens are a category of their
+// own — a register item classified Screen on a MacBook (device series, or
+// the name says so) files there instead of under Screen.
+const MACBOOK_SCREEN = "MacBook Screen";
+const CLASSIFICATIONS = ["Screen", MACBOOK_SCREEN, "Housing", "Middle Frame", "BackCover", "Battery", "Small Parts", "IC", "Tools", "Other"];
+const isMacBookItem = (it) => /macbook/i.test(String((it && it.deviceSeries) || "")) || /macbook/i.test(String((it && it.name) || ""));
+// A register item's module category: its classification, MacBook screens
+// apart; blank / unknown → Other.
+const categoryOfItem = (it) => {
+  const c = it && it.classification;
+  if (c === "Screen" && isMacBookItem(it)) return MACBOOK_SCREEN;
+  return CLASSIFICATIONS.includes(c) ? c : "Other";
+};
 // Warranty (2026-10-14): replacement parts claimed from the supplier — a
 // pinned list on the Purchase Order page; its lines carry price 0 and ship
 // as warranty (no charge on the Zoho PO).
@@ -113,9 +125,8 @@ const forOf = (v) => str(v).slice(0, 60);
 // category (blank / unknown → Other) and its image id.
 async function registerFacts(db, itemId) {
   if (!itemId) return { category: "Other", imageId: null };
-  const it = await db.collection(ITEMS).findOne({ itemId: String(itemId) }, { projection: { _id: 0, classification: 1, imageId: 1 } });
-  const c = it && it.classification;
-  return { category: CLASSIFICATIONS.includes(c) ? c : "Other", imageId: (it && it.imageId) || null };
+  const it = await db.collection(ITEMS).findOne({ itemId: String(itemId) }, { projection: { _id: 0, classification: 1, imageId: 1, name: 1, deviceSeries: 1 } });
+  return { category: categoryOfItem(it), imageId: (it && it.imageId) || null };
 }
 
 const actor = (req) => (req.user && (req.user.username || req.user.email)) || null;
@@ -145,7 +156,7 @@ const oscarRefOf = (code) => {
 };
 // the register item as the scan lookup answers it
 const ITEM_BRIEF = { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, imageId: 1 };
-const itemBrief = (item) => (item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: CLASSIFICATIONS.includes(item.classification) ? item.classification : "Other", imageId: item.imageId || null, imageUrl: imageUrlFromId(item.imageId) } : null);
+const itemBrief = (item) => (item ? { itemId: item.itemId, sku: item.sku, name: item.name || "", classification: item.classification || "", suggestedCategory: categoryOfItem(item), imageId: item.imageId || null, imageUrl: imageUrlFromId(item.imageId) } : null);
 // ordered lines before pending ones, oldest first
 const openFirst = (a, b) => (a.status === "ordered" ? 0 : 1) - (b.status === "ordered" ? 0 : 1) || new Date(a.orderedAt || a.createdAt) - new Date(b.orderedAt || b.createdAt);
 const hasVal = (v) => v !== undefined && v !== null && String(v).trim() !== "";
@@ -235,7 +246,7 @@ router.get("/products/search", requireAny("spp:order:view", "spp:batch:create"),
       classification: r.classification || "",
       available: r.metrics ? r.metrics.available : null,
       // where a line for it files (the server derives the same on create)
-      suggestedCategory: CLASSIFICATIONS.includes(r.classification) ? r.classification : "Other",
+      suggestedCategory: categoryOfItem(r),
     }));
     return res.json({ success: true, products });
   } catch (error) {

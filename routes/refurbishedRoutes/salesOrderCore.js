@@ -57,7 +57,11 @@ function sumLines(lines) {
 // simply carry 0.
 const GST_RATE = 0.1;
 
+// GST is on by default (user 2026-10-15): an order created without a rate
+// gets 10%; the page sends 0 explicitly when its GST box is unticked.
+const DEFAULT_GST_RATE = 0.1;
 function normalizeGstRate(v) {
+  if (v === undefined || v === null || v === "") return DEFAULT_GST_RATE;
   const n = Number(v);
   if (!Number.isFinite(n) || n < 0) return 0;
   return Math.min(n, 1);
