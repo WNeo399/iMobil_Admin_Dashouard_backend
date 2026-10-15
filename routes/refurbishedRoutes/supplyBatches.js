@@ -144,7 +144,7 @@ const CURRENCIES = ["AUD", "CNY", "HKD"];
 // saved: a missing cost (with its currency) and the unit's upstream
 // supplier. Applied to the device docs BEFORE snapshotting, so the
 // batch lines and the register can't disagree.
-//   updates: [{ deviceId, costPrice, currency, supplierId }]
+//   updates: [{ deviceId, costPrice, currency, supplierId, model }]
 // For staff, costs only ever FILL a blank (an existing figure is never
 // overwritten from this path). A phone supplier's figure is their price,
 // which they may change here — the same rule as the Stock page: always
@@ -193,6 +193,17 @@ async function applyDeviceUpdates(db, req, devices, rawUpdates) {
       set.costPrice = Number(cost);
       set.currency = currency;
       history.push(`Cost set to ${currency} ${Number(cost).toFixed(2)} while boarding a supply batch`);
+    }
+
+    // A model typed in the dialog for a unit that had none (Blackbelt's
+    // report carried no model, 2026-10-15) — written onto the device so
+    // the batch line, the receiving list and the register agree.
+    const model = u.model === undefined ? "" : String(u.model || "").trim().slice(0, 100);
+    if (model && model !== String(d.model || "")) {
+      set.model = model;
+      history.push(d.model
+        ? `Model changed from ${d.model} to ${model} while boarding a supply batch`
+        : `Model set to ${model} while boarding a supply batch`);
     }
 
     if (isSupplierUser && u.supplierId !== undefined) {
@@ -362,6 +373,21 @@ router.get("/:id", VIEW, async (req, res) => {
   }
 });
 
+// The batch's own supplier (user 2026-10-15): a phone supplier may pick one
+// of THEIR suppliers for the whole batch — stored on the batch and, through
+// deviceUpdates, written onto every device aboard. Validated against their
+// scoped list; blank clears it. Staff batches carry none.
+//   → { supplier: { id, name } | null } or { error }
+async function batchSupplierOf(db, req, supplierId) {
+  if (!actsAsPhoneSupplier(req.user)) return { supplier: null };
+  const wanted = supplierId == null ? "" : String(supplierId).trim();
+  if (!wanted) return { supplier: null };
+  if (!ObjectId.isValid(wanted)) return { error: "The picked supplier isn't on your suppliers list" };
+  const sup = await db.collection("refurb_suppliers").findOne({ _id: new ObjectId(wanted), stockSource: stockSourceForUser(req.user) });
+  if (!sup) return { error: "The picked supplier isn't on your suppliers list" };
+  return { supplier: { id: sup._id, name: sup.name } };
+}
+
 // ── POST /refurbished/supply ────────────────────────────────────────
 // Body: { notes, tracking, deviceIds: [...] } — saves a Pending draft.
 // Devices are untouched until the batch is confirmed.
@@ -378,6 +404,8 @@ router.post("/", MANAGE, async (req, res) => {
     }
     const updErr = await applyDeviceUpdates(db, req, resolved.devices, body.deviceUpdates);
     if (updErr) return res.status(400).json({ success: false, message: updErr });
+    const sup = await batchSupplierOf(db, req, body.supplierId);
+    if (sup.error) return res.status(400).json({ success: false, message: sup.error });
 
     const now = new Date();
     const { seq, batchNo } = await nextBatchNumber(db);
@@ -385,6 +413,8 @@ router.post("/", MANAGE, async (req, res) => {
       batchNo,
       seq,
       stockSource: resolved.stockSource,
+      // the supplier every device on the batch comes from (phone suppliers)
+      supplier: sup.supplier,
       notes: String(body.notes || "").trim().slice(0, 1000),
       tracking: String(body.tracking || "").trim().slice(0, 100),
       status: STATUS_PENDING,
@@ -440,12 +470,15 @@ router.put("/:id", MANAGE, async (req, res) => {
     }
     const updErr = await applyDeviceUpdates(db, req, resolved.devices, body.deviceUpdates);
     if (updErr) return res.status(400).json({ success: false, message: updErr });
+    const sup = await batchSupplierOf(db, req, body.supplierId);
+    if (sup.error) return res.status(400).json({ success: false, message: sup.error });
 
     const r = await db.collection(SUPPLY).findOneAndUpdate(
       { _id: batch._id },
       {
         $set: {
           stockSource: resolved.stockSource,
+          supplier: sup.supplier,
           notes: String(body.notes || "").trim().slice(0, 1000),
           tracking: String(body.tracking || "").trim().slice(0, 100),
           lines: snapshotLines(resolved.devices),
