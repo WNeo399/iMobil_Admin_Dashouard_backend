@@ -104,6 +104,15 @@ function cleanQuality(v) {
   return { quality: q };
 }
 
+// The cost price as typed (2026-10-16 — required to create, it goes to Zoho
+// as the purchase rate): { cost } (null when blank) or { error }.
+function readCost(v) {
+  if (v === undefined || v === null || v === "") return { cost: null };
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0 || n > 1000000) return { error: "The cost price must be more than 0" };
+  return { cost: Math.round(n * 100) / 100 };
+}
+
 // Is this SKU already on an item in Zoho?
 async function skuTaken(sku) {
   const r = await handleZohoInventoryRequest(`${ZOHO}/items?organization_id=${ORG}&sku=${encodeURIComponent(sku)}`);
@@ -233,6 +242,7 @@ module.exports = {
   PRICE_LISTS,
   qualityOptions,
   cleanQuality,
+  readCost,
   MAX_IMAGES,
   acceptPhotos,
   parsePriceLists,

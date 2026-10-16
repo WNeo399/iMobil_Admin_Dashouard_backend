@@ -53,6 +53,9 @@ const { createBatchPurchaseOrders, cancelBatchPurchaseOrders, syncBatchReference
 const { MAX_IMAGES, acceptImage, storeImage, removeImage } = require("../../utils/sppImages");
 const { refreshToken } = require("../../utils/zohoRequest");
 const zohoItem = require("../../utils/zohoNewItem");
+// "Create in Zoho" (2026-10-16): the pricing formula for a typed cost, and the store categories
+const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
+const { loadCategories, findCategory } = require("../websiteRoutes/categories");
 
 const ORDERS = "imb_spp_orders";
 const BATCHES = "imb_spp_batches";
@@ -529,6 +532,7 @@ router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
 
     let series = [];
     let models = [];
+    const modelCategories = {};
     const brand = str(req.query.brand);
     if (brand) {
       const rows = await items.find({ ...base, deviceBrand: brand }, { projection: { _id: 0, deviceSeries: 1, compatibleModels: 1 } }).toArray();
@@ -546,6 +550,19 @@ router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
       models = [...modelSeries.entries()]
         .map(([model, sm]) => ({ model, series: [...sm.entries()].sort((a, b) => b[1] - a[1]).map(([x]) => x) }))
         .sort((a, b) => a.model.localeCompare(b.model, "en", { numeric: true }));
+      // The store category each New Products model of the brand is linked to,
+      // by the names the register uses for it ("Motorola Moto G96", its other
+      // names too) — the dialog files the item under the first picked one's.
+      const linked = await db.collection("imb_spp_new_products")
+        .find({ brand: new RegExp(`^${escapeRegex(brand)}$`, "i"), active: { $ne: false }, categoryId: { $nin: [null, ""] } }, { projection: { model: 1, compatibleModel: 1, aliases: 1, categoryId: 1, categoryPath: 1 } })
+        .toArray();
+      for (const m of linked) {
+        const names = [m.compatibleModel, `${brand} ${m.model}`, ...(m.aliases || []).map((a) => `${brand} ${a}`)];
+        for (const n of names) {
+          const k = str(n).toLowerCase();
+          if (k && !modelCategories[k]) modelCategories[k] = { model: m.model, categoryId: m.categoryId, categoryPath: m.categoryPath || "" };
+        }
+      }
     }
     return res.json({
       success: true,
@@ -553,17 +570,33 @@ router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
       brands,
       series,
       models,
+      modelCategories,
       qualities: await zohoItem.qualityOptions(db),
       placeholderRate: zohoItem.PLACEHOLDER_RATE,
       priceLists: Object.entries(zohoItem.PRICE_LISTS).map(([key, v]) => ({ key, label: v.label })),
+      // the pricing formula and which one each classification takes (a
+      // "Service Pack" quality switches to that one, as on New Products)
+      priceFormulas: PRICE_FORMULAS,
+      priceFamilies: Object.fromEntries(CLASSIFICATIONS.map((c) => [c, priceRuleFamily({ classification: c })])),
     });
   } catch (error) {
     next(error);
   }
 });
 
+// The store categories (Zoho Commerce, the tree Inventory files items under)
+// for the dialog's Category picker — the Categories page's minute cache.
+router.get("/zoho-item/categories", PRODUCT_CREATE, async (req, res) => {
+  try {
+    return res.json({ success: true, categories: await loadCategories(req.query.refresh === "1") });
+  } catch (e) {
+    console.error("Create in Zoho categories error:", e.message);
+    return res.status(502).json({ success: false, message: "Could not read the categories from Zoho Commerce" });
+  }
+});
+
 // POST /orders/:id/zoho-item — create the line's item in Zoho and link it.
-// multipart/form-data: name, sku?, quality, rate, prices (JSON),
+// multipart/form-data: name, sku?, quality, cost, categoryId, rate, prices (JSON),
 // classification, subClassification, deviceBrand, deviceSeries,
 // compatibleModels (JSON), order (JSON photo order: [{ id }] a photo already
 // on the line, [{ new: n }] the n-th file sent now) + "images".
@@ -589,6 +622,16 @@ router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, asyn
     if (!Number.isFinite(rate) || rate < 0) return bad(res, "Selling price must be 0 or more");
     const { rates: listRates, error: priceError } = zohoItem.parsePriceLists(b.prices);
     if (priceError) return bad(res, priceError);
+    // the cost price (→ Zoho purchase rate) and the store category, both
+    // required as on New Products (user ask 2026-10-16)
+    const { cost, error: costError } = zohoItem.readCost(b.cost);
+    if (costError) return bad(res, costError);
+    if (cost === null) return bad(res, "Enter the cost price");
+    const categoryId = str(b.categoryId);
+    if (!categoryId) return bad(res, "Pick the store category");
+    if (!/^\d{1,30}$/.test(categoryId)) return bad(res, "Bad category");
+    const { category, error: categoryError, status: categoryStatus } = await findCategory(categoryId);
+    if (categoryError) return res.status(categoryStatus).json({ success: false, message: categoryError });
     const classification = str(b.classification);
     if (!classification) return bad(res, "Pick a classification");
     const subClassification = str(b.subClassification);
@@ -618,9 +661,17 @@ router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, asyn
     const z = await zohoItem.createZohoItem({
       name, sku, rate, quality, classification, subClassification, deviceBrand, deviceSeries,
       compatibleModel: compatibleModels.join("; "),
+      purchaseRate: cost,
+      categoryId: category.id,
     });
     if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
     const itemId = String(z.item.item_id);
+    // the category: set on the new item when the create call didn't keep it
+    const filed = { id: category.id, name: category.name };
+    if (String(z.item.category_id || "") !== category.id) {
+      const c = await zohoItem.setItemCategory(itemId, category.id);
+      if (c.error) filed.error = c.error;
+    }
     const finalSku = String(z.item.sku || sku);
     const finalName = z.item.name || name;
 
@@ -650,13 +701,16 @@ router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, asyn
     await db.collection(ORDERS).updateOne(
       { _id },
       {
-        $set: { itemId, sku: finalSku, imageId: (photos && photos.imageId) || order.imageId || null, zohoItem: { at: now, by, name: finalName }, updatedAt: now },
+        $set: {
+          itemId, sku: finalSku, imageId: (photos && photos.imageId) || order.imageId || null, updatedAt: now,
+          zohoItem: { at: now, by, name: finalName, cost, categoryId: filed.error ? null : filed.id, categoryName: filed.error ? null : filed.name },
+        },
         $unset: { zohoCreating: "" },
         $push: { history: hist("created in Zoho", by, { sku: finalSku, name: finalName }) },
       },
     );
     claimed = false;
-    return res.json({ success: true, item: { itemId, sku: finalSku, name: finalName }, photos, prices });
+    return res.json({ success: true, item: { itemId, sku: finalSku, name: finalName }, photos, prices, category: filed });
   } catch (error) {
     next(error);
   } finally {

@@ -50,11 +50,11 @@ const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
   PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, cleanQuality,
-  skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, readImagesFromUrls,
+  skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, readImagesFromUrls, readCost,
 } = require("../../utils/zohoNewItem");
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
-const { loadCategories } = require("../websiteRoutes/categories");
+const { loadCategories, findCategory } = require("../websiteRoutes/categories");
 
 const MODELS = "imb_spp_new_products";
 const ITEMS = "imb_stock_items";
@@ -382,19 +382,6 @@ router.get("/categories", CREATE, async (req, res) => {
   }
 });
 
-// A category id from the dialog, checked against the store's list (read
-// again when it isn't there — it may have been made in Zoho a moment ago).
-// { category } or { error, status }.
-async function findCategory(id) {
-  try {
-    let category = (await loadCategories()).find((c) => c.id === id);
-    if (!category) category = (await loadCategories(true)).find((c) => c.id === id);
-    return category ? { category } : { error: "That category no longer exists — refresh and pick again", status: 400 };
-  } catch (e) {
-    return { error: "Could not read the categories from Zoho Commerce — try again", status: 502 };
-  }
-}
-
 // A model's store category (user ask 2026-10-16: linked, not matched by
 // name) — every item created for the model is filed there. The name and the
 // path are kept with the link so the page shows them without asking Zoho.
@@ -410,14 +397,6 @@ async function categoryLink(id) {
   const names = [];
   for (let c = category, n = 0; c && n < 12; c = byId.get(c.parentId), n++) names.unshift(c.name);
   return { link: { categoryId: category.id, categoryName: category.name, categoryPath: names.join(" › ") } };
-}
-
-// The cost price as typed: { cost } (null when blank) or { error }.
-function readCost(v) {
-  if (v === undefined || v === null || v === "") return { cost: null };
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0 || n > 1000000) return { error: "The cost price must be more than 0" };
-  return { cost: Math.round(n * 100) / 100 };
 }
 
 // ── POST /new-products/items ─────────────────────────────────────────

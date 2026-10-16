@@ -269,3 +269,18 @@ module.exports = router;
 module.exports.slugify = slugify;
 // New Products' create dialog picks a category from the same (cached) list
 module.exports.loadCategories = loadCategories;
+
+// A category id from a dialog, checked against the store's list (read again
+// when it isn't there — it may have been made in Zoho a moment ago); hidden
+// ones count too. { category } or { error, status }. Shared by New Products
+// and the Purchase Order page's "Create in Zoho".
+async function findCategory(id) {
+  try {
+    let category = (await loadCategories()).find((c) => c.id === id);
+    if (!category) category = (await loadCategories(true)).find((c) => c.id === id);
+    return category ? { category } : { error: "That category no longer exists — refresh and pick again", status: 400 };
+  } catch (e) {
+    return { error: "Could not read the categories from Zoho Commerce — try again", status: 502 };
+  }
+}
+module.exports.findCategory = findCategory;
