@@ -1705,12 +1705,15 @@ async function draftPayload(db, b, freight) {
   return { freight, lines, unmatchedCount: lines.filter((l) => l.unmatched).length, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
 }
 
-// The kind a batch being made is: the body's (required on a new batch), or
-// the draft's own (a draft from before 2026-10-16 has none → air).
+// The kind a batch being made is: the draft's own, else the body's. None
+// given → air (user 2026-10-16: a page from before the 海运 / 空运 split
+// sends none, and neither does a draft from before then); only a value
+// that is neither is refused.
 function batchFreight(b, draft) {
   if (draft && FREIGHTS.includes(draft.freight)) return draft.freight;
-  if (FREIGHTS.includes(str(b && b.freight))) return str(b.freight);
-  return draft ? "air" : null;
+  const asked = str(b && b.freight);
+  if (FREIGHTS.includes(asked)) return asked;
+  return draft || !asked ? "air" : null;
 }
 
 // Straight away, or a saved draft
