@@ -174,7 +174,8 @@ const ROLE_PERMISSIONS = {
   // sheet's Purchase Order page it used was retired 2026-09-23); its iMobile →
   // Special Order page was removed 2026-10-07. Deliberately NOT
   // zoho:salesOrder:create, which would also unlock the Credit Note page.
-  [ROLES.IMOBILE_PURCHASE]: ["po:*:*", "spp:*:*"],
+  // + iMobile Listing (2026-10-16): Categories, New Products, Listing Widget
+  [ROLES.IMOBILE_PURCHASE]: ["po:*:*", "spp:*:*", "listing:*:*"],
   // Parts Supplier — Spare Parts Purchase: sees every order, quotes / places
   // / flags shortages, ships batches. Editing / deleting orders and receiving
   // batches stay with iMobile (spp:order:create / spp:order:receive). Since
@@ -186,7 +187,10 @@ const ROLE_PERMISSIONS = {
   // Special Orders, line edits, the New Products page and "Create in Zoho"
   // included. Only spp:order:receive (receive a batch) stays with iMobile;
   // since 2026-10-15 "Mark as completed" on a line is its own permission,
-  // spp:order:complete, which the supplier holds.
+  // spp:order:complete, which the supplier holds. Since 2026-10-16 the New
+  // Products page lives under iMobile Listing (listing:product:*, which the
+  // supplier does NOT hold); spp:product:create still opens "Create in Zoho"
+  // on New Product lines.
   [ROLES.PARTS_SUPPLIER]: [
     "spp:order:complete",
     "spp:order:view",
@@ -246,6 +250,8 @@ const ROLE_PERMISSIONS = {
     "svp:*:*",
     "parts:browse:view",
     "spp:*:*",
+    // iMobile Listing (2026-10-16): Categories, New Products, Listing Widget
+    "listing:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
     "refurb:stock:view", "refurb:stock:manage",
     "refurb:sale:view", "refurb:sale:manage",

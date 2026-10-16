@@ -26,20 +26,23 @@
 //   POST /new-products/models               add a model
 //   PUT  /new-products/models/:id           edit a model (or hide it: active false)
 //   GET  /new-products/next-sku             the next free parts SKU (22xxx) — asks Zoho
+//   GET  /new-products/categories           the store categories to file a new item under (Zoho Commerce)
 //   POST /new-products/items                create one Zoho item for a model + part (+ photos, price lists; or from a draft)
 //   POST /new-products/drafts               save the create dialog as a draft (not in Zoho)
 //   GET  /new-products/drafts/:id           one draft
 //   PUT  /new-products/drafts/:id           change a draft (fields, photos and their order)
 //   DELETE /new-products/drafts/:id         delete a draft (marked deleted, kept in the DB)
 //
-// Permissions: spp:product:view / spp:product:create — inside spp:*:*, so
-// Admin, iMobile Admin, iMobile Purchase and iMobile Warehouse have them;
-// the parts supplier (an explicit list) does not.
+// Permissions (2026-10-16, the page moved under iMobile Listing):
+// listing:product:view / listing:product:create — Admin, iMobile Warehouse,
+// iMobile Purchase (listing:*:*). /next-sku also answers spp:product:create:
+// the Purchase Order page's "Create in Zoho" dialog asks it for a SKU.
 
 const express = require("express");
 const router = express.Router();
 const { ObjectId } = require("mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { refreshToken } = require("../../utils/zohoRequest");
 const { imageUrlFromId } = require("../../utils/productImage");
@@ -47,14 +50,23 @@ const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
   PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, cleanQuality,
-  skuTaken, nextFreeSku, createZohoItem, setPriceLists, uploadItemPhotos, readImagesFromUrls,
+  skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, readImagesFromUrls,
 } = require("../../utils/zohoNewItem");
+// the pricing formula (the dialog prices a typed cost with it) and the store categories
+const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
+const { loadCategories } = require("../websiteRoutes/categories");
 
 const MODELS = "imb_spp_new_products";
 const ITEMS = "imb_stock_items";
 
-const VIEW = requirePermission("spp:product:view");
-const CREATE = requirePermission("spp:product:create");
+const VIEW = requirePermission("listing:product:view");
+const CREATE = requirePermission("listing:product:create");
+// the next free SKU: this page, or "Create in Zoho" on a Purchase Order line
+const SKU = (req, res, next) => {
+  const have = (req.user && req.user.permissions) || [];
+  if (["listing:product:create", "spp:product:create"].some((p) => hasPermission(have, p))) return next();
+  return res.status(403).json({ success: false, message: "You do not have permission for this action" });
+};
 
 // The parts a brand needs for every model, and how each is written up in
 // Zoho — the register's Classification / Sub Classification, and the item
@@ -201,10 +213,15 @@ router.get("/", VIEW, async (req, res, next) => {
         value: b,
         label: BRANDS[b].label,
         deviceBrand: BRANDS[b].deviceBrand,
-        parts: BRANDS[b].parts.map((p) => ({ key: p.key, label: p.label, classification: p.classification, subClassification: p.subClassification })),
+        parts: BRANDS[b].parts.map((p) => ({
+          key: p.key, label: p.label, classification: p.classification, subClassification: p.subClassification,
+          // which formula prices it (a "Service Pack" quality switches the dialog to that one)
+          priceFamily: priceRuleFamily({ classification: p.classification }),
+        })),
       })),
       qualities: await qualityOptions(db),
       placeholderRate: PLACEHOLDER_RATE,
+      priceFormulas: PRICE_FORMULAS,
       rows,
       // the open drafts, newest first (each opens in the create dialog)
       drafts: (await db.collection(DRAFTS).find({ status: "draft", brand: { $in: brandList } }).sort({ updatedAt: -1 }).toArray()).map(draftBrief),
@@ -329,7 +346,7 @@ router.put("/models/:id", CREATE, async (req, res, next) => {
 
 // ── the next free parts SKU (utils/zohoNewItem nextFreeSku) ──────────
 
-router.get("/next-sku", CREATE, async (req, res, next) => {
+router.get("/next-sku", SKU, async (req, res, next) => {
   try {
     const db = await connectToDatabase();
     await refreshToken();
@@ -339,11 +356,48 @@ router.get("/next-sku", CREATE, async (req, res, next) => {
   }
 });
 
+// The store categories (Zoho Commerce — the same tree Inventory files items
+// under), for the create dialog's Category picker. The Categories page's
+// minute cache.
+router.get("/categories", CREATE, async (req, res) => {
+  try {
+    const categories = await loadCategories(req.query.refresh === "1");
+    return res.json({ success: true, categories });
+  } catch (e) {
+    console.error("New Products categories error:", e.message);
+    return res.status(502).json({ success: false, message: "Could not read the categories from Zoho Commerce" });
+  }
+});
+
+// A category id from the dialog, checked against the store's list (read
+// again when it isn't there — it may have been made in Zoho a moment ago).
+// { category } or { error, status }.
+async function findCategory(id) {
+  try {
+    let category = (await loadCategories()).find((c) => c.id === id);
+    if (!category) category = (await loadCategories(true)).find((c) => c.id === id);
+    return category ? { category } : { error: "That category no longer exists — refresh and pick again", status: 400 };
+  } catch (e) {
+    return { error: "Could not read the categories from Zoho Commerce — try again", status: 502 };
+  }
+}
+
+// The cost price as typed: { cost } (null when blank) or { error }.
+function readCost(v) {
+  if (v === undefined || v === null || v === "") return { cost: null };
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0 || n > 1000000) return { error: "The cost price must be more than 0" };
+  return { cost: Math.round(n * 100) / 100 };
+}
+
 // ── POST /new-products/items ─────────────────────────────────────────
 // Create one Zoho Inventory item for a model + part. Body: { modelId, part,
-// name?, sku?, quality?, rate?, compatibleModels? } — the defaults are what
-// the page shows. Sent as multipart/form-data it may carry photos under
-// "images" (compatibleModels then as a JSON array string).
+// cost, categoryId, name?, sku?, quality?, rate?, prices?, compatibleModels? }
+// — the defaults are what the page shows. The cost price (the dialog prices
+// the four lists from it) goes to Zoho as the purchase rate, and the item is
+// filed under the store category picked (both required, 2026-10-16). Sent as
+// multipart/form-data it may carry photos under "images" (compatibleModels
+// then as a JSON array string).
 router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
   try {
     const b = req.body || {};
@@ -376,6 +430,13 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     // the price lists given (blank = left unset), checked before creating
     const { rates: listRates, error: priceError } = parsePriceLists(b.prices);
     if (priceError) return bad(res, priceError);
+    const { cost, error: costError } = readCost(b.cost);
+    if (costError) return bad(res, costError);
+    if (cost === null) return bad(res, "Enter the cost price");
+    const categoryId = str(b.categoryId);
+    if (!categoryId) return bad(res, "Pick the category to file the item under");
+    const { category, error: categoryError, status: categoryStatus } = await findCategory(categoryId);
+    if (categoryError) return res.status(categoryStatus).json({ success: false, message: categoryError });
     // every model the part fits — the brand's models from the page, this
     // one by default; written to Zoho as one "; "-separated value, the way
     // the register reads it back
@@ -394,6 +455,8 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
 
     const z = await createZohoItem({
       name, sku, rate, quality,
+      purchaseRate: cost,
+      categoryId: category.id,
       classification: part.classification,
       subClassification: part.subClassification,
       deviceBrand: cfg.deviceBrand,
@@ -401,6 +464,12 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
       compatibleModel,
     });
     if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
+    // the category: set on the item itself when the create call didn't keep it
+    const filed = { id: category.id, name: category.name };
+    if (String(z.item.category_id || "") !== category.id) {
+      const c = await setItemCategory(String(z.item.item_id), category.id);
+      if (c.error) filed.error = c.error;
+    }
     // the photos go onto the new item; a failure there leaves the item made
     const fromDraft = draft ? await readImagesFromUrls(draft.images || []) : { files: [], errors: [] };
     const allFiles = [...fromDraft.files, ...files];
@@ -420,6 +489,9 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
       name: z.item.name || name,
       quality,
       rate,
+      cost,
+      categoryId: filed.error ? null : filed.id,
+      categoryName: filed.error ? null : filed.name,
       compatibleModel,
       compatibleModels,
       at: new Date(),
@@ -437,7 +509,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
         { $set: { status: "submitted", submittedAt: new Date(), submittedBy: actor(req), itemId: created.itemId, submittedSku: created.sku } },
       );
     }
-    return res.json({ success: true, item: created, countedFor: 1 + alsoIds.length, photos, prices, draftId: draft ? String(draft._id) : null });
+    return res.json({ success: true, item: created, countedFor: 1 + alsoIds.length, photos, prices, category: filed, draftId: draft ? String(draft._id) : null });
   } catch (error) {
     next(error);
   }
@@ -473,9 +545,14 @@ function draftFields(b, cfg) {
     if (!Number.isFinite(n) || n < 0 || n > 1000000) return { error: `${PRICE_LISTS[k].label}: the price must be 0 or more` };
     prices[k] = Math.round(n * 100) / 100;
   }
+  const { cost, error: costError } = readCost(b.cost);
+  if (costError) return { error: costError };
+  // checked against the store's list when the draft is submitted
+  const categoryId = str(b.categoryId);
+  if (categoryId && !/^\d{1,30}$/.test(categoryId)) return { error: "Bad category" };
   const models = jsonField(b.compatibleModels, []);
   if (models === Symbol.for("bad")) return { error: "Bad compatible models" };
-  return { fields: { part: part.key, name, sku, quality, rate, prices, compatibleModels: [...new Set(list(models))] } };
+  return { fields: { part: part.key, name, sku, quality, rate, cost, categoryId, prices, compatibleModels: [...new Set(list(models))] } };
 }
 
 function draftBrief(d) {
@@ -488,7 +565,8 @@ function draftBrief(d) {
 function draftFull(d) {
   return {
     ...draftBrief(d),
-    quality: d.quality || "", rate: d.rate, prices: d.prices || {}, compatibleModels: d.compatibleModels || [],
+    quality: d.quality || "", rate: d.rate, cost: d.cost == null ? null : d.cost, categoryId: d.categoryId || "",
+    prices: d.prices || {}, compatibleModels: d.compatibleModels || [],
     images: (d.images || []).map((im) => ({ id: im.id, url: im.url, name: im.name || "", width: im.width || null, height: im.height || null })),
     createdAt: d.createdAt, createdBy: d.createdBy || null,
   };

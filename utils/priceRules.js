@@ -38,15 +38,19 @@ function priceRuleFamily(row) {
   return "other";
 }
 
+// The formula as data — per family and price list, [added to the cost,
+// multiplier]. New Products' create dialog gets this table and prices a
+// typed cost with it, so the page and the checks here never differ.
+const PRICE_FORMULAS = {
+  "service-pack": { label: "Service pack", wholesale: [2, 1.1], svip: [2, 1.15], vip: [2, 1.2], platinum: [2, 1.25] },
+  "major-part": { label: "Screen / housing / battery / back cover", wholesale: [2, 1.1], svip: [2, 1.2], vip: [2, 1.25], platinum: [2, 1.3] },
+  other: { label: "Other parts", wholesale: [0, 1.15], svip: [2, 1.2], vip: [2, 1.25], platinum: [2, 1.3] },
+};
+
 function expectedPrices(cost, family) {
-  const c2 = cost + 2;
-  if (family === "service-pack") {
-    return { wholesale: r2(c2 * 1.1), svip: r2(c2 * 1.15), vip: r2(c2 * 1.2), platinum: r2(c2 * 1.25) };
-  }
-  if (family === "major-part") {
-    return { wholesale: r2(c2 * 1.1), svip: r2(c2 * 1.2), vip: r2(c2 * 1.25), platinum: r2(c2 * 1.3) };
-  }
-  return { wholesale: r2(cost * 1.15), svip: r2(c2 * 1.2), vip: r2(c2 * 1.25), platinum: r2(c2 * 1.3) };
+  const f = PRICE_FORMULAS[family] || PRICE_FORMULAS.other;
+  const at = ([add, times]) => r2((cost + add) * times);
+  return { wholesale: at(f.wholesale), svip: at(f.svip), vip: at(f.vip), platinum: at(f.platinum) };
 }
 
 // Evaluate one row: { rule, expected, broken }. Only rates that actually
@@ -76,4 +80,4 @@ function evaluatePriceRule(row) {
   return { rule, expected, broken };
 }
 
-module.exports = { PRICE_PLACEHOLDERS, DEVIATION, priceRuleFamily, expectedPrices, evaluatePriceRule };
+module.exports = { PRICE_PLACEHOLDERS, PRICE_FORMULAS, DEVIATION, priceRuleFamily, expectedPrices, evaluatePriceRule };

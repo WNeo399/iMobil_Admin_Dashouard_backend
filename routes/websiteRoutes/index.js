@@ -16,7 +16,7 @@
 //   PUT    /website/banner-settings     the carousel's max height / width
 //                                       (utils/webBannerSettings)
 //   GET    /website/spare-parts         what the Spare Parts widget shows
-//                                       (utils/sparePartsCatalog; web:parts:view)
+//                                       (utils/sparePartsCatalog; listing:widget:view — iMobile Listing since 2026-10-16)
 //   /website/campaigns/…                 email campaigns via Zoho Campaigns (./campaigns.js)
 //
 // web:banner:view reads, web:banner:manage writes (admin + iMobile Admin).
@@ -337,7 +337,7 @@ router.delete("/banners/:id", MANAGE, async (req, res) => {
 // ── GET /website/spare-parts ────────────────────────────────────────
 // The Spare Parts widget page: what the widget holds, by brand. The widget
 // itself reads the public feed (routes/widgetRoutes/spareParts.js).
-router.get("/spare-parts", requirePermission("web:parts:view"), async (req, res) => {
+router.get("/spare-parts", requirePermission("listing:widget:view"), async (req, res) => {
   try {
     const cat = await getCatalog();
     return res.json({
@@ -357,5 +357,7 @@ router.get("/spare-parts", requirePermission("web:parts:view"), async (req, res)
 });
 
 router.use("/campaigns", require("./campaigns"));
+// The online store's category tree, through Zoho Commerce (2026-10-16)
+router.use("/categories", require("./categories"));
 
 module.exports = router;

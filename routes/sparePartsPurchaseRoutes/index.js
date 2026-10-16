@@ -105,7 +105,17 @@ const categoryOfItem = (it) => {
 // pinned list on the Purchase Order page; its lines carry price 0 and ship
 // as warranty (no charge on the Zoho PO).
 const WARRANTY = "Warranty";
-const CHANNELS = ["海运", "Special Order", "New Product", WARRANTY];
+const SEA = "海运";
+const CHANNELS = [SEA, "Special Order", "New Product", WARRANTY];
+// A dispatch batch ships by sea (海运) or by air (空运), chosen before it is
+// built (user ask 2026-10-16), and takes only its own kind of line: 海运 =
+// the 海运 category, 空运 = every other one (the analytics split). Batches
+// from before then carry no freight — they were all air.
+const FREIGHTS = ["sea", "air"];
+const FREIGHT_LABEL = { sea: SEA, air: "空运" };
+const lineFreight = (rec) => (rec && rec.category === SEA ? "sea" : "air");
+const freightError = (rec, freight) =>
+  `${rec.sku || rec.orderNo || rec.productName} is a ${FREIGHT_LABEL[lineFreight(rec)]} line — it can't go on a ${FREIGHT_LABEL[freight]} batch`;
 const CATEGORIES = [...CLASSIFICATIONS, ...CHANNELS];
 const isChannel = (c) => CHANNELS.includes(c);
 // A New Product or Special Order line (user rules 2026-10-06) is quoted
@@ -314,10 +324,14 @@ router.get("/meta", requireAny("spp:order:view", "spp:batch:create"), async (req
 });
 
 // The ordered (then pending) lines waiting to ship — the Create Batch picker.
+// ?freight=sea|air: only the lines a batch of that kind takes.
 router.get("/orders/open-lines", BATCH_VIEW, async (req, res, next) => {
   try {
     const search = str(req.query.search);
     const match = { status: { $in: ["ordered", "pending"] } };
+    const freight = str(req.query.freight);
+    if (freight === "sea") match.category = SEA;
+    else if (freight === "air") match.category = { $ne: SEA };
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
       match.$or = [{ sku: rx }, { productName: rx }, { orderNo: rx }, { supplier: rx }, { category: rx }];
@@ -338,16 +352,26 @@ router.get("/orders/open-lines", BATCH_VIEW, async (req, res, next) => {
   }
 });
 
-// Scan-to-batch: the OLDEST waiting line for a SKU (ordered before pending),
+// Scan-to-batch: the OLDEST waiting line for a SKU (ordered before pending;
+// iMobile's own lines before ones raised for a customer such as OSCAR),
 // skipping ids already on the batch being built, so scanning the same SKU
-// again walks to its next order.
+// again walks to its next order. ?freight=sea|air (the batch's kind): only
+// lines of that kind match; when the SKU waits only on the other kind the
+// reply says so (`otherFreight`) instead of treating the scan as not in PO.
 router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
   try {
     const sku = str(req.query.sku);
     if (!sku) return bad(res, "sku is required");
     const exclude = new Set(str(req.query.exclude).split(",").map((s) => s.trim()).filter(Boolean));
+    const freight = FREIGHTS.includes(str(req.query.freight)) ? str(req.query.freight) : "";
     const db = await connectToDatabase();
-    const openOnes = (list) => list.filter((r) => !exclude.has(String(r._id)) && !awaitsQuote(r)).sort(openFirst);
+    const usable = (list) => list.filter((r) => !exclude.has(String(r._id)) && !awaitsQuote(r)).sort(openFirst);
+    const openOnes = (list) => usable(list).filter((r) => !freight || lineFreight(r) === freight);
+    const elsewhere = (list) => {
+      if (!freight) return null;
+      const other = usable(list).filter((r) => lineFreight(r) !== freight);
+      return other.length ? { freight: lineFreight(other[0]), label: FREIGHT_LABEL[lineFreight(other[0])], count: other.length, orderNo: other[0].orderNo } : null;
+    };
     const oc = sku.match(OSCAR_CODE);
     if (oc) {
       // Oscar's return code (user 2026-10-14): the line raised for OSCAR
@@ -358,7 +382,9 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
       const ref = { "dispatchRef.faultyCodePrefix": prefix, "dispatchRef.customerSku": new RegExp(`^${escapeRegex(customerSku)}$`, "i") };
       const rows = await db.collection(ORDERS).find({ status: { $in: ["ordered", "pending"] }, ...ref }, { projection: { history: 0 } }).toArray();
       const candidates = openOnes(rows);
-      if (candidates.length) return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1, oscar });
+      if (candidates.length) return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1, all: candidates, oscar });
+      const otherFreight = elsewhere(rows);
+      if (otherFreight) return res.json({ success: true, match: null, otherFreight, oscar });
       // no open line behind the code: the product it stands for — from the
       // last line raised for it, else the dispatch record's own SKU mapping
       const prev = await db.collection(ORDERS).find(ref, { projection: { itemId: 1, sku: 1, createdAt: 1 } }).sort({ createdAt: -1 }).limit(1).toArray();
@@ -377,14 +403,21 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
       .collection(ORDERS)
       .find({ status: { $in: ["ordered", "pending"] }, sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: { history: 0 } })
       .toArray();
-    const candidates = openOnes(rows);
+    // A plain SKU scan is iMobile's stock first: lines raised for a customer
+    // (OSCAR) only once no iMobile line waits — those answer to their return code.
+    const candidates = openOnes(rows).sort((a, b) => (a.forCustomer ? 1 : 0) - (b.forCustomer ? 1 : 0));
     if (!candidates.length) {
+      const otherFreight = elsewhere(rows);
+      if (otherFreight) return res.json({ success: true, match: null, otherFreight });
       // Not on any order (user ask 2026-10-13: such a scan is kept on the
       // batch for adjustment): the register's name for the SKU, if known.
       const item = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(sku)}$`, "i") }, { projection: ITEM_BRIEF });
       return res.json({ success: true, match: null, hadWaiting: rows.length > 0, item: itemBrief(item) });
     }
-    return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1 });
+    // `all`: every waiting line for the SKU (oldest first) — the batch form
+    // brings the ones for the same destination in together (one row, the
+    // shipped count spread over them oldest first; user ask 2026-10-16)
+    return res.json({ success: true, match: candidates[0], remaining: candidates.length - 1, all: candidates });
   } catch (error) {
     next(error);
   }
@@ -1447,6 +1480,8 @@ router.get("/batches", BATCH_VIEW, async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 20));
     const match = {};
     if (q.status && ["draft", "shipped", "received", "cancelled"].includes(String(q.status))) match.status = String(q.status);
+    if (q.freight === "sea") match.freight = "sea";
+    else if (q.freight === "air") match.freight = { $ne: "sea" };
     const search = str(q.search);
     if (search) {
       const rx = new RegExp(escapeRegex(search), "i");
@@ -1492,12 +1527,16 @@ function shippingCostOf(b) {
 // A draft batch is the Create Batch form saved for later: lines with or
 // without a quantity, tracking, date, note, shipping cost. Nothing ships and no PB number
 // is issued until it is shipped — its lines stay ordered / pending and can
-// still board another batch (the ship step re-checks them).
-async function draftPayload(db, b) {
+// still board another batch (the ship step re-checks them). `freight` is the
+// batch's kind: its lines are checked against it here too.
+async function draftPayload(db, b, freight) {
   const rawLines = Array.isArray(b.lines) ? b.lines : [];
   if (rawLines.length > 300) return { error: "Too many lines (max 300)" };
   const parsed = [];
   for (const l of rawLines) {
+    // Special Orders and warranty claims are air lines
+    if (freight === "sea" && l.special === true) return { error: `Special Orders go on a ${FREIGHT_LABEL.air} batch` };
+    if (freight === "sea" && l.warranty === true) return { error: `Warranty lines go on a ${FREIGHT_LABEL.air} batch` };
     // A scan that matched no order (user ask 2026-10-13: "leave it as it
     // is for future adjustment"): kept on the draft by SKU with no order
     // behind it, until someone removes it or finds its order. It cannot
@@ -1571,6 +1610,7 @@ async function draftPayload(db, b) {
     }
     const rec = byId.get(String(p._id));
     if (!rec) return { error: `Order not found: ${p._id}` };
+    if (lineFreight(rec) !== freight) return { error: freightError(rec, freight) };
     lines.push({
       orderId: p._id,
       orderNo: rec.orderNo,
@@ -1591,16 +1631,26 @@ async function draftPayload(db, b) {
   const ship = shippingCostOf(b);
   if (ship.error) return { error: ship.error };
   const vendor = vendorById(b.zohoVendorId);
-  return { lines, unmatchedCount: lines.filter((l) => l.unmatched).length, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
+  return { freight, lines, unmatchedCount: lines.filter((l) => l.unmatched).length, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
+}
+
+// The kind a batch being made is: the body's (required on a new batch), or
+// the draft's own (a draft from before 2026-10-16 has none → air).
+function batchFreight(b, draft) {
+  if (draft && FREIGHTS.includes(draft.freight)) return draft.freight;
+  if (FREIGHTS.includes(str(b && b.freight))) return str(b.freight);
+  return draft ? "air" : null;
 }
 
 // Straight away, or a saved draft
 router.post("/batches", BATCH_CREATE, async (req, res, next) => {
   try {
     const b = req.body || {};
+    const freight = batchFreight(b, null);
+    if (!freight) return bad(res, `Choose ${FREIGHT_LABEL.sea} or ${FREIGHT_LABEL.air} for the batch`);
     const db = await connectToDatabase();
     if (b.draft === true) {
-      const d = await draftPayload(db, b);
+      const d = await draftPayload(db, b, freight);
       if (d.error) return bad(res, d.error);
       const now = new Date();
       const doc = { batchNo: "", seq: null, status: "draft", ...d, lineCount: d.lines.length, totalQty: d.lines.reduce((t, l) => t + (l.qty || 0), 0), createdAt: now, createdBy: actor(req), updatedAt: now };
@@ -1624,7 +1674,7 @@ router.put("/batches/:id/draft", BATCH_CREATE, async (req, res, next) => {
     const draft = await db.collection(BATCHES).findOne({ _id });
     if (!draft) return res.status(404).json({ success: false, message: "Batch not found" });
     if (draft.status !== "draft") return bad(res, "Only a draft can be edited this way");
-    const d = await draftPayload(db, req.body || {});
+    const d = await draftPayload(db, req.body || {}, batchFreight(req.body, draft));
     if (d.error) return bad(res, d.error);
     const set = { ...d, lineCount: d.lines.length, totalQty: d.lines.reduce((t, l) => t + (l.qty || 0), 0), updatedAt: new Date() };
     await db.collection(BATCHES).updateOne({ _id }, { $set: set });
@@ -1675,6 +1725,8 @@ async function shipBatch(db, req, b, draft) {
   const rawLines = Array.isArray(b.lines) ? b.lines : [];
   if (!rawLines.length) return { error: "No lines selected" };
   if (rawLines.length > 300) return { error: "Too many lines (max 300)" };
+  const freight = batchFreight(b, draft);
+  if (!freight) return { error: `Choose ${FREIGHT_LABEL.sea} or ${FREIGHT_LABEL.air} for the batch` };
   // Lines scanned with no order behind them (user ask 2026-10-14): once a
   // product, a supplier, a price and a quantity are on them, they ship too —
   // each becomes an SP- line of its own as the batch ships. Without a
@@ -1682,6 +1734,9 @@ async function shipBatch(db, req, b, draft) {
   const extras = [];
   for (const l of rawLines) {
     if (!(l.unmatched === true || l.special === true || !l.orderId)) continue;
+    // Special Orders and warranty claims are air lines
+    if (freight === "sea" && l.special === true) return { error: `Special Orders go on a ${FREIGHT_LABEL.air} batch` };
+    if (freight === "sea" && l.warranty === true) return { error: `Warranty lines go on a ${FREIGHT_LABEL.air} batch` };
     if (l.special === true) {
       const productName = str(l.productName).slice(0, 200);
       if (!productName) return { error: "A Special Order line needs a description before it ships" };
@@ -1734,6 +1789,7 @@ async function shipBatch(db, req, b, draft) {
     if (rec.status !== "ordered" && rec.status !== "pending") {
       return { error: `${rec.sku || rec.orderNo} is ${rec.status}; only ordered or pending lines can ship` };
     }
+    if (lineFreight(rec) !== freight) return { error: freightError(rec, freight) };
     if (awaitsQuote(rec)) return { error: `${rec.productName || rec.orderNo}: a ${rec.category} line is quoted and confirmed before it ships` };
     if (rec.status === "pending" && !p.supplier && !rec.supplier && rec.category !== SPECIAL_ORDER && rec.category !== WARRANTY) return { error: `${rec.sku || rec.orderNo} needs a supplier before it ships` };
     // The price may be left off when placing, but every shipped line must
@@ -1752,6 +1808,7 @@ async function shipBatch(db, req, b, draft) {
     for (const x of extras) {
       const facts = x.special ? { category: SPECIAL_ORDER, imageId: null } : await registerFacts(db, x.itemId);
       if (x.warranty) facts.category = WARRANTY; // on the Warranty list, like one added there
+      if (freight === "sea") facts.category = SEA; // came by sea: a 海运 line, like the rest of the batch
       const { seq: xSeq, no: xNo } = await nextNo(db, "order", "SP", 10001, ORDERS);
       const doc = {
         // a typed Special Order: no quote step (needsQuote false), so it ships in this same pass
@@ -1848,6 +1905,7 @@ async function shipBatch(db, req, b, draft) {
       batchNo,
       seq,
       status: "shipped",
+      freight,
       tracking,
       shippedAt,
       note: str(b.note),

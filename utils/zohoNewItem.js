@@ -125,9 +125,11 @@ async function nextFreeSku(db) {
   throw new Error("Could not find a free SKU");
 }
 
-// Create the item in Zoho. Custom fields go only when set. Returns
-// { item } (Zoho's item) or { error } (Zoho's message).
-async function createZohoItem({ name, sku, rate, quality, classification, subClassification, deviceBrand, deviceSeries, compatibleModel }) {
+// Create the item in Zoho. Custom fields go only when set; `purchaseRate`
+// is the cost price (0 when not given) and `categoryId` files it under a
+// store category (Inventory and Commerce share one tree — New Products,
+// 2026-10-16). Returns { item } (Zoho's item) or { error } (Zoho's message).
+async function createZohoItem({ name, sku, rate, purchaseRate, categoryId, quality, classification, subClassification, deviceBrand, deviceSeries, compatibleModel }) {
   const customFields = [];
   const cf = (api_name, value) => { if (value) customFields.push({ api_name, value }); };
   cf("cf_tags", classification);
@@ -143,17 +145,32 @@ async function createZohoItem({ name, sku, rate, quality, classification, subCla
     item_type: "inventory",
     product_type: "goods",
     rate,
-    purchase_rate: 0,
+    purchase_rate: purchaseRate || 0,
     account_id: SALES_ACCOUNT,
     purchase_account_id: PURCHASE_ACCOUNT,
     inventory_account_id: INVENTORY_ACCOUNT,
     custom_fields: customFields,
   };
+  if (categoryId) body.category_id = String(categoryId);
   const z = await handleZohoInventoryPostRequest(`${ZOHO}/items?organization_id=${ORG}`, body);
   if (!z || z.code !== 0 || !z.item) {
     return { error: (z && (z.message || (z.error && z.error.message))) || "Zoho did not create the item" };
   }
   return { item: z.item };
+}
+
+// File a new item under a store category when the create call didn't keep
+// it — only ever the item just made. { categoryId, categoryName } or { error }.
+async function setItemCategory(itemId, categoryId) {
+  try {
+    const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`, { category_id: String(categoryId) });
+    if (r && r.code === 0 && r.item && String(r.item.category_id) === String(categoryId)) {
+      return { categoryId: String(r.item.category_id), categoryName: r.item.category_name || "" };
+    }
+    return { error: (r && (r.message || (r.error && r.error.message))) || "Zoho did not keep the category" };
+  } catch (e) {
+    return { error: (e && e.message) || "Zoho did not keep the category" };
+  }
 }
 
 // Write a new item's price-list rates — one merge call per list (only this
@@ -222,6 +239,7 @@ module.exports = {
   skuTaken,
   nextFreeSku,
   createZohoItem,
+  setItemCategory,
   setPriceLists,
   uploadItemPhotos,
   readImagesFromUrls,
