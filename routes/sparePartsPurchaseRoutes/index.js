@@ -537,22 +537,8 @@ router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
     const db = await connectToDatabase();
     const items = db.collection(ITEMS);
     const base = { active: { $ne: false }, scope: "parts" };
-    // only Zoho's agreed classifications (the register also holds stray values
-    // like "Phones" or "-"; "MacBook Screen" is a purchase category, not a
-    // Zoho one), each listed even when no part uses it yet
-    const cls = await items.aggregate([
-      { $match: { ...base, classification: { $in: ZOHO_CLASSIFICATIONS } } },
-      { $group: { _id: { c: "$classification", s: { $ifNull: ["$subClassification", ""] } }, n: { $sum: 1 } } },
-    ]).toArray();
-    const byClass = new Map(ZOHO_CLASSIFICATIONS.map((c) => [c, { value: c, count: 0, subs: [] }]));
-    for (const x of cls) {
-      const c = byClass.get(x._id.c) || { value: x._id.c, count: 0, subs: [] };
-      c.count += x.n;
-      if (x._id.s) c.subs.push({ value: x._id.s, count: x.n });
-      byClass.set(x._id.c, c);
-    }
-    const classifications = [...byClass.values()].sort((a, b) => b.count - a.count);
-    classifications.forEach((c) => c.subs.sort((a, b) => b.count - a.count));
+    // Zoho's classifications with their sub classifications (shared with New Products)
+    const classifications = await zohoItem.classificationOptions(db);
     const brands = (await items.aggregate([
       { $match: { ...base, deviceBrand: { $nin: [null, ""] } } },
       { $group: { _id: "$deviceBrand", n: { $sum: 1 } } },

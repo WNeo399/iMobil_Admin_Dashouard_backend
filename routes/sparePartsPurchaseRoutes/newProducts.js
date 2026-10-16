@@ -49,13 +49,13 @@ const { imageUrlFromId } = require("../../utils/productImage");
 const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
-  PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, cleanQuality,
+  PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
   skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, readImagesFromUrls, readCost,
 } = require("../../utils/zohoNewItem");
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
 const { loadCategories, findCategory } = require("../websiteRoutes/categories");
-const { qualitiesByClassification } = require("../../utils/listingQualities");
+const { qualitiesByClassification, ZOHO_CLASSIFICATIONS } = require("../../utils/listingQualities");
 
 const MODELS = "imb_spp_new_products";
 const ITEMS = "imb_stock_items";
@@ -87,6 +87,8 @@ const BRANDS = {
     ],
     compatibleModel: (m) => `Motorola ${m.model}`,
     short: (m) => String(m.model).replace(/^Moto\s+/i, ""),
+    // how any other product's name starts (the rest is typed)
+    namePrefix: (m) => `MOTO ${withCodes(m)} Compatible`,
     // Device Series from a Compatible Model — the product line's own name +
     // " Series" (user 2026-10-07; the 163 existing items were set the same way)
     series: (compatibleModel) => {
@@ -116,6 +118,25 @@ function withCodes(m) {
   return codes.length ? `${short} (${codes.join(" / ")})` : short;
 }
 
+// Any other product for a model (user ask 2026-10-16) — not one of the
+// brand's needed parts: its Zoho classification and sub classification are
+// picked in the dialog and its name typed (no template). Part key "other".
+const OTHER = "other";
+// The part a request means: a needed part by key, or "other" with its
+// classification. { part } or { error }.
+function partFor(cfg, b) {
+  const key = str(b.part);
+  if (key === OTHER) {
+    const classification = str(b.classification);
+    if (!ZOHO_CLASSIFICATIONS.includes(classification)) return { error: "Pick the classification" };
+    const subClassification = str(b.subClassification).replace(/\s+/g, " ").slice(0, 60);
+    if (/[[\]]/.test(subClassification)) return { error: "Sub classification can't contain [ or ]" };
+    return { part: { key: OTHER, label: classification, classification, subClassification, name: () => "" } };
+  }
+  const part = cfg && cfg.parts.find((p) => p.key === key);
+  return part ? { part } : { error: "Unknown part type for this brand" };
+}
+
 
 const str = (v) => String(v == null ? "" : v).trim();
 const oid = (v) => { try { return new ObjectId(String(v)); } catch (e) { return null; } };
@@ -140,6 +161,10 @@ function modelKeysOf(m) {
 // Which of the brand's needed parts an item is, if any.
 function partOf(cfg, it) {
   return cfg.parts.find((p) => p.classification === it.classification && (!p.subClassification || p.subClassification === it.subClassification)) || null;
+}
+// …and of one created from this page
+function createdPart(cfg, c) {
+  return c.part === OTHER ? partOf(cfg, c) : cfg.parts.find((p) => p.key === c.part) || null;
 }
 
 // The register's live items for a brand (archived ones included — they
@@ -178,7 +203,8 @@ function coverage(model, index) {
   for (const p of cfg.parts) {
     const seen = new Map();
     for (const k of keys) for (const it of ((index.get(k) || {})[p.key] || [])) seen.set(String(it.itemId), it);
-    for (const c of model.created || []) if (c.part === p.key) seen.set(String(c.itemId), { itemId: c.itemId, sku: c.sku, name: c.name, quality: c.quality || "", createdHere: true });
+    // (any other product counts when its classification is a needed part's, as the register will)
+    for (const c of model.created || []) if (createdPart(cfg, c) === p) seen.set(String(c.itemId), { itemId: c.itemId, sku: c.sku, name: c.name, quality: c.quality || "", createdHere: true });
     out[p.key] = [...seen.values()];
   }
   return out;
@@ -204,6 +230,8 @@ router.get("/", VIEW, async (req, res, next) => {
         // the create dialog's default item name per part (no Zoho call — the
         // dialog opens straight away; only the SKU is fetched separately)
         const defaultNames = Object.fromEntries(cfg.parts.map((p) => [p.key, p.name(m)]));
+        // any other product: the name's start, the rest typed
+        defaultNames[OTHER] = `${cfg.namePrefix(m)} `;
         rows.push({ ...m, _id: String(m._id), have, missing, defaultNames, deviceSeries: seriesFor(cfg, [m.compatibleModel || cfg.compatibleModel(m)]) });
       }
     }
@@ -223,6 +251,9 @@ router.get("/", VIEW, async (req, res, next) => {
       qualities: await qualityOptions(db),
       // the qualities each classification comes in (iMobile Listing → Qualities); none = every one
       qualitiesByClass: await qualitiesByClassification(db),
+      // any other product: Zoho's classifications with their subs, and which price formula each takes
+      classifications: await classificationOptions(db),
+      priceFamilies: Object.fromEntries(ZOHO_CLASSIFICATIONS.map((c) => [c, priceRuleFamily({ classification: c })])),
       placeholderRate: PLACEHOLDER_RATE,
       priceFormulas: PRICE_FORMULAS,
       rows,
@@ -272,13 +303,16 @@ router.get("/models/:id/items", VIEW, async (req, res, next) => {
     }
     for (const c of model.created || []) {
       if (seen.has(String(c.itemId))) { seen.get(String(c.itemId)).createdHere = true; continue; }
-      const part = cfg.parts.find((p) => p.key === c.part);
+      const part = createdPart(cfg, c);
+      const other = c.part === OTHER;
       seen.set(String(c.itemId), {
         itemId: c.itemId, sku: c.sku, name: c.name, quality: c.quality || "",
-        classification: part ? part.classification : "", subClassification: part ? part.subClassification : "",
+        // a needed part's, or the one picked for any other product
+        classification: other || !part ? c.classification || "" : part.classification,
+        subClassification: other || !part ? c.subClassification || "" : part.subClassification,
         archived: false, scope: "parts", available: null, imageUrl: imageUrlFromId(c.imageId),
         compatibleModels: c.compatibleModels || [c.compatibleModel].filter(Boolean),
-        part: c.part, createdHere: true,
+        part: part ? part.key : null, createdHere: true,
       });
     }
     const items = [...seen.values()];
@@ -424,8 +458,9 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     const model = await db.collection(MODELS).findOne({ _id });
     if (!model) return res.status(404).json({ success: false, message: "Model not found" });
     const cfg = BRANDS[model.brand];
-    const part = cfg && cfg.parts.find((p) => p.key === str(b.part));
-    if (!part) return bad(res, "Unknown part type for this brand");
+    if (!cfg) return bad(res, "Unknown part type for this brand");
+    const { part, error: partError } = partFor(cfg, b);
+    if (partError) return bad(res, partError);
     // submitted from a draft: its saved photos go with the item
     let draft = null;
     if (b.draftId) {
@@ -436,6 +471,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     }
     const name = (str(b.name) || part.name(model)).replace(/[\r\n]+/g, " ");
     if (name.length < 5) return bad(res, "Item name is too short");
+    if (part.key === OTHER && name.toLowerCase() === cfg.namePrefix(model).toLowerCase()) return bad(res, "Type what the product is after the model");
     const { quality, error: qualityError } = cleanQuality(b.quality);
     if (qualityError) return bad(res, qualityError);
     const rate = b.rate === undefined || b.rate === null || b.rate === "" ? PLACEHOLDER_RATE : Number(b.rate);
@@ -498,6 +534,8 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     const prices = Object.keys(listRates).length ? await setPriceLists(String(z.item.item_id), listRates) : null;
     const created = {
       part: part.key,
+      classification: part.classification,
+      subClassification: part.subClassification || "",
       itemId: String(z.item.item_id),
       imageId: (photos && photos.imageId) || null,
       prices: prices ? prices.set : {},
@@ -542,8 +580,10 @@ const jsonField = (v, fallback) => {
 };
 
 function draftFields(b, cfg) {
-  const part = cfg.parts.find((p) => p.key === str(b.part));
-  if (!part) return { error: "Unknown part type for this brand" };
+  // any other product may be kept before its classification is picked
+  const other = str(b.part) === OTHER;
+  const { part, error: partError } = other && !str(b.classification) ? { part: { key: OTHER, classification: "", subClassification: "" } } : partFor(cfg, b);
+  if (partError) return { error: partError };
   const name = str(b.name).replace(/[\r\n]+/g, " ").slice(0, 200);
   const sku = str(b.sku);
   if (sku && !/^\d{4,6}$/.test(sku)) return { error: "SKU must be a number" };
@@ -565,12 +605,15 @@ function draftFields(b, cfg) {
   if (costError) return { error: costError };
   const models = jsonField(b.compatibleModels, []);
   if (models === Symbol.for("bad")) return { error: "Bad compatible models" };
-  return { fields: { part: part.key, name, sku, quality, rate, cost, prices, compatibleModels: [...new Set(list(models))] } };
+  const fields = { part: part.key, name, sku, quality, rate, cost, prices, compatibleModels: [...new Set(list(models))] };
+  if (other) Object.assign(fields, { classification: part.classification, subClassification: part.subClassification || "" });
+  return { fields };
 }
 
 function draftBrief(d) {
   return {
     _id: String(d._id), modelId: String(d.modelId), brand: d.brand, part: d.part, name: d.name || "", sku: d.sku || "",
+    classification: d.classification || "", subClassification: d.subClassification || "",
     imageCount: (d.images || []).length, thumb: ((d.images || [])[0] || {}).url || null,
     updatedAt: d.updatedAt, updatedBy: d.updatedBy || d.createdBy || null,
   };

@@ -133,6 +133,9 @@ const ROLE_PERMISSIONS = {
     "web:*:*",
     // iMobile → Screen Buyback: the ABCD grade price list (2026-10-13)
     "buyback:price:view", "buyback:price:manage",
+    // iMobile Listing, all of it (user 2026-10-16): Categories, Qualities,
+    // New Products, Listing Widget
+    "listing:*:*",
   ],
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
@@ -188,10 +191,12 @@ const ROLE_PERMISSIONS = {
   // included. Only spp:order:receive (receive a batch) stays with iMobile;
   // since 2026-10-15 "Mark as completed" on a line is its own permission,
   // spp:order:complete, which the supplier holds. Since 2026-10-16 the New
-  // Products page lives under iMobile Listing (listing:product:*, which the
-  // supplier does NOT hold); spp:product:create still opens "Create in Zoho"
-  // on New Product lines.
+  // Products page lives under iMobile Listing; spp:product:create still opens
+  // "Create in Zoho" on New Product lines. The same day (user) the supplier
+  // got the whole of iMobile Listing, like iMobile Purchase — store category
+  // edits and the Qualities lists included.
   [ROLES.PARTS_SUPPLIER]: [
+    "listing:*:*",
     "spp:order:complete",
     "spp:order:view",
     "spp:order:create",

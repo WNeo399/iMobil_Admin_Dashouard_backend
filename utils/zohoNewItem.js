@@ -17,6 +17,7 @@ const {
 } = require("./zohoRequest");
 const { fetchItemDetails } = require("./zohoStock");
 const { imageIdOf } = require("./productImage");
+const { ZOHO_CLASSIFICATIONS } = require("./listingQualities");
 
 const ORG = "746138234";
 const ZOHO = "https://www.zohoapis.com/inventory/v1";
@@ -94,6 +95,28 @@ async function qualityOptions(db) {
   ]).toArray();
   return rows.map((r) => r._id);
 }
+// Zoho's classifications for parts, each with the sub classifications live
+// items use (most used first), every one listed even when no part uses it
+// yet — the register also holds stray values ("Phones", "-") and those are
+// left out. [{ value, count, subs: [{ value, count }] }], most used first.
+// Shared by "Create in Zoho" on the Purchase Order page and New Products.
+async function classificationOptions(db) {
+  const rows = await db.collection("imb_stock_items").aggregate([
+    { $match: { active: { $ne: false }, scope: "parts", classification: { $in: ZOHO_CLASSIFICATIONS } } },
+    { $group: { _id: { c: "$classification", s: { $ifNull: ["$subClassification", ""] } }, n: { $sum: 1 } } },
+  ]).toArray();
+  const byClass = new Map(ZOHO_CLASSIFICATIONS.map((c) => [c, { value: c, count: 0, subs: [] }]));
+  for (const x of rows) {
+    const c = byClass.get(x._id.c);
+    if (!c) continue;
+    c.count += x.n;
+    if (x._id.s) c.subs.push({ value: x._id.s, count: x.n });
+  }
+  const out = [...byClass.values()].sort((a, b) => b.count - a.count);
+  out.forEach((c) => c.subs.sort((a, b) => b.count - a.count));
+  return out;
+}
+
 // A quality as given (picked or typed): short text, no [ ] — it goes into
 // the name as a [tag]. { quality } or { error }.
 function cleanQuality(v) {
@@ -241,6 +264,7 @@ module.exports = {
   PLACEHOLDER_RATE,
   PRICE_LISTS,
   qualityOptions,
+  classificationOptions,
   cleanQuality,
   readCost,
   MAX_IMAGES,
