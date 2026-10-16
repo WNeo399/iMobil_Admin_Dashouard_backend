@@ -23,8 +23,8 @@
 //
 //   GET  /new-products                      brands + models with coverage (every brand, or ?brand=)
 //   GET  /new-products/models/:id/items     one model's items, every classification
-//   POST /new-products/models               add a model
-//   PUT  /new-products/models/:id           edit a model (or hide it: active false)
+//   POST /new-products/models               add a model (categoryId? = its store category)
+//   PUT  /new-products/models/:id           edit a model (or hide it: active false; categoryId links its store category)
 //   GET  /new-products/next-sku             the next free parts SKU (22xxx) — asks Zoho
 //   GET  /new-products/categories           the store categories to file a new item under (Zoho Commerce)
 //   POST /new-products/items                create one Zoho item for a model + part (+ photos, price lists; or from a draft)
@@ -312,8 +312,15 @@ router.post("/models", CREATE, async (req, res, next) => {
     const db = await connectToDatabase();
     const dup = await db.collection(MODELS).findOne({ brand: doc.brand, active: { $ne: false }, model: new RegExp(`^${doc.model.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
     if (dup) return bad(res, `${doc.brand} ${doc.model} is already listed`);
+    // its store category, when one is picked already
+    let link = {};
+    if (req.body && req.body.categoryId !== undefined) {
+      const c = await categoryLink(req.body.categoryId);
+      if (c.error) return res.status(c.status).json({ success: false, message: c.error });
+      link = c.link;
+    }
     const now = new Date();
-    const full = { ...doc, source: "added on the page", active: true, created: [], createdAt: now, createdBy: actor(req), updatedAt: now };
+    const full = { ...doc, ...link, source: "added on the page", active: true, created: [], createdAt: now, createdBy: actor(req), updatedAt: now };
     const r = await db.collection(MODELS).insertOne(full);
     return res.json({ success: true, model: { ...full, _id: String(r.insertedId) } });
   } catch (error) {
@@ -337,8 +344,14 @@ router.put("/models/:id", CREATE, async (req, res, next) => {
       if (error) return bad(res, error);
       Object.assign(set, doc);
     }
+    // link the model to a store category ("" unlinks it)
+    if (b.categoryId !== undefined) {
+      const c = await categoryLink(b.categoryId);
+      if (c.error) return res.status(c.status).json({ success: false, message: c.error });
+      Object.assign(set, c.link);
+    }
     await db.collection(MODELS).updateOne({ _id }, { $set: set });
-    return res.json({ success: true });
+    return res.json({ success: true, model: { _id: String(_id), ...set } });
   } catch (error) {
     next(error);
   }
@@ -382,6 +395,23 @@ async function findCategory(id) {
   }
 }
 
+// A model's store category (user ask 2026-10-16: linked, not matched by
+// name) — every item created for the model is filed there. The name and the
+// path are kept with the link so the page shows them without asking Zoho.
+// { link } ({ categoryId, categoryName, categoryPath }; all null = unlinked)
+// or { error, status }.
+async function categoryLink(id) {
+  const categoryId = str(id);
+  if (!categoryId) return { link: { categoryId: null, categoryName: null, categoryPath: null } };
+  if (!/^\d{1,30}$/.test(categoryId)) return { error: "Bad category", status: 400 };
+  const { category, error, status } = await findCategory(categoryId);
+  if (error) return { error, status };
+  const byId = new Map((await loadCategories()).map((c) => [c.id, c]));
+  const names = [];
+  for (let c = category, n = 0; c && n < 12; c = byId.get(c.parentId), n++) names.unshift(c.name);
+  return { link: { categoryId: category.id, categoryName: category.name, categoryPath: names.join(" › ") } };
+}
+
 // The cost price as typed: { cost } (null when blank) or { error }.
 function readCost(v) {
   if (v === undefined || v === null || v === "") return { cost: null };
@@ -392,10 +422,11 @@ function readCost(v) {
 
 // ── POST /new-products/items ─────────────────────────────────────────
 // Create one Zoho Inventory item for a model + part. Body: { modelId, part,
-// cost, categoryId, name?, sku?, quality?, rate?, prices?, compatibleModels? }
-// — the defaults are what the page shows. The cost price (the dialog prices
-// the four lists from it) goes to Zoho as the purchase rate, and the item is
-// filed under the store category picked (both required, 2026-10-16). Sent as
+// cost, name?, sku?, quality?, rate?, prices?, compatibleModels? } — the
+// defaults are what the page shows. The cost price (the dialog prices the
+// four lists from it, required) goes to Zoho as the purchase rate, and the
+// item is filed under the store category the model is linked to (2026-10-16:
+// a model without a link creates nothing until it is linked). Sent as
 // multipart/form-data it may carry photos under "images" (compatibleModels
 // then as a JSON array string).
 router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
@@ -433,10 +464,13 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     const { cost, error: costError } = readCost(b.cost);
     if (costError) return bad(res, costError);
     if (cost === null) return bad(res, "Enter the cost price");
-    const categoryId = str(b.categoryId);
-    if (!categoryId) return bad(res, "Pick the category to file the item under");
+    // the store category is the model's own link (2026-10-16), never picked per item
+    const categoryId = str(model.categoryId);
+    if (!categoryId) return bad(res, `Link ${model.model} to a store category first`);
     const { category, error: categoryError, status: categoryStatus } = await findCategory(categoryId);
-    if (categoryError) return res.status(categoryStatus).json({ success: false, message: categoryError });
+    if (categoryError) {
+      return res.status(categoryStatus).json({ success: false, message: categoryStatus === 400 ? `The store category linked to ${model.model} no longer exists — link it again` : categoryError });
+    }
     // every model the part fits — the brand's models from the page, this
     // one by default; written to Zoho as one "; "-separated value, the way
     // the register reads it back
@@ -547,12 +581,9 @@ function draftFields(b, cfg) {
   }
   const { cost, error: costError } = readCost(b.cost);
   if (costError) return { error: costError };
-  // checked against the store's list when the draft is submitted
-  const categoryId = str(b.categoryId);
-  if (categoryId && !/^\d{1,30}$/.test(categoryId)) return { error: "Bad category" };
   const models = jsonField(b.compatibleModels, []);
   if (models === Symbol.for("bad")) return { error: "Bad compatible models" };
-  return { fields: { part: part.key, name, sku, quality, rate, cost, categoryId, prices, compatibleModels: [...new Set(list(models))] } };
+  return { fields: { part: part.key, name, sku, quality, rate, cost, prices, compatibleModels: [...new Set(list(models))] } };
 }
 
 function draftBrief(d) {
@@ -565,7 +596,7 @@ function draftBrief(d) {
 function draftFull(d) {
   return {
     ...draftBrief(d),
-    quality: d.quality || "", rate: d.rate, cost: d.cost == null ? null : d.cost, categoryId: d.categoryId || "",
+    quality: d.quality || "", rate: d.rate, cost: d.cost == null ? null : d.cost,
     prices: d.prices || {}, compatibleModels: d.compatibleModels || [],
     images: (d.images || []).map((im) => ({ id: im.id, url: im.url, name: im.name || "", width: im.width || null, height: im.height || null })),
     createdAt: d.createdAt, createdBy: d.createdBy || null,
