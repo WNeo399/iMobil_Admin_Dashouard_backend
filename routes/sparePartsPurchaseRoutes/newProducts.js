@@ -55,6 +55,7 @@ const {
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
 const { loadCategories, findCategory } = require("../websiteRoutes/categories");
+const { qualitiesByClassification } = require("../../utils/listingQualities");
 
 const MODELS = "imb_spp_new_products";
 const ITEMS = "imb_stock_items";
@@ -220,6 +221,8 @@ router.get("/", VIEW, async (req, res, next) => {
         })),
       })),
       qualities: await qualityOptions(db),
+      // the qualities each classification comes in (iMobile Listing → Qualities); none = every one
+      qualitiesByClass: await qualitiesByClassification(db),
       placeholderRate: PLACEHOLDER_RATE,
       priceFormulas: PRICE_FORMULAS,
       rows,

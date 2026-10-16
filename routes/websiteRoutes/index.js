@@ -359,5 +359,7 @@ router.get("/spare-parts", requirePermission("listing:widget:view"), async (req,
 router.use("/campaigns", require("./campaigns"));
 // The online store's category tree, through Zoho Commerce (2026-10-16)
 router.use("/categories", require("./categories"));
+// The qualities each classification of part comes in (iMobile Listing → Qualities, 2026-10-16)
+router.use("/qualities", require("./qualities"));
 
 module.exports = router;

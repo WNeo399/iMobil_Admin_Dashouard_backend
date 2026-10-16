@@ -56,6 +56,7 @@ const zohoItem = require("../../utils/zohoNewItem");
 // "Create in Zoho" (2026-10-16): the pricing formula for a typed cost, and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
 const { loadCategories, findCategory } = require("../websiteRoutes/categories");
+const { ZOHO_CLASSIFICATIONS, qualitiesByClassification } = require("../../utils/listingQualities");
 
 const ORDERS = "imb_spp_orders";
 const BATCHES = "imb_spp_batches";
@@ -140,6 +141,23 @@ async function registerFacts(db, itemId) {
   if (!itemId) return { category: "Other", imageId: null };
   const it = await db.collection(ITEMS).findOne({ itemId: String(itemId) }, { projection: { _id: 0, classification: 1, imageId: 1, name: 1, deviceSeries: 1 } });
   return { category: categoryOfItem(it), imageId: (it && it.imageId) || null };
+}
+
+// A 海运 line files under 海运, and within it under its item's own category
+// (user ask 2026-10-16: 海运 has the same tabs as 空运) — worked out from the
+// register once and kept on the line as `itemCategory` (a line without an
+// item → Other). Lines that lack it get it here, whichever way they were made.
+async function fillSeaCategories(db) {
+  const col = db.collection(ORDERS);
+  const todo = await col.find({ category: SEA, itemCategory: { $exists: false } }, { projection: { itemId: 1 } }).limit(5000).toArray();
+  if (!todo.length) return;
+  const ids = [...new Set(todo.map((r) => r.itemId).filter(Boolean).map(String))];
+  const items = ids.length ? await db.collection(ITEMS).find({ itemId: { $in: ids } }, { projection: { _id: 0, itemId: 1, classification: 1, name: 1, deviceSeries: 1 } }).toArray() : [];
+  const byItem = new Map(items.map((it) => [String(it.itemId), categoryOfItem(it)]));
+  await col.bulkWrite(
+    todo.map((r) => ({ updateOne: { filter: { _id: r._id }, update: { $set: { itemCategory: (r.itemId && byItem.get(String(r.itemId))) || "Other" } } } })),
+    { ordered: false },
+  );
 }
 
 const actor = (req) => (req.user && (req.user.username || req.user.email)) || null;
@@ -277,9 +295,13 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const page = Math.max(1, parseInt(q.page, 10) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(q.pageSize, 10) || 20));
     const base = {};
-    if (q.category) base.category = str(q.category);
-    // categories the list leaves out (the Purchase Order page's "All orders"
-    // skips the ones pinned above its tree)
+    if (q.category) {
+      base.category = str(q.category);
+      // a tab under 海运: its lines of that item category
+      if (base.category === SEA && str(q.seaCategory)) base.itemCategory = str(q.seaCategory);
+    }
+    // categories the list leaves out (the Purchase Order page's 空运 skips
+    // the ones pinned above its tree, and 海运)
     else if (str(q.excludeCategory)) base.category = { $nin: str(q.excludeCategory).split(",").map((c) => c.trim()).filter(Boolean) };
     if (q.supplier) base.supplier = str(q.supplier);
     // one item's lines (the Stock Monitoring item drawer)
@@ -297,20 +319,26 @@ router.get("/orders", VIEW, async (req, res, next) => {
 
     const db = await connectToDatabase();
     const col = db.collection(ORDERS);
-    const [rows, total, statusAgg, catAgg, suppliers] = await Promise.all([
+    await fillSeaCategories(db);
+    const counts = { total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } } };
+    const [rows, total, statusAgg, catAgg, seaAgg, suppliers] = await Promise.all([
       col.find(match, { projection: { history: 0 } }).sort(String(q.sort) === "received" ? { receivedAt: -1, _id: -1 } : { createdAt: dir, _id: dir }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
       col.countDocuments(match),
       col.aggregate([{ $match: base }, { $group: { _id: "$status", n: { $sum: 1 } } }]).toArray(),
-      col.aggregate([{ $group: { _id: "$category", total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } } } }]).toArray(),
+      col.aggregate([{ $group: { _id: "$category", ...counts } }]).toArray(),
+      // 海运's tabs: its lines by their item's category
+      col.aggregate([{ $match: { category: SEA } }, { $group: { _id: "$itemCategory", ...counts } }]).toArray(),
       supplierOptions(db),
     ]);
     const byStatus = {};
     for (const s of statusAgg) byStatus[s._id] = s.n;
     const byCategory = {};
     for (const c of catAgg) byCategory[c._id || ""] = { total: c.total, open: c.open, pending: c.pending };
+    const bySeaCategory = {};
+    for (const c of seaAgg) bySeaCategory[c._id || "Other"] = { total: c.total, open: c.open, pending: c.pending };
     // the fixed tree, plus any value a line somehow still carries
     const categories = [...new Set([...CATEGORIES, ...catAgg.map((c) => c._id).filter(Boolean)])];
-    return res.json({ success: true, page, pageSize, total, rows, byStatus, byCategory, categories, suppliers });
+    return res.json({ success: true, page, pageSize, total, rows, byStatus, byCategory, bySeaCategory, categories, suppliers });
   } catch (error) {
     next(error);
   }
@@ -509,13 +537,14 @@ router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
     const db = await connectToDatabase();
     const items = db.collection(ITEMS);
     const base = { active: { $ne: false }, scope: "parts" };
-    // only the agreed classifications (the register also holds stray values
-    // like "Phones" or "-"), each listed even when no part uses it yet
+    // only Zoho's agreed classifications (the register also holds stray values
+    // like "Phones" or "-"; "MacBook Screen" is a purchase category, not a
+    // Zoho one), each listed even when no part uses it yet
     const cls = await items.aggregate([
-      { $match: { ...base, classification: { $in: CLASSIFICATIONS } } },
+      { $match: { ...base, classification: { $in: ZOHO_CLASSIFICATIONS } } },
       { $group: { _id: { c: "$classification", s: { $ifNull: ["$subClassification", ""] } }, n: { $sum: 1 } } },
     ]).toArray();
-    const byClass = new Map(CLASSIFICATIONS.map((c) => [c, { value: c, count: 0, subs: [] }]));
+    const byClass = new Map(ZOHO_CLASSIFICATIONS.map((c) => [c, { value: c, count: 0, subs: [] }]));
     for (const x of cls) {
       const c = byClass.get(x._id.c) || { value: x._id.c, count: 0, subs: [] };
       c.count += x.n;
@@ -577,7 +606,9 @@ router.get("/zoho-item/options", PRODUCT_CREATE, async (req, res, next) => {
       // the pricing formula and which one each classification takes (a
       // "Service Pack" quality switches to that one, as on New Products)
       priceFormulas: PRICE_FORMULAS,
-      priceFamilies: Object.fromEntries(CLASSIFICATIONS.map((c) => [c, priceRuleFamily({ classification: c })])),
+      priceFamilies: Object.fromEntries(ZOHO_CLASSIFICATIONS.map((c) => [c, priceRuleFamily({ classification: c })])),
+      // the qualities each classification comes in (iMobile Listing → Qualities); none = every one
+      qualitiesByClass: await qualitiesByClassification(db),
     });
   } catch (error) {
     next(error);
