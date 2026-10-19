@@ -172,18 +172,37 @@ const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // 2026-10-14): prefix + customer SKU name the purchase line raised for
 // OSCAR from that dispatch.
 const OSCAR_CODE = /^SS-(\d+)-(.+)$/i;
-// what a line raised for a customer carries onto a batch line (its labels)
+// what a line raised for a customer carries onto a batch line (its labels):
+// the customer's own code + description, Oscar's return-code prefix, and the
+// customer's PO number (the footer of the Order Dispatch label — Best
+// Sourcing's, 2026-10-19)
 const oscarFacts = (rec) => (rec && rec.forCustomer ? {
   forCustomer: rec.forCustomer,
   customerSku: (rec.dispatchRef && rec.dispatchRef.customerSku) || "",
   customerDescription: (rec.dispatchRef && rec.dispatchRef.customerDescription) || "",
   oscarPrefix: (rec.dispatchRef && rec.dispatchRef.faultyCodePrefix) || "",
+  customerPo: (rec.dispatchRef && rec.dispatchRef.invoiceNumber) || "",
 } : {});
 // a not-in-PO line scanned as an Oscar return code: the line it raises is marked for OSCAR
 const oscarRefOf = (code) => {
   const m = str(code).match(OSCAR_CODE);
   if (!m) return {};
   return { forCustomer: "OSCAR", dispatchRef: { recordId: "", invoiceNumber: "", customerName: "Oscar Mobile Pty Ltd", faultyCodePrefix: m[1], customerSku: str(m[2]).slice(0, 80), customerDescription: "" } };
+};
+// Whose order a line raised from InFlow serves, as the chip / batch rows say
+// it: "OSCAR" for Oscar Mobile, else the customer's name without "Pty Ltd"
+// ("BEST SOURCING"; 2026-10-19 — Order Dispatch only sent OSCAR before).
+const customerTagOf = (name) => {
+  const n = str(name);
+  if (!n) return "";
+  if (/oscar\s*mobile/i.test(n)) return "OSCAR";
+  return n.replace(/\b(pty\.?\s*ltd\.?|pty\.?|ltd\.?|limited)\b/gi, " ").replace(/\s+/g, " ").replace(/[\s,.\-–]+$/, "").trim().toUpperCase().slice(0, 40);
+};
+// a not-in-PO line scanned as a customer's own barcode (not Oscar's): the line it raises is marked for that customer
+const customerRefOf = (code, name) => {
+  const tag = customerTagOf(name);
+  if (!str(code) || !tag || tag === "OSCAR") return {};
+  return { forCustomer: tag, dispatchRef: { recordId: "", invoiceNumber: "", customerName: str(name).slice(0, 120), faultyCodePrefix: "", customerSku: str(code).slice(0, 80), customerDescription: "" } };
 };
 // the register item as the scan lookup answers it
 const ITEM_BRIEF = { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, imageId: 1 };
@@ -383,6 +402,37 @@ router.get("/orders/open-lines", BATCH_VIEW, async (req, res, next) => {
   }
 });
 
+// A customer's own barcode (not Oscar's — those go by return code): the
+// waiting lines raised for that customer with that code (`customer` {code,
+// tag, name}); none waiting — the product it stands for, from the last line
+// raised for it or a dispatch record's SKU mapping. null when the code is
+// no customer's.
+async function customerCodeLookup(db, code, { openOnes, elsewhere }) {
+  const codeRx = new RegExp(`^${escapeRegex(code)}$`, "i");
+  const forCust = { "dispatchRef.customerSku": codeRx, forCustomer: { $exists: true, $nin: ["", "OSCAR"] } };
+  const rows = await db.collection(ORDERS).find({ status: { $in: ["ordered", "pending"] }, ...forCust }, { projection: { history: 0 } }).toArray();
+  if (rows.length) {
+    const customer = { code, tag: rows[0].forCustomer, name: (rows[0].dispatchRef && rows[0].dispatchRef.customerName) || "" };
+    const candidates = openOnes(rows);
+    if (candidates.length) return { match: candidates[0], remaining: candidates.length - 1, all: candidates, customer };
+    const otherFreight = elsewhere(rows);
+    if (otherFreight) return { match: null, otherFreight, customer };
+  }
+  // nothing waiting: a line raised for it before, else a dispatch record's line with that code
+  const prev = (await db.collection(ORDERS).find(forCust, { projection: { itemId: 1, sku: 1, forCustomer: 1, dispatchRef: 1, createdAt: 1 } }).sort({ createdAt: -1 }).limit(1).toArray())[0];
+  let name = prev ? str(prev.dispatchRef && prev.dispatchRef.customerName) : "";
+  let q = prev && prev.itemId ? { itemId: String(prev.itemId) } : prev && prev.sku ? { sku: new RegExp(`^${escapeRegex(prev.sku)}$`, "i") } : null;
+  if (!prev) {
+    const rec = await db.collection(DISPATCH_UPLOADS).findOne({ "lineItems.sku": codeRx, customerName: { $not: /oscar\s*mobile/i } }, { projection: { customerName: 1, lineItems: 1 } });
+    if (!rec || !customerTagOf(rec.customerName)) return null;
+    name = str(rec.customerName);
+    const li = (rec.lineItems || []).find((l) => codeRx.test(str(l.sku)));
+    if (li && str(li.imbSku)) q = { sku: new RegExp(`^${escapeRegex(str(li.imbSku))}$`, "i") };
+  }
+  const item = q ? await db.collection(ITEMS).findOne(q, { projection: ITEM_BRIEF }) : null;
+  return { match: null, hadWaiting: rows.length > 0, customer: { code, tag: customerTagOf(name), name }, item: itemBrief(item) };
+}
+
 // Scan-to-batch: the OLDEST waiting line for a SKU (ordered before pending;
 // iMobile's own lines before ones raised for a customer such as OSCAR),
 // skipping ids already on the batch being built, so scanning the same SKU
@@ -437,6 +487,12 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
     // A plain SKU scan is iMobile's stock first: lines raised for a customer
     // (OSCAR) only once no iMobile line waits — those answer to their return code.
     const candidates = openOnes(rows).sort((a, b) => (a.forCustomer ? 1 : 0) - (b.forCustomer ? 1 : 0));
+    // Not one of our SKUs waiting: maybe a customer's own barcode (user
+    // 2026-10-19 — Best Sourcing's 13-digit codes on the Order Dispatch label)
+    if (!rows.length) {
+      const byCustomer = await customerCodeLookup(db, sku, { openOnes, elsewhere });
+      if (byCustomer) return res.json({ success: true, ...byCustomer });
+    }
     if (!candidates.length) {
       const otherFreight = elsewhere(rows);
       if (otherFreight) return res.json({ success: true, match: null, otherFreight });
@@ -769,12 +825,13 @@ router.post("/orders", ADD, async (req, res, next) => {
         const it = await db.collection(ITEMS).findOne({ sku: new RegExp(`^${escapeRegex(str(l.sku))}$`, "i") }, { projection: { _id: 0, itemId: 1, name: 1 } });
         if (it) { itemId = it.itemId; if (!productName) productName = it.name || ""; }
       }
-      const forCustomer = str(l.forCustomer).toUpperCase().slice(0, 40);
       const dr = l.dispatchRef && typeof l.dispatchRef === "object" ? l.dispatchRef : null;
       const dispatchRef = dr ? {
         recordId: str(dr.recordId).slice(0, 40), invoiceNumber: str(dr.invoiceNumber).slice(0, 80), customerName: str(dr.customerName).slice(0, 120),
         faultyCodePrefix: str(dr.faultyCodePrefix).slice(0, 40), customerSku: str(dr.customerSku).slice(0, 80), customerDescription: str(dr.customerDescription).slice(0, 200),
       } : null;
+      // raised from a dispatch: for that customer, named when the page didn't (Best Sourcing, 2026-10-19)
+      const forCustomer = (str(l.forCustomer) || (dispatchRef ? customerTagOf(dispatchRef.customerName) : "")).toUpperCase().slice(0, 40);
       // the same dispatch line raised twice: the open line stands
       if (dispatchRef && dispatchRef.recordId && dispatchRef.customerSku) {
         const open = await db.collection(ORDERS).findOne(
@@ -1648,7 +1705,7 @@ async function draftPayload(db, b, freight) {
       }
       // since 2026-10-14 the line can carry the product picked for it (register itemId), a supplier and a price
       parsed.push({ unmatched: true, sku, productName: str(l.productName).slice(0, 200), category: str(l.category).slice(0, 40), reason: l.reason === "over" ? "over" : "none", qty: uqty,
-        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: l.warranty === true ? 0 : uprice, warranty: l.warranty === true, oscarCode: str(l.oscarCode).slice(0, 80), key: str(l.key).slice(0, 40) });
+        itemId: str(l.itemId) || null, imageId: str(l.imageId) || null, supplier: str(l.supplier), price: l.warranty === true ? 0 : uprice, warranty: l.warranty === true, oscarCode: str(l.oscarCode).slice(0, 80), customerCode: str(l.customerCode).slice(0, 80), customerName: str(l.customerName).slice(0, 120), key: str(l.key).slice(0, 40) });
       continue;
     }
     const _id = oid(l.orderId);
@@ -1676,7 +1733,7 @@ async function draftPayload(db, b, freight) {
       continue;
     }
     if (p.unmatched) {
-      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, warranty: !!p.warranty, oscarCode: p.oscarCode || "", key: p.key });
+      lines.push({ orderId: null, orderNo: "", itemId: p.itemId, imageId: p.imageId, imageUrl: imageUrlFromId(p.imageId), sku: p.sku, productName: p.productName, category: p.category, status: "unmatched", supplier: p.supplier, orderedAt: null, orderQty: null, qty: p.qty, unitPrice: p.price != null ? round2(p.price) : null, unmatched: true, reason: p.reason, warranty: !!p.warranty, oscarCode: p.oscarCode || "", customerCode: p.customerCode || "", customerName: p.customerName || "", key: p.key });
       continue;
     }
     const rec = byId.get(String(p._id));
@@ -1832,7 +1889,7 @@ async function shipBatch(db, req, b, draft) {
     const warranty = l.warranty === true; // a warranty replacement: no charge (user 2026-10-14)
     const price = warranty ? 0 : hasVal(l.unitPrice) ? num(l.unitPrice) : null;
     if (price == null || price < 0) return { error: `${label}: unit price is required to ship` };
-    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price, warranty, oscarCode: str(l.oscarCode).slice(0, 80) });
+    extras.push({ itemId, sku: str(l.sku).slice(0, 80), productName: str(l.productName).slice(0, 200), qty: Math.round(xq), supplier, price, warranty, oscarCode: str(l.oscarCode).slice(0, 80), customerCode: str(l.customerCode).slice(0, 80), customerName: str(l.customerName).slice(0, 120) });
   }
   const zohoVendor = vendorById(b.zohoVendorId);
   if (!zohoVendor) return { error: "Pick the Zoho vendor for this batch" };
@@ -1890,6 +1947,8 @@ async function shipBatch(db, req, b, draft) {
         ...(x.warranty ? { warranty: true } : {}),
         // scanned as an Oscar return code: marked for OSCAR with the code's facts (labels)
         ...oscarRefOf(x.oscarCode),
+        // scanned as another customer's barcode (Best Sourcing): marked for that customer
+        ...(x.oscarCode ? {} : customerRefOf(x.customerCode, x.customerName)),
         orderNo: xNo, seq: xSeq, itemId: x.itemId, sku: x.sku, productName: x.productName, imageId: facts.imageId, category: facts.category,
         orderQty: x.qty, note: x.warranty ? "Warranty replacement" : "", status: "pending", quotedPrice: null, supplier: x.supplier, unitPrice: round2(x.price), lineTotal: round2(x.qty * x.price),
         orderedAt: null, orderedBy: null, shippedQty: null, shippedAt: null, batchId: null, batchNo: "", tracking: "",
