@@ -23,6 +23,7 @@
 //
 //   GET  /new-products                      brands + models with coverage (every brand, or ?brand=)
 //   GET  /new-products/models/:id/items     one model's items, every classification
+//   GET  /new-products/model-options        Add Model's Model list: models Zoho has parts for in a brand + series, not on the page yet
 //   POST /new-products/models               add a model (categoryId? = its store category)
 //   PUT  /new-products/models/:id           edit a model (or hide it: active false; categoryId links its store category)
 //   GET  /new-products/next-sku             the next free parts SKU (22xxx) — asks Zoho
@@ -104,13 +105,82 @@ const BRANDS = {
       if (/^ThinkPhone/i.test(m)) return "ThinkPhone";
       return "";
     },
+    // the Add Model dialog's hints, and a new store category's name start
+    // (the page keeps Motorola's own rule: "MOTO G96", "Edge 70 Pro")
+    modelHint: "e.g. Moto G96",
+    codesHint: "XT…",
+    categoryPrefix: "MOTO ",
+    words: ["motorola", "moto"],
   },
 };
+
+// The other brands (user ask 2026-10-19, "more brands"): the same three
+// needed parts, named the way the register's own items of the brand are —
+// "Samsung Galaxy A52 (A525) Compatible …" (Compatible Model "Galaxy A52
+// (A525)"), "Google Pixel 11 Compatible …", "iPhone 17 Pro Compatible …",
+// "OPPO Reno 13 5G Compatible …". No series rule: an item's Device Series is
+// its models' own series on this page, picked from the brand's Zoho Device
+// Series ("S Series", "Fold Series", "Pixel", "iPhone").
+// the model without the brand's own words in front ("Samsung Galaxy S26" → "S26")
+const stripWords = (model, words) => {
+  let s = String(model || "").trim();
+  for (let again = true; again;) {
+    again = false;
+    for (const w of words) {
+      const rx = new RegExp(`^${w}\\s+`, "i");
+      if (rx.test(s)) { s = s.replace(rx, ""); again = true; }
+    }
+  }
+  return s;
+};
+function otherBrand({ label, deviceBrand = label, words, display, cm, categoryPrefix, modelHint, codesHint = "" }) {
+  const cfg = {
+    label,
+    deviceBrand,
+    words,
+    short: (m) => stripWords(m.model, words),
+    compatibleModel: (m) => cm(m, cfg.short(m)),
+    namePrefix: (m) => `${display(m, cfg.short(m))} Compatible`,
+    series: null,
+    stripModel: true,
+    categoryPrefix,
+    modelHint,
+    codesHint,
+  };
+  // Motorola's three, as "<display> Compatible …"
+  cfg.parts = [
+    { key: "screen", label: "Screen", classification: "Screen", subClassification: "", name: (m) => `${cfg.namePrefix(m)} LCD Touch Digitizer Screen` },
+    { key: "battery", label: "Battery", classification: "Battery", subClassification: "", name: (m) => `${cfg.namePrefix(m)} Battery` },
+    { key: "chargingPort", label: "Charging Port", classification: "Small Parts", subClassification: "Charging Port", name: (m) => `${cfg.namePrefix(m)} Charging Port` },
+  ];
+  return cfg;
+}
+// Realme / OnePlus phones are filed under OPPO in Zoho (brand rules 2026-09) but keep their own name
+const oppoName = (s) => (/^(realme|oneplus)\b/i.test(s) ? s : `OPPO ${s}`);
+Object.assign(BRANDS, {
+  Samsung: otherBrand({ label: "Samsung", words: ["samsung", "galaxy"], display: (m) => `Samsung Galaxy ${withCodes(m)}`, cm: (m) => `Galaxy ${withCodes(m)}`, categoryPrefix: "Galaxy ", modelHint: "e.g. S26 Ultra, Z Fold 8, A57", codesHint: "e.g. S948" }),
+  Google: otherBrand({ label: "Google", words: ["google"], display: (m) => `Google ${withCodes(m)}`, cm: (m, s) => `Google ${s}`, categoryPrefix: "Google ", modelHint: "e.g. Pixel 11 Pro" }),
+  Apple: otherBrand({ label: "Apple", words: ["apple"], display: (m) => withCodes(m), cm: (m, s) => s, categoryPrefix: "", modelHint: "e.g. iPhone 17 Pro", codesHint: "e.g. A3256" }),
+  OPPO: otherBrand({ label: "OPPO", words: ["oppo"], display: (m) => oppoName(withCodes(m)), cm: (m, s) => oppoName(s), categoryPrefix: "OPPO ", modelHint: "e.g. Reno 14 5G, Find X9 Pro", codesHint: "e.g. CPH2689" }),
+  Xiaomi: otherBrand({ label: "Xiaomi", words: ["xiaomi"], display: (m) => `Xiaomi ${withCodes(m)}`, cm: (m, s) => `Xiaomi ${s}`, categoryPrefix: "Xiaomi ", modelHint: "e.g. Redmi Note 14 Pro" }),
+  Huawei: otherBrand({ label: "Huawei", words: ["huawei"], display: (m) => `Huawei ${withCodes(m)}`, cm: (m, s) => `Huawei ${s}`, categoryPrefix: "Huawei ", modelHint: "e.g. P60 Pro" }),
+  Sony: otherBrand({ label: "Sony", words: ["sony"], display: (m) => `Sony ${withCodes(m)}`, cm: (m, s) => `Sony ${s}`, categoryPrefix: "Sony ", modelHint: "e.g. Xperia 1 VII" }),
+  Nokia: otherBrand({ label: "Nokia", words: ["nokia"], display: (m) => `Nokia ${withCodes(m)}`, cm: (m, s) => `Nokia ${s}`, categoryPrefix: "Nokia ", modelHint: "e.g. G42" }),
+});
 // The Device Series for a set of Compatible Models ("; "-joined, like the
 // other brands' items); "" when the brand has no series rule.
 function seriesFor(cfg, models) {
   if (!cfg || !cfg.series) return "";
   return [...new Set((models || []).map(cfg.series).filter(Boolean))].join("; ");
+}
+// A new item's Device Series: the brand's rule (Motorola), else the series of
+// every model of the brand it is given for — this one's, and those whose
+// Compatible Model was picked too ("; "-joined).
+async function deviceSeriesFor(db, model, compatibleModels) {
+  const cfg = BRANDS[model.brand];
+  if (cfg.series) return seriesFor(cfg, compatibleModels);
+  const others = await db.collection(MODELS).find({ brand: model.brand, active: { $ne: false }, compatibleModel: { $in: compatibleModels } }, { projection: { series: 1 } }).toArray();
+  return [...new Set([model.series, ...others.map((o) => o.series)].map(str).filter(Boolean))].join("; ");
 }
 function withCodes(m) {
   const short = BRANDS[m.brand].short(m);
@@ -149,7 +219,7 @@ const list = (v) => (Array.isArray(v) ? v : String(v == null ? "" : v).split(/[,
 function modelKey(s) {
   return String(s || "").toLowerCase()
     .replace(/\b(xt|pb|pa)[-\w]*\d[\w-]*/g, " ")
-    .replace(/\b(motorola|moto|5g|4g|us)\b/g, " ")
+    .replace(/\b(motorola|moto|samsung|galaxy|google|apple|oppo|xiaomi|huawei|sony|nokia|5g|4g|us)\b/g, " ")
     .replace(/[^a-z0-9()]+/g, "");
 }
 
@@ -220,8 +290,34 @@ router.get("/", VIEW, async (req, res, next) => {
     const asked = str(req.query.brand);
     const brandList = BRANDS[asked] ? [asked] : Object.keys(BRANDS);
     const rows = [];
+    // the series to pick from per brand (Add Model): the page's own, then —
+    // for a brand without a series rule — Zoho's Device Series of its parts
+    // (one query each — the database is a round trip away; 2026-10-19)
+    const seriesOptions = Object.fromEntries(Object.keys(BRANDS).map((b) => [b, []]));
+    const own = await db.collection(MODELS).aggregate([
+      { $match: { active: { $ne: false }, series: { $nin: [null, ""] } } },
+      { $group: { _id: { b: "$brand", s: "$series" }, o: { $min: "$seriesOrder" } } },
+      { $sort: { o: 1, "_id.s": 1 } },
+    ]).toArray();
+    for (const x of own) if (seriesOptions[x._id.b]) seriesOptions[x._id.b].push(x._id.s);
+    const zohoSeries = await db.collection(ITEMS).aggregate([
+      { $match: { active: { $ne: false }, scope: "parts", deviceSeries: { $nin: [null, ""] } } },
+      { $group: { _id: { b: "$deviceBrand", s: "$deviceSeries" }, n: { $sum: 1 } } },
+    ]).toArray();
+    for (const brand of Object.keys(BRANDS).filter((b) => !BRANDS[b].series)) {
+      const counts = new Map();
+      for (const x of zohoSeries) {
+        if (String(x._id.b).toLowerCase() !== BRANDS[brand].deviceBrand.toLowerCase()) continue;
+        // an item filed under several ("S Series; Note Series") counts for each
+        for (const s of String(x._id.s).split(";").map((y) => y.trim()).filter(Boolean)) counts.set(s, (counts.get(s) || 0) + x.n);
+      }
+      const zoho = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([s]) => s);
+      seriesOptions[brand] = [...new Set([...seriesOptions[brand], ...zoho])];
+    }
+    const allModels = await db.collection(MODELS).find({ brand: { $in: brandList }, active: { $ne: false } }).sort({ seriesOrder: 1, series: 1, sortKey: 1, model: 1 }).toArray();
     for (const brand of brandList) {
-      const models = await db.collection(MODELS).find({ brand, active: { $ne: false } }).sort({ seriesOrder: 1, series: 1, sortKey: 1, model: 1 }).toArray();
+      const models = allModels.filter((m) => m.brand === brand);
+      if (!models.length) continue; // a brand with no models yet: nothing to read from the register
       const index = await registerIndex(db, brand);
       const cfg = BRANDS[brand];
       for (const m of models) {
@@ -232,7 +328,9 @@ router.get("/", VIEW, async (req, res, next) => {
         const defaultNames = Object.fromEntries(cfg.parts.map((p) => [p.key, p.name(m)]));
         // any other product: the name's start, the rest typed
         defaultNames[OTHER] = `${cfg.namePrefix(m)} `;
-        rows.push({ ...m, _id: String(m._id), have, missing, defaultNames, deviceSeries: seriesFor(cfg, [m.compatibleModel || cfg.compatibleModel(m)]) });
+        // a brand with a series rule (Motorola) works it out; the others use the model's own series
+        const deviceSeries = cfg.series ? seriesFor(cfg, [m.compatibleModel || cfg.compatibleModel(m)]) : str(m.series);
+        rows.push({ ...m, _id: String(m._id), have, missing, defaultNames, deviceSeries });
       }
     }
     return res.json({
@@ -242,6 +340,14 @@ router.get("/", VIEW, async (req, res, next) => {
         value: b,
         label: BRANDS[b].label,
         deviceBrand: BRANDS[b].deviceBrand,
+        // the Add Model dialog: the series to pick from, field hints, the
+        // brand's own words (dropped from a model name) and how a new store
+        // category's name starts
+        series: seriesOptions[b] || [],
+        modelHint: BRANDS[b].modelHint || "",
+        codesHint: BRANDS[b].codesHint || "",
+        words: BRANDS[b].words || [],
+        categoryPrefix: BRANDS[b].categoryPrefix || "",
         parts: BRANDS[b].parts.map((p) => ({
           key: p.key, label: p.label, classification: p.classification, subClassification: p.subClassification,
           // which formula prices it (a "Service Pack" quality switches the dialog to that one)
@@ -327,7 +433,9 @@ router.get("/models/:id/items", VIEW, async (req, res, next) => {
 function modelFromBody(b, existing) {
   const brand = str(b.brand) || (existing && existing.brand);
   if (!BRANDS[brand]) return { error: "Unknown brand" };
-  const model = str(b.model !== undefined ? b.model : existing && existing.model);
+  let model = str(b.model !== undefined ? b.model : existing && existing.model);
+  // the other brands keep the model without their own words ("Samsung Galaxy Z Fold 8" → "Z Fold 8"); Motorola's are "Moto G96"
+  if (BRANDS[brand].stripModel) model = stripWords(model, BRANDS[brand].words);
   if (!model) return { error: "Model is required" };
   const doc = {
     brand,
@@ -337,7 +445,12 @@ function modelFromBody(b, existing) {
     aliases: b.aliases !== undefined ? list(b.aliases) : (existing && existing.aliases) || [],
     note: str(b.note !== undefined ? b.note : existing && existing.note),
   };
-  doc.compatibleModel = str(b.compatibleModel !== undefined ? b.compatibleModel : existing && existing.compatibleModel) || BRANDS[brand].compatibleModel(doc);
+  // The Compatible Model is no longer typed (Add Model, 2026-10-19): it is the
+  // brand's rule — worked out again when the model or its codes change, unless
+  // the record carries one of its own (Skyline's seeded wording).
+  const auto = existing && existing.compatibleModel === BRANDS[brand].compatibleModel(existing);
+  const kept = b.compatibleModel !== undefined ? b.compatibleModel : existing && !auto ? existing.compatibleModel : "";
+  doc.compatibleModel = str(kept) || BRANDS[brand].compatibleModel(doc);
   return { doc };
 }
 
@@ -347,8 +460,11 @@ router.post("/models", CREATE, async (req, res, next) => {
     const { doc, error } = modelFromBody(req.body || {});
     if (error) return bad(res, error);
     const db = await connectToDatabase();
-    const dup = await db.collection(MODELS).findOne({ brand: doc.brand, active: { $ne: false }, model: new RegExp(`^${doc.model.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
-    if (dup) return bad(res, `${doc.brand} ${doc.model} is already listed`);
+    // already listed: the same name once brand words, 4G/5G, case and punctuation are set aside
+    const key = modelKey(doc.model);
+    const listed = await db.collection(MODELS).find({ brand: doc.brand, active: { $ne: false } }, { projection: { model: 1 } }).toArray();
+    const dup = listed.find((m) => modelKey(m.model) === key);
+    if (dup) return bad(res, `${doc.brand} ${dup.model} is already listed`);
     // its store category, when one is picked already
     let link = {};
     if (req.body && req.body.categoryId !== undefined) {
@@ -360,6 +476,120 @@ router.post("/models", CREATE, async (req, res, next) => {
     const full = { ...doc, ...link, source: "added on the page", active: true, created: [], createdAt: now, createdBy: actor(req), updatedAt: now };
     const r = await db.collection(MODELS).insertOne(full);
     return res.json({ success: true, model: { ...full, _id: String(r.insertedId) } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── GET /new-products/model-options?brand=&series= ───────────────────
+// The Add Model dialog's Model list (user ask 2026-10-19): the models Zoho
+// already has parts for in the brand + series — each Compatible Model value
+// of the register's parts — less the ones on this page already. Each comes
+// with the model name and codes the page keeps ("Galaxy Z Fold 8 (F971)" →
+// "Z Fold 8" + F971), the Compatible Model itself (sent back on add, so the
+// existing parts count at once), how many parts it has, which of the needed
+// ones, and the store category most of them are filed under in Zoho (the
+// dialog links the model there by default — linking never moves a part).
+const MODEL_CODE = /\s*\(([A-Z]{1,3}\d{3,4}[A-Z]?)\)\s*$/i; // "(F971)", "(G850)" — not "(2022)" or "(44mm)"
+// a brand's parts from the register (what the Model list reads), kept a minute
+const PARTS_TTL = 60 * 1000;
+const partsCache = new Map(); // deviceBrand → { at, items }
+async function brandParts(db, cfg) {
+  const hit = partsCache.get(cfg.deviceBrand);
+  if (hit && Date.now() - hit.at < PARTS_TTL) return hit.items;
+  const items = await db.collection(ITEMS).find(
+    { deviceBrand: new RegExp(`^${cfg.deviceBrand}$`, "i"), active: { $ne: false }, scope: "parts" },
+    { projection: { _id: 0, classification: 1, subClassification: 1, compatibleModels: 1, deviceSeries: 1, zohoCategoryId: 1, zohoCategory: 1 } },
+  ).toArray();
+  partsCache.set(cfg.deviceBrand, { at: Date.now(), items });
+  return items;
+}
+function optionFromCompatibleModel(cfg, cm) {
+  if (!cfg.stripModel) return { model: str(cm).replace(new RegExp(`^${cfg.deviceBrand}\\s+`, "i"), ""), codes: [] };
+  const s = stripWords(cm, cfg.words);
+  const code = s.match(MODEL_CODE);
+  return code ? { model: s.replace(MODEL_CODE, "").trim(), codes: [code[1].toUpperCase()] } : { model: s, codes: [] };
+}
+router.get("/model-options", CREATE, async (req, res, next) => {
+  try {
+    const brand = str(req.query.brand);
+    const series = str(req.query.series);
+    const cfg = BRANDS[brand];
+    if (!cfg) return bad(res, "Unknown brand");
+    if (!series) return res.json({ success: true, options: [] });
+    const db = await connectToDatabase();
+    const onPage = await db.collection(MODELS).find({ brand, active: { $ne: false } }, { projection: { model: 1, compatibleModel: 1, aliases: 1 } }).toArray();
+    const listed = new Set(onPage.flatMap(modelKeysOf));
+    // the Zoho Device Series the page's series stands for: itself, or
+    // (Motorola) the rule's series of the page's models in it ("G" → "Moto G Series")
+    let zohoSeries = [series];
+    if (cfg.series) {
+      const mine = await db.collection(MODELS).find({ brand, series, active: { $ne: false } }, { projection: { model: 1, compatibleModel: 1 } }).toArray();
+      zohoSeries = [...new Set(mine.map((m) => cfg.series(m.compatibleModel || cfg.compatibleModel(m))).filter(Boolean))];
+      if (!zohoSeries.length) zohoSeries = [cfg.series(`${cfg.deviceBrand} ${series}`) || series];
+    }
+    // every part of the brand: a part that fits several phones carries one
+    // Device Series, so a phone's own series is the one most of its parts
+    // carry (an "A72" on an "S Series" part is still an A Series phone).
+    // Kept a minute, for picking one series after another in the dialog.
+    const items = await brandParts(db, cfg);
+    // one option per phone: Zoho's spellings of the same model ("Pixel 10a" /
+    // "Pixel 10A", "Moto G57" / "Moto G57 5G") are one, as the page counts
+    // them — shown with the spelling most of its parts use
+    const byKey = new Map();
+    for (const it of items) {
+      const itemSeries = String(it.deviceSeries || "").split(";").map((x) => x.trim()).filter(Boolean);
+      const part = partOf(cfg, it);
+      for (const cm of it.compatibleModels || []) {
+        const name = str(cm);
+        const key = modelKey(name);
+        if (!name || !key || listed.has(key)) continue;
+        const o = byKey.get(key) || { spellings: new Map(), series: new Map(), categories: new Map(), items: 0, have: [] };
+        o.spellings.set(name, (o.spellings.get(name) || 0) + 1);
+        for (const s of itemSeries) o.series.set(s, (o.series.get(s) || 0) + 1);
+        // the store category its parts are filed under in Zoho
+        if (it.zohoCategoryId) {
+          const c = o.categories.get(String(it.zohoCategoryId)) || { id: String(it.zohoCategoryId), name: it.zohoCategory || "", n: 0 };
+          c.n++;
+          o.categories.set(c.id, c);
+        }
+        o.items++;
+        if (part && !o.have.includes(part.key)) o.have.push(part.key);
+        byKey.set(key, o);
+      }
+    }
+    const wanted = new Set(zohoSeries.map((s) => s.toLowerCase()));
+    // the brand's series by the name they start ("A Series" → "A95 5G", "Reno Series" → "Reno 13", "Tab Series" → "Tab S9"), longest first
+    const stems = [...new Set(items.flatMap((it) => String(it.deviceSeries || "").split(";").map((x) => x.trim())).filter(Boolean))]
+      .map((s) => ({ series: s, stem: s.replace(/\s*series$/i, "").trim().toLowerCase() }))
+      .filter((x) => x.stem)
+      .sort((a, b) => b.stem.length - a.stem.length);
+    const byName = (model) => {
+      const m = String(model || "").toLowerCase();
+      const hit = stems.find((x) => m.startsWith(x.stem) && /^[\s\d]/.test(m.slice(x.stem.length)));
+      return hit ? hit.series : "";
+    };
+    const inSeries = (o, name) => {
+      // Motorola: the model's own series by the rule
+      if (cfg.series) return zohoSeries.includes(cfg.series(name));
+      // the name says it ("A95 5G" is an A Series phone, whatever one stray part carries)
+      const named = byName(optionFromCompatibleModel(cfg, name).model);
+      if (named) return wanted.has(named.toLowerCase());
+      // else the series most of its parts carry — a tie ("S Series; Note Series" parts only) lists it under each
+      const most = Math.max(0, ...o.series.values());
+      return most > 0 && [...o.series.entries()].some(([s, n]) => n === most && wanted.has(s.toLowerCase()));
+    };
+    const options = [...byKey.values()].filter((o) => inSeries(o, [...o.spellings.keys()][0])).map((o) => {
+      const compatibleModel = [...o.spellings.entries()].sort((a, b) => b[1] - a[1])[0][0];
+      // the store category most of its parts are in (the dialog links the model there by default)
+      const top = [...o.categories.values()].sort((a, b) => b.n - a.n)[0] || null;
+      const category = top ? { id: top.id, name: top.name, parts: top.n } : null;
+      return { compatibleModel, ...optionFromCompatibleModel(cfg, compatibleModel), items: o.items, have: o.have, category };
+    });
+    // newest first: by the model's number ("S26 Ultra" 26, "iPhone SE 3 (2022)" 3; none — "iPhone XS" — last), then by name
+    const numberOf = (m) => { const x = String(m).replace(/\([^)]*\)/g, " ").match(/\d+(\.\d+)?/); return x ? Number(x[0]) : -1; };
+    options.sort((a, b) => numberOf(b.model) - numberOf(a.model) || b.model.localeCompare(a.model, undefined, { numeric: true, sensitivity: "base" }));
+    return res.json({ success: true, options });
   } catch (error) {
     next(error);
   }
@@ -512,7 +742,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
       classification: part.classification,
       subClassification: part.subClassification,
       deviceBrand: cfg.deviceBrand,
-      deviceSeries: seriesFor(cfg, compatibleModels),
+      deviceSeries: await deviceSeriesFor(db, model, compatibleModels),
       compatibleModel,
     });
     if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
