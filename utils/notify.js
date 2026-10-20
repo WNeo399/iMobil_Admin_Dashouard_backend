@@ -71,7 +71,7 @@ async function notifyRoles(db, roles, payload) {
 
 // The admin-side SQT roles — iMobile Front Desk works SQT like TechElite
 // Admin and gets its notifications too (user ask 2026-10-05).
-const SQT_ADMIN_SIDE_ROLES = [ROLES.ADMIN, ROLES.TECHELITE_ADMIN, ROLES.IMOBILE_FRONT_DESK];
+const SQT_ADMIN_SIDE_ROLES = [ROLES.ADMIN, ROLES.TECHELITE_ADMIN, ROLES.IMOBILE_FRONT_DESK, ROLES.EXYON_ADMIN];
 const RETURN_TRACKER_ROLES = SQT_ADMIN_SIDE_ROLES;
 
 // Unrepairable / BER / Cancelled all activate return tracking — tell the people

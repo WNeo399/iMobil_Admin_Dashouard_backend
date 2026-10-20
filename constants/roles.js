@@ -38,6 +38,9 @@ const ROLES = {
   // Exyon's operations staff — the Exyon Accessories menu (orders, dispatch,
   // pick lists).
   EXYON_OPERATION: "exyon-operation",
+  // Exyon's admin (2026-10-20) — Exyon Accessories, SQT (admin side),
+  // Blackbelt and ExEngine.
+  EXYON_ADMIN: "exyon-admin",
 };
 
 const ROLE_LABELS = {
@@ -58,6 +61,7 @@ const ROLE_LABELS = {
   [ROLES.IMOBILE_WAREHOUSE]: "iMobile Warehouse",
   [ROLES.IMOBILE_FRONT_DESK]: "iMobile Front Desk",
   [ROLES.EXYON_OPERATION]: "Exyon Operation",
+  [ROLES.EXYON_ADMIN]: "Exyon Admin",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -97,6 +101,7 @@ const ROLE_GROUP_OF = {
   [ROLES.IMOBILE_WAREHOUSE]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_FRONT_DESK]: ROLE_GROUPS.IMOBILE,
   [ROLES.EXYON_OPERATION]: ROLE_GROUPS.EXYON,
+  [ROLES.EXYON_ADMIN]: ROLE_GROUPS.EXYON,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -295,6 +300,20 @@ const ROLE_PERMISSIONS = {
   [ROLES.EXYON_OPERATION]: [
     "exyon:accessory:view",
     "exyon:accessory:picklist",
+  ],
+  // Exyon Admin (2026-10-20, user): the Exyon Accessories menu (all of it —
+  // Confirm dispatch included), SQT like TechElite Admin / Front Desk (every
+  // action, and the admin-side view by role: SQT_ADMIN_SIDE_ROLES in
+  // sqt/cases + utils/notify, GROUP_FILTER_ROLES / UNREPAIRABLE_REVIEW_ROLES in
+  // sqtRoutes/cases; not Shops → Users), Blackbelt (accounts, invoices) and
+  // ExEngine (insights, accessories, and the Scraper pages — refurb:offer:view,
+  // none of the rest of Refurbished Device).
+  [ROLES.EXYON_ADMIN]: [
+    "exyon:*:*",
+    "sqt:*:*",
+    "blackbelt:*:*",
+    "exengine:*:*",
+    "refurb:offer:view",
   ],
 };
 

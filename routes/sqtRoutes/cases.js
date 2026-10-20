@@ -198,7 +198,7 @@ async function resolveModel(db, modelId) {
 // Roles allowed to use the shop-group filter on /list and /counts (iMobile
 // Front Desk works SQT like TechElite Admin, 2026-10-05). Any one of an
 // account's roles is enough.
-const GROUP_FILTER_ROLES = ["admin", "techelite-admin", "imobile-front-desk"];
+const GROUP_FILTER_ROLES = ["admin", "techelite-admin", "imobile-front-desk", "exyon-admin"];
 const canFilterByGroup = (user) =>
   !!user && (user.roles || [user.role]).some((r) => GROUP_FILTER_ROLES.includes(r));
 
@@ -842,7 +842,7 @@ router.post(
 // Admin, iMobile Front Desk and TechElite Admin (the latter two added
 // 2026-10-15), by explicit role check — the same admin-side list the group
 // filter uses; shop roles never review.
-const UNREPAIRABLE_REVIEW_ROLES = ["admin", "imobile-front-desk", "techelite-admin"];
+const UNREPAIRABLE_REVIEW_ROLES = ["admin", "imobile-front-desk", "techelite-admin", "exyon-admin"];
 router.post("/review-unrepairable/:id", async (req, res) => {
   try {
     const roles = (req.user && (req.user.roles || [req.user.role])) || [];
