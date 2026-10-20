@@ -1651,7 +1651,7 @@ router.get("/item/:itemId/prices", VIEW, async (req, res) => {
     const mirrored = await withItemLock(itemId, async () => {
       const row = await db.collection(ITEMS).findOne(
         { itemId },
-        { projection: { name: 1, category: 1, classification: 1, quality: 1 } },
+        { projection: { name: 1, category: 1, classification: 1, quality: 1, scope: 1 } },
       );
       if (!row) return null;
       const set = {
@@ -1777,7 +1777,7 @@ router.put("/item/:itemId/price", requirePermission("zoho:stock:edit"), async (r
         {
           projection: {
             pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1,
-            name: 1, category: 1, classification: 1, quality: 1,
+            name: 1, category: 1, classification: 1, quality: 1, scope: 1,
           },
         },
       );
@@ -1849,7 +1849,7 @@ router.put("/prices/bulk", requirePermission("zoho:stock:edit"), async (req, res
       const field = list === PURCHASE_LIST ? "purchasePrice" : PRICE_FIELDS[list];
       const row = await db.collection(ITEMS).findOne(
         { itemId },
-        { projection: { pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1, name: 1, category: 1, classification: 1, quality: 1 } },
+        { projection: { pricePlatinum: 1, priceVip: 1, priceSvip: 1, priceWholesale: 1, purchasePrice: 1, name: 1, category: 1, classification: 1, quality: 1, scope: 1 } },
       );
       if (!row) return null;
       row[field] = rate;

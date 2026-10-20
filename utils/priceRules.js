@@ -1,4 +1,5 @@
-// The pricing formula (user rule, 2026-09-16) for items that carry a cost
+// The pricing formula (user rule, 2026-09-16; Other parts' WholeSale
+// cost×1.15 → (cost+2)×1.15 on 2026-10-20) for items that carry a cost
 // price, evaluated with a ±5% tolerance. Shared by the daily snapshot and
 // the price-push endpoint so both compute the same verdict.
 //
@@ -7,6 +8,9 @@
 //   Screen / housing / battery / back cover:
 //     WholeSale (cost+2)×1.10 · SVIP ×1.20 · VIP ×1.25 · Platinum ×1.30
 //   Others:
+//     WholeSale (cost+2)×1.15 · SVIP ×1.20 · VIP ×1.25 · Platinum ×1.30
+//   Accessories that would be "Others" (user 2026-10-20: the WholeSale
+//   change is for spare parts only) keep the earlier rule:
 //     WholeSale cost×1.15 (no +2) · SVIP (cost+2)×1.20 · VIP ×1.25 · Platinum ×1.30
 
 // Rates that mean "not really priced yet" — they render but are never
@@ -18,8 +22,17 @@ const r2 = (v) => Math.round(v * 100) / 100;
 
 // Which formula family an item belongs to, from the signals the register
 // row carries: Zoho's Classification and Quality (the custom fields), our
-// old catalogue category, and the item name as the fallback.
+// old catalogue category, and the item name as the fallback. An accessory
+// (its register scope, or an accessory Classification) that falls to
+// "other" is "accessory" — the same rule as before 2026-10-20.
+const ACCESSORY_CLASSES = ["accessory", "accessory special offer"];
 function priceRuleFamily(row) {
+  const family = partFamily(row);
+  if (family !== "other") return family;
+  const accessory = row.scope === "accessory" || ACCESSORY_CLASSES.includes(String(row.classification || "").toLowerCase());
+  return accessory ? "accessory" : "other";
+}
+function partFamily(row) {
   const n = String(row.name || "").toLowerCase();
   const q = String(row.quality || "").toLowerCase();
   if (q.includes("service pack") || n.includes("service pack")) return "service-pack";
@@ -44,7 +57,8 @@ function priceRuleFamily(row) {
 const PRICE_FORMULAS = {
   "service-pack": { label: "Service pack", wholesale: [2, 1.1], svip: [2, 1.15], vip: [2, 1.2], platinum: [2, 1.25] },
   "major-part": { label: "Screen / housing / battery / back cover", wholesale: [2, 1.1], svip: [2, 1.2], vip: [2, 1.25], platinum: [2, 1.3] },
-  other: { label: "Other parts", wholesale: [0, 1.15], svip: [2, 1.2], vip: [2, 1.25], platinum: [2, 1.3] },
+  other: { label: "Other parts", wholesale: [2, 1.15], svip: [2, 1.2], vip: [2, 1.25], platinum: [2, 1.3] },
+  accessory: { label: "Accessories", wholesale: [0, 1.15], svip: [2, 1.2], vip: [2, 1.25], platinum: [2, 1.3] },
 };
 
 function expectedPrices(cost, family) {

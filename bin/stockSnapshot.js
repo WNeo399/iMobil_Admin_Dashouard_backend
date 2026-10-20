@@ -343,8 +343,21 @@ async function main() {
       lte(rSvip, rVip) && lte(rWs, rVip) && lte(rVip, rPlat) &&
       lte(rSvip, rPlat) && lte(rWs, rPlat)
     );
-    // The pricing-formula verdict for cost-priced items (±5% tolerance).
+    // Accessories and spare parts are separate businesses and get
+    // separate views. Classification and accessory brand mark an
+    // accessory (accessory-collection membership used to as well, but
+    // a collection is now a filter over these very rows, and a filter
+    // cannot decide the scope it is filtered by); the rest is parts.
+    // An item ticked "TE" in Zoho (SQT use only) is neither.
+    const scope = cf.te ? TE_SCOPE
+      : ACCESSORY_CLASSIFICATIONS.has(classification) ||
+      ACCESSORY_BRANDS.has(String(a.Brand || "").trim())
+        ? "accessory"
+        : "parts";
+    // The pricing-formula verdict for cost-priced items (±5% tolerance);
+    // the scope picks the accessories' own rule.
     const ruleEval = evaluatePriceRule({
+      scope,
       name: a["Item Name"] || d.name,
       category: product && product.category ? product.category.name : null,
       classification,
@@ -360,17 +373,8 @@ async function main() {
       itemId: id,
       sku,
       name: String(a["Item Name"] || d.name || ""),
-      // Accessories and spare parts are separate businesses and get
-      // separate views. Classification and accessory brand mark an
-      // accessory (accessory-collection membership used to as well, but
-      // a collection is now a filter over these very rows, and a filter
-      // cannot decide the scope it is filtered by); the rest is parts.
-      // An item ticked "TE" in Zoho (SQT use only) is neither.
-      scope: cf.te ? TE_SCOPE
-        : ACCESSORY_CLASSIFICATIONS.has(classification) ||
-        ACCESSORY_BRANDS.has(String(a.Brand || "").trim())
-          ? "accessory"
-          : "parts",
+      // parts / accessory / te — worked out above
+      scope,
       te: cf.te,
       classification,
       subClassification: cf.subClassification,
