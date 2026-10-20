@@ -11,6 +11,7 @@
 //     → { bySku, multiLine, onPickList, summary, channels, statuses }
 //     every order carries `envelope` { size, reasons } (utils/exyonEnvelope)
 //   GET  /exyon-accessories/pick-lists              → { lists, today }
+//   GET  /exyon-accessories/pick-lists/find?q=      → { matches } — which list an order is on
 //   GET  /exyon-accessories/pick-lists/:day         → { list, lines, summary }
 //   POST /exyon-accessories/pick-lists/:day/remove  { orderId }
 //   POST /exyon-accessories/pick-lists/today/process { orders: [{ orderId, tracking }] }
@@ -365,6 +366,31 @@ router.get("/pick-lists", VIEW, async function (req, res) {
   } catch (error) {
     console.error("Exyon pick lists error:", error);
     return res.status(502).json({ success: false, message: error.message || "Failed to load the pick lists" });
+  }
+});
+
+// Which list (day) an order is on (user 2026-10-20) — order numbers holding
+// the text (3+ characters, case and spaces ignored), newest list first.
+//   GET /pick-lists/find?q=A3472 → { matches: [{ day, orderId, channel, customerName, tracking, dispatch }] }
+// (before /pick-lists/:day, which would take "find" for a day)
+router.get("/pick-lists/find", VIEW, async function (req, res) {
+  try {
+    const q = String(req.query.q || "").replace(/\s+/g, "").slice(0, 40);
+    if (q.length < 3) return res.json({ success: true, matches: [] });
+    const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const col = await pickLists();
+    const docs = await col.find({ "orders.orderId": rx, ...LIVE_LIST }, { projection: { day: 1, "orders.orderId": 1, "orders.channel": 1, "orders.customerName": 1, "orders.tracking": 1, "orders.dispatch": 1 } })
+      .sort({ day: -1 }).limit(60).toArray();
+    const matches = [];
+    for (const d of docs) {
+      for (const o of d.orders || []) {
+        if (rx.test(o.orderId)) matches.push({ day: d.day, orderId: o.orderId, channel: o.channel || "", customerName: o.customerName || "", tracking: o.tracking || "", dispatch: o.dispatch || null });
+      }
+    }
+    return res.json({ success: true, matches: matches.slice(0, 50) });
+  } catch (error) {
+    console.error("Exyon pick list find error:", error);
+    return res.status(502).json({ success: false, message: error.message || "Failed to search the pick lists" });
   }
 });
 
