@@ -27,6 +27,8 @@ const {
   STATUS_WITH_SUPPLIER,
   SUPPLIER_OWNED_STATUSES,
   supplierPriceOf,
+  LOCATION_IMOBILE,
+  LOCATION_SENDING_IMOBILE,
 } = require("./stockSource");
 
 const VIEW = requirePermission("refurb:stock:view");
@@ -46,6 +48,22 @@ function supplierSource(user) {
 function outOfScope(user, device) {
   const src = supplierSource(user);
   return src !== null && (!device || device.stockSource !== src);
+}
+// What a phone supplier sees of a location (user 2026-10-20: "only HK, In
+// transit and iMobile"): their own shelf by its name (HK), a unit on a sent
+// supply batch "In transit", and everywhere else — iMobile, Exyon, a
+// consignment shop, sold — "iMobile". Applied to the list rows, the filter
+// options and the location filter; the stored location never changes.
+const SUPPLIER_IN_TRANSIT = "In transit";
+function supplierLocation(loc, scope) {
+  if (loc && loc === scope) return scope;
+  if (loc === LOCATION_SENDING_IMOBILE) return SUPPLIER_IN_TRANSIT;
+  return LOCATION_IMOBILE;
+}
+function supplierLocationMatch(want, scope) {
+  if (want === SUPPLIER_IN_TRANSIT) return LOCATION_SENDING_IMOBILE;
+  if (want === LOCATION_IMOBILE) return { $nin: [scope, LOCATION_SENDING_IMOBILE] };
+  return want; // their own shelf
 }
 const DEVICES = "refurb_devices";
 const { recordTransfer, SNAPSHOT } = require("../../utils/refurbTransfers");
@@ -207,7 +225,10 @@ router.get("/", VIEW, async (req, res) => {
     // a supplier's view.
     const scope = supplierSource(req.user);
     if (scope !== null) match.stockSource = scope;
-    if (req.query.location) match.location = String(req.query.location);
+    if (req.query.location) {
+      const want = String(req.query.location);
+      match.location = scope === null ? want : supplierLocationMatch(want, scope);
+    }
     if (req.query.model) match.model = String(req.query.model);
     // Sale status. Devices recorded before the field existed are unsold, so
     // "In Stock" also matches docs with no status at all. A comma list
@@ -299,7 +320,7 @@ router.get("/", VIEW, async (req, res) => {
       rows: supplierView
         ? rows.map((d) => {
             const own = supplierPriceOf(d);
-            return { ...d, costPrice: own.price, currency: own.currency };
+            return { ...d, costPrice: own.price, currency: own.currency, location: supplierLocation(d.location, scope) };
           })
         : rows,
     });
@@ -361,7 +382,8 @@ router.get("/filters", VIEW, async (req, res) => {
       stockSources,
       storages,
       colors,
-      locations,
+      // a phone supplier: their shelf, In transit, iMobile — nothing else
+      locations: scope === null ? locations : [scope, SUPPLIER_IN_TRANSIT, LOCATION_IMOBILE],
       supplyBatches,
       statuses: ["In Stock", "Sold", "On Consignment"],
     });
