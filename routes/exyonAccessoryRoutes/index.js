@@ -14,6 +14,7 @@
 //   GET  /exyon-accessories/pick-lists/:day         → { list, lines, summary }
 //   POST /exyon-accessories/pick-lists/:day/remove  { orderId }
 //   POST /exyon-accessories/pick-lists/today/process { orders: [{ orderId, tracking }] }
+//   POST /exyon-accessories/pick-lists/:day/dispatch { orders: [...] } — Confirm dispatch → Neto
 //   GET  /exyon-accessories/labels?orderIds=A,B   → shipping label data (address from Neto)
 
 var express = require("express");
@@ -200,6 +201,52 @@ async function openOrders({ channel, status } = {}) {
   return ordersOf(rows);
 }
 
+// ── Neto's status of the open orders (2026-10-20) ───────────────────────
+// Exyon's table keeps an order at Pick for good — it is dispatched in Neto
+// (by hand there, or by Confirm dispatch on a pick list) and the table never
+// hears (on 2026-10-20 669 of its 676 "open" orders were Dispatched in Neto).
+// So the open orders are checked against Neto and its dispatched / cancelled
+// ones drop out (user). Answers are kept in Mongo: a final one for good, an
+// open one re-asked after a few minutes. Neto out of reach → the cached
+// answers only (`checked: false`), the page still loads.
+const NETO_STATUS = "exyon_neto_status";
+const NETO_FINAL = ["Dispatched", "Cancelled"];
+const NETO_OPEN_TTL = 5 * 60 * 1000;
+async function netoStatusesOf(orderIds) {
+  const statuses = new Map();
+  const ids = [...new Set(orderIds.filter(Boolean))];
+  if (!ids.length) return { statuses, checked: true };
+  const db = await connectToDatabase();
+  const col = db.collection(NETO_STATUS);
+  const now = Date.now();
+  const cached = new Map((await col.find({ _id: { $in: ids } }).toArray()).map((c) => [c._id, c]));
+  for (const [id, c] of cached) statuses.set(id, c.status);
+  const ask = ids.filter((id) => {
+    const c = cached.get(id);
+    return !c || (!NETO_FINAL.includes(c.status) && now - new Date(c.checkedAt).getTime() > NETO_OPEN_TTL);
+  });
+  try {
+    for (let i = 0; i < ask.length; i += 100) {
+      const part = ask.slice(i, i + 100);
+      const d = await netoCall("GetOrder", { Filter: { OrderID: part, OutputSelector: ["OrderID", "OrderStatus"] } });
+      const got = new Map([].concat(d.Order || []).map((o) => [String(o.OrderID), String(o.OrderStatus || "")]));
+      const at = new Date();
+      // one Neto doesn't know is kept as "" (open) — asked again later
+      const ops = part.map((id) => ({ updateOne: { filter: { _id: id }, update: { $set: { status: got.get(id) || "", checkedAt: at } }, upsert: true } }));
+      await col.bulkWrite(ops, { ordered: false });
+      for (const id of part) statuses.set(id, got.get(id) || "");
+    }
+    return { statuses, checked: true };
+  } catch (e) {
+    console.error("Exyon accessories — Neto order status:", e.message);
+    return { statuses, checked: false };
+  }
+}
+async function rememberNetoStatus(orderId, status) {
+  const db = await connectToDatabase();
+  await db.collection(NETO_STATUS).updateOne({ _id: orderId }, { $set: { status, checkedAt: new Date() } }, { upsert: true });
+}
+
 // ── Pick lists (our records) ────────────────────────────────────────────
 // One document per day (Melbourne date, like the packing lists), holding a
 // snapshot of each order added that day: its items, our item for each SKU,
@@ -221,16 +268,17 @@ async function pickLists() {
   }
   return col;
 }
-// orderId → { day, tracking } of the pick list entry it is on (tracking set
-// once the order is processed on the Dispatch page)
+// orderId → { day, tracking, dispatch } of the pick list entry it is on
+// (tracking set once the order is processed on the Dispatch page; dispatch
+// once the list's dispatch is confirmed — dispatched / held / failed)
 async function pickEntriesOf(orderIds) {
   const out = new Map();
   if (!orderIds.length) return out;
   try {
     const col = await pickLists();
-    const docs = await col.find({ "orders.orderId": { $in: orderIds }, ...LIVE_LIST }, { projection: { day: 1, "orders.orderId": 1, "orders.tracking": 1 } }).toArray();
+    const docs = await col.find({ "orders.orderId": { $in: orderIds }, ...LIVE_LIST }, { projection: { day: 1, "orders.orderId": 1, "orders.tracking": 1, "orders.dispatch": 1 } }).toArray();
     const wanted = new Set(orderIds);
-    for (const d of docs) for (const o of d.orders || []) if (wanted.has(o.orderId)) out.set(o.orderId, { day: d.day, tracking: o.tracking || "" });
+    for (const d of docs) for (const o of d.orders || []) if (wanted.has(o.orderId)) out.set(o.orderId, { day: d.day, tracking: o.tracking || "", dispatch: o.dispatch || null });
   } catch (e) {
     console.error("Exyon pick lists — days:", e.message);
   }
@@ -285,11 +333,17 @@ function pickLinesOf(list) {
     || a.location.localeCompare(b.location, undefined, { numeric: true })
     || nameOf(a).localeCompare(nameOf(b)));
 }
+const dispatchStatusOf = (o) => (o && o.dispatch && o.dispatch.status) || "";
 function pickSummaryOf(list) {
   const orders = list.orders || [];
   const multi = orders.filter((o) => o.multi);
   return {
     orders: orders.length,
+    // Confirm dispatch: shipped (pushed to Neto, or Neto already had it) /
+    // held back with a reason / still to confirm (incl. a failed push)
+    dispatched: orders.filter((o) => dispatchStatusOf(o) === "dispatched").length,
+    held: orders.filter((o) => dispatchStatusOf(o) === "held").length,
+    toConfirm: orders.filter((o) => !["dispatched", "held"].includes(dispatchStatusOf(o))).length,
     singleOrders: orders.length - multi.length,
     multiOrders: multi.length,
     units: orders.reduce((t, o) => t + unitsOf(o), 0),
@@ -339,6 +393,11 @@ router.post("/pick-lists/:day/remove", PICK_EDIT, async function (req, res) {
     const col = await pickLists();
     const now = new Date();
     const by = actor(req);
+    // a dispatched order stays — its record of what went to Neto with it
+    const on = await col.findOne({ day: req.params.day, ...LIVE_LIST }, { projection: { orders: { $elemMatch: { orderId } } } });
+    if (on && on.orders && dispatchStatusOf(on.orders[0]) === "dispatched") {
+      return res.status(400).json({ success: false, message: `${orderId} is already dispatched — it stays on the list` });
+    }
     const r = await col.updateOne(
       { day: req.params.day, "orders.orderId": orderId },
       { $pull: { orders: { orderId } }, $set: { updatedAt: now, updatedBy: by }, $push: { history: { at: now, by, action: "removed", orderId } } },
@@ -435,6 +494,143 @@ router.post("/pick-lists/today/process", PICK_EDIT, async function (req, res) {
   }
 });
 
+// Confirm dispatch (user 2026-10-20): every order on a day's list is taken to
+// be picked and shipped that day — the warehouse confirms it, and each order
+// is either
+//   dispatched — pushed to Neto as Dispatched: each line's tracking number
+//                (the label scanned when it was processed), carrier
+//                "Australia Post" (on every dispatched line in Neto,
+//                2026-10-20), QuantityShipped = its quantity; NO customer
+//                email (user). One Neto already has as Dispatched is just
+//                recorded, not pushed again.
+//   held       — not shipped (insufficient stock…): stays on the list,
+//                flagged with its reason (user), until dispatched or taken off.
+// An order with no tracking number can't be dispatched (user): scan one —
+// sent here as `tracking` — or hold it. One Neto call per order, each result
+// saved as it comes; a push that fails is kept as "failed" to try again.
+//   POST /pick-lists/:day/dispatch
+//     { orders: [{ orderId, dispatch: true, tracking? } | { orderId, dispatch: false, reason, note? }], dryRun? }
+//     → { results: [{ orderId, outcome: dispatched | already | held | failed | dry-run, message?, payload? }] }
+// dryRun: nothing saved, nothing sent — the Neto request each order would get.
+const HOLD_REASONS = ["Insufficient stock", "Damaged item", "Address issue", "Customer cancelled", "Other"];
+const NETO_SHIPPING_METHOD = "Australia Post";
+const confirming = new Set(); // days being confirmed right now (one at a time)
+router.post("/pick-lists/:day/dispatch", PICK_EDIT, async function (req, res) {
+  const bad = (message) => res.status(400).json({ success: false, message });
+  const day = req.params.day;
+  if (!DAY_RE.test(day)) return bad("Bad day");
+  const dryRun = !!(req.body && req.body.dryRun);
+  if (!dryRun && confirming.has(day)) return res.status(409).json({ success: false, message: "This list is being confirmed by someone else right now — try again in a moment" });
+  if (!dryRun) confirming.add(day);
+  try {
+    const col = await pickLists();
+    const list = await col.findOne({ day, ...LIVE_LIST }, { projection: { orders: 1 } });
+    if (!list) return res.status(404).json({ success: false, message: "No pick list for that day" });
+    const onList = new Map((list.orders || []).map((o) => [o.orderId, o]));
+
+    const asked = Array.isArray(req.body && req.body.orders) ? req.body.orders : [];
+    const plan = [];
+    const results = [];
+    for (const x of asked) {
+      const orderId = String((x && x.orderId) || "").trim();
+      if (!orderId) continue;
+      const entry = onList.get(orderId);
+      if (!entry) return bad(`${orderId} is not on this list`);
+      if (plan.some((p) => p.orderId === orderId)) return bad(`${orderId} is in the request twice`);
+      if (dispatchStatusOf(entry) === "dispatched") { results.push({ orderId, outcome: "already", message: "Already dispatched" }); continue; }
+      if (x.dispatch === true) {
+        const tracking = String(x.tracking || entry.tracking || "").replace(/\s+/g, "");
+        if (!TRACKING_RE.test(tracking)) return bad(`${orderId} has no tracking number — scan its label, or hold it back with a reason`);
+        plan.push({ orderId, entry, dispatch: true, tracking });
+      } else if (x.dispatch === false) {
+        const reason = String(x.reason || "").trim();
+        if (!HOLD_REASONS.includes(reason)) return bad(`${orderId}: pick why it isn't dispatched`);
+        plan.push({ orderId, entry, dispatch: false, reason, note: String(x.note || "").trim().slice(0, 300) });
+      }
+    }
+    if (!plan.length && !results.length) return bad("Nothing to confirm");
+
+    // Neto: each order's status and lines, before pushing anything
+    const sendIds = plan.filter((p) => p.dispatch).map((p) => p.orderId);
+    const neto = new Map();
+    for (let i = 0; i < sendIds.length; i += 100) {
+      const d = await netoCall("GetOrder", { Filter: { OrderID: sendIds.slice(i, i + 100), OutputSelector: ["OrderID", "OrderStatus", "OrderLine", "OrderLine.SKU", "OrderLine.Quantity", "OrderLine.ShippingTracking"] } });
+      for (const o of [].concat(d.Order || [])) neto.set(String(o.OrderID), o);
+    }
+
+    const by = actor(req);
+    const save = async (p, dispatch, extra = {}) => {
+      if (dryRun) return;
+      const at = new Date();
+      await col.updateOne(
+        { day, "orders.orderId": p.orderId },
+        {
+          $set: { "orders.$.dispatch": { ...dispatch, at, by }, ...extra, updatedAt: at, updatedBy: by },
+          $push: { history: { at, by, action: `dispatch:${dispatch.status}`, orderId: p.orderId, ...(dispatch.reason ? { reason: dispatch.reason } : {}), ...(dispatch.error ? { error: dispatch.error } : {}) } },
+        },
+      );
+    };
+    for (const p of plan) {
+      if (!p.dispatch) {
+        await save(p, { status: "held", reason: p.reason, note: p.note });
+        results.push({ orderId: p.orderId, outcome: dryRun ? "dry-run" : "held", message: p.reason });
+        continue;
+      }
+      // a tracking number scanned in the confirm popup lands on the entry too
+      const trackingSet = p.tracking !== (p.entry.tracking || "")
+        ? { "orders.$.tracking": p.tracking, "orders.$.processedAt": new Date(), "orders.$.processedBy": by } : {};
+      const n = neto.get(p.orderId);
+      if (!n) {
+        await save(p, { status: "failed", error: "Neto has no such order" }, trackingSet);
+        results.push({ orderId: p.orderId, outcome: "failed", message: "Neto has no such order" });
+        continue;
+      }
+      const status = String(n.OrderStatus || "");
+      if (status === "Dispatched") {
+        const netoTracking = [...new Set([].concat(n.OrderLine || []).map((l) => String(l.ShippingTracking || "").trim()).filter(Boolean))].join(", ");
+        await save(p, { status: "dispatched", neto: "already", netoTracking }, trackingSet);
+        await rememberNetoStatus(p.orderId, "Dispatched").catch(() => {});
+        results.push({ orderId: p.orderId, outcome: "already", message: "Neto already had it as Dispatched" });
+        continue;
+      }
+      if (status === "Cancelled") {
+        await save(p, { status: "failed", error: "Cancelled in Neto" }, trackingSet);
+        results.push({ orderId: p.orderId, outcome: "failed", message: "Cancelled in Neto" });
+        continue;
+      }
+      const lines = [].concat(n.OrderLine || []).filter((l) => String(l.SKU || "").trim());
+      const payload = {
+        Order: [{
+          OrderID: p.orderId,
+          OrderStatus: "Dispatched",
+          OrderLine: lines.map((l) => ({
+            SKU: String(l.SKU).trim(),
+            QuantityShipped: Number(l.Quantity) || 0,
+            TrackingDetails: { ShippingMethod: NETO_SHIPPING_METHOD, TrackingNumber: p.tracking },
+          })),
+        }],
+      };
+      if (dryRun) { results.push({ orderId: p.orderId, outcome: "dry-run", message: `Neto ${status || "?"} → Dispatched`, payload }); continue; }
+      try {
+        const r = await netoCall("UpdateOrder", payload);
+        const warning = r.Ack === "Warning" && r.Messages ? JSON.stringify(r.Messages).slice(0, 300) : "";
+        await save(p, { status: "dispatched", neto: "pushed", tracking: p.tracking, ...(warning ? { warning } : {}) }, trackingSet);
+        await rememberNetoStatus(p.orderId, "Dispatched").catch(() => {});
+        results.push({ orderId: p.orderId, outcome: "dispatched", ...(warning ? { message: warning } : {}) });
+      } catch (e) {
+        await save(p, { status: "failed", error: String(e.message || e).slice(0, 300) }, trackingSet);
+        results.push({ orderId: p.orderId, outcome: "failed", message: e.message });
+      }
+    }
+    return res.json({ success: true, dryRun, results });
+  } catch (error) {
+    console.error("Exyon pick list dispatch error:", error);
+    return res.status(502).json({ success: false, message: error.message || "Failed to confirm the dispatch" });
+  } finally {
+    if (!dryRun) confirming.delete(day);
+  }
+});
+
 // Shipping labels (user 2026-10-08), one per order: the delivery address and
 // phone from Neto (GetOrder — Exyon's table has no address), the items and
 // the tracking number from the order's pick list entry.
@@ -514,6 +710,10 @@ router.get("/dispatch", VIEW, async function (req, res) {
       .filter(([v]) => v).map(([value, n]) => ({ value, n })).sort((a, b) => b.n - a.n);
 
     let orders = await openOrders({ channel: req.query.channel, status: req.query.status });
+    // what Neto already dispatched / cancelled drops out (user 2026-10-20)
+    const neto = await netoStatusesOf(orders.map((o) => o.orderId));
+    const netoDone = orders.filter((o) => NETO_FINAL.includes(neto.statuses.get(o.orderId))).length;
+    orders = orders.filter((o) => !NETO_FINAL.includes(neto.statuses.get(o.orderId)));
     const q = String(req.query.q || "").trim().toLowerCase();
     if (q) {
       orders = orders.filter((o) => [o.orderId, o.customerName, ...o.items.flatMap((it) => [it.sku, it.productName])]
@@ -528,12 +728,15 @@ router.get("/dispatch", VIEW, async function (req, res) {
     //   multiLine — multi-line orders, one by one
     // and onPickList — the orders already on a pick list (processed or not)
     const entry = await pickEntriesOf(orders.map((o) => o.orderId));
-    // envelope: the size the order ships in, from its items (user 2026-10-20)
+    // dispatched from a pick list = done, whatever Neto's cached answer says
+    orders = orders.filter((o) => dispatchStatusOf(entry.get(o.orderId)) !== "dispatched");
+    // envelope: the size the order ships in, from its items (user 2026-10-20);
+    // dispatch: held back / a failed push, from its pick list
     const brief = (o) => {
       const e = entry.get(o.orderId) || {};
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
         status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, tracking: e.tracking || "",
-        envelope: envelopeOf(o.items) };
+        dispatch: e.dispatch || null, envelope: envelopeOf(o.items) };
     };
     const sku = new Map();
     const multiLine = [];
@@ -573,6 +776,10 @@ router.get("/dispatch", VIEW, async function (req, res) {
         multiLine: multiLine.length,
         onPickList: onPickList.length,
         processed: onPickList.filter((o) => o.tracking).length,
+        // left out because Neto already has them as Dispatched / Cancelled;
+        // netoChecked false = Neto didn't answer (cached answers only)
+        netoDone,
+        netoChecked: neto.checked,
       },
       channels: tally("channel"),
       statuses: tally("status"),

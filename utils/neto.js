@@ -1,6 +1,7 @@
 // Neto (Maropost) store API — where the Exyon accessory orders come from
 // (www.toptechdeals.com.au). Configured via NETOAPI_URL + NETOAPI_KEY in the
-// env. Read-only here.
+// env. Mostly reads; the one write is UpdateOrder → Dispatched, from Confirm
+// dispatch on the Exyon pick lists (routes/exyonAccessoryRoutes, 2026-10-20).
 //
 // Each Neto product carries our Zoho item id in its custom field Misc38
 // ("zoho_id", checked 2026-10-08), which is how a Neto SKU maps to our item.
