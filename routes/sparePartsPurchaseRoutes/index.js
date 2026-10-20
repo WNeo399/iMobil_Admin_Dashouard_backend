@@ -55,6 +55,8 @@ const { refreshToken } = require("../../utils/zohoRequest");
 const zohoItem = require("../../utils/zohoNewItem");
 // "Create in Zoho" (2026-10-16): the pricing formula for a typed cost, and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
+// a product created here goes into the register at once
+const { addCreatedItem } = require("../../utils/stockItemsSync");
 const { loadCategories, findCategory } = require("../websiteRoutes/categories");
 const { ZOHO_CLASSIFICATIONS, qualitiesByClassification } = require("../../utils/listingQualities");
 
@@ -783,6 +785,12 @@ router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, asyn
       },
     );
     claimed = false;
+    // into the register at once — Add Item's search and the pages read it (2026-10-20)
+    await addCreatedItem(db, {
+      itemId, sku: finalSku, name: finalName, quality, purchasePrice: cost, classification, subClassification,
+      deviceBrand, deviceSeries, compatibleModels, imageId: (photos && photos.imageId) || null,
+      zohoCategoryId: filed.error ? "" : filed.id, zohoCategory: filed.error ? "" : filed.name, prices: prices ? prices.set : {},
+    });
     return res.json({ success: true, item: { itemId, sku: finalSku, name: finalName }, photos, prices, category: filed });
   } catch (error) {
     next(error);

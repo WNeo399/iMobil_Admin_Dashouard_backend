@@ -50,6 +50,7 @@ const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
 // an item ticked "TE" in Zoho (SQT use only) is no product of this page
 const { TE_SCOPE } = require("../../utils/stockItems");
+const { addCreatedItem } = require("../../utils/stockItemsSync");
 const { refreshToken, handleZohoInventoryRequest, handleZohoInventoryPutRequest } = require("../../utils/zohoRequest");
 const { imageUrlFromId, imageIdOf } = require("../../utils/productImage");
 const { fetchItemDetails } = require("../../utils/zohoStock");
@@ -1119,6 +1120,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
       sku = await nextFreeSku(db);
     }
 
+    const deviceSeries = await deviceSeriesFor(db, model, compatibleModels);
     const z = await createZohoItem({
       name, sku, rate, quality,
       purchaseRate: cost,
@@ -1126,7 +1128,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
       classification: part.classification,
       subClassification: part.subClassification,
       deviceBrand: cfg.deviceBrand,
-      deviceSeries: await deviceSeriesFor(db, model, compatibleModels),
+      deviceSeries,
       compatibleModel,
     });
     if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
@@ -1171,6 +1173,13 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     const others = await db.collection(MODELS).find({ brand: model.brand, _id: { $ne: _id } }, { projection: { compatibleModel: 1, model: 1, aliases: 1 } }).toArray();
     const alsoIds = others.filter((o) => [o.compatibleModel, o.model, ...(o.aliases || [])].map(modelKey).some((k) => k && keys.includes(k))).map((o) => o._id);
     await db.collection(MODELS).updateMany({ _id: { $in: [_id, ...alsoIds] } }, { $push: { created }, $set: { updatedAt: new Date() } });
+    // into the register at once — Add Item's search and the pages read it (2026-10-20)
+    await addCreatedItem(db, {
+      itemId: created.itemId, sku: created.sku, name: created.name, quality, purchasePrice: cost,
+      classification: part.classification, subClassification: part.subClassification || "",
+      deviceBrand: cfg.deviceBrand, deviceSeries, compatibleModels, imageId: created.imageId,
+      zohoCategoryId: created.categoryId || "", zohoCategory: created.categoryName || "", prices: created.prices,
+    });
     if (draft) {
       await db.collection(DRAFTS).updateOne(
         { _id: draft._id },

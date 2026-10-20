@@ -346,4 +346,98 @@ async function getStockItemsSyncState(db) {
   };
 }
 
-module.exports = { runStockItemsSync, getStockItemsSyncState, markFullRefresh };
+// An item just created from the dashboard (Listing → Create, Purchase Order
+// → Create in Zoho; user 2026-10-20: "I added a new product … when I
+// searched for it it doesn't come up") goes into the register at once:
+// Add Item's search and the pages read the register, which otherwise only
+// learns of the item at the next refresh. Shaped like a new row of the
+// hourly pass above, from what the create sent Zoho — no stock, no sales;
+// the next refresh fills in the rest. Inserts only: a row already there
+// (a refresh got there first) is left alone. Never throws.
+//   it: { itemId, sku, name, classification, subClassification, quality,
+//         deviceBrand, deviceSeries, compatibleModels, purchasePrice,
+//         imageId, zohoCategoryId, zohoCategory, prices: { platinum, vip, svip, wholesale } }
+async function addCreatedItem(db, it) {
+  try {
+    const now = new Date();
+    const sku = String(it.sku || "").trim();
+    const itemId = String(it.itemId || "");
+    if (!itemId || !sku) return { added: false };
+    const po = (await openPurchasesBySku(db)).get(skuKey(sku));
+    const openPoQty = po ? po.qty : 0;
+    const prices = it.prices || {};
+    const rate = (k) => (prices[k] == null ? null : Number(prices[k]));
+    const row = {
+      itemId,
+      sku,
+      name: String(it.name || ""),
+      location: "",
+      zohoBrand: "",
+      purchasePrice: Number(it.purchasePrice) || 0,
+      imageId: it.imageId || null,
+      showInStore: false,
+      zohoCategoryId: String(it.zohoCategoryId || ""),
+      zohoCategory: String(it.zohoCategory || ""),
+      classification: it.classification || "",
+      subClassification: it.subClassification || "",
+      quality: it.quality || "",
+      deviceBrand: it.deviceBrand || "",
+      deviceSeries: it.deviceSeries || "",
+      compatibleModels: Array.isArray(it.compatibleModels) ? it.compatibleModels : [],
+      te: false,
+      reorderLevel: 0,
+      brand: null,
+      category: null,
+      inCatalogue: false,
+      archived: isNoiseName(it.name),
+      archivedReason: isNoiseName(it.name) ? "criteria" : null,
+      active: true,
+      inactiveAt: null,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      stockAt: now,
+      metricsAt: now,
+      scope: ACCESSORY_CLASSIFICATIONS.has(it.classification) ? "accessory" : "parts",
+      preferVendor: "",
+      collections: [],
+      accessoryCollections: [],
+      groups: [],
+      pricePlatinum: rate("platinum"),
+      priceVip: rate("vip"),
+      priceSvip: rate("svip"),
+      priceWholesale: rate("wholesale"),
+      priceMissing: ["platinum", "vip", "svip", "wholesale"].some((k) => rate(k) == null),
+      pricePlaceholder: false,
+      priceBelowCost: false,
+      priceOrderBroken: false,
+      priceRule: null,
+      priceExpected: null,
+      priceRuleBroken: false,
+      addedBy: "dashboard create",
+      metrics: {
+        available: 0,
+        accountingStock: 0,
+        stockOnHand: 0,
+        committed: 0,
+        openPoQty,
+        openPoLines: po ? po.lines : 0,
+        earliestPoDate: po ? po.earliest : null,
+        ...stockFlags({ available: 0, units30: 0, openPoQty }),
+        units7: emptySaleUnits(),
+        units14: emptySaleUnits(),
+        units30: emptySaleUnits(),
+        units90: emptySaleUnits(),
+        lastSaleAt: null,
+        daysSinceSale: null,
+        stale: true,
+      },
+    };
+    const r = await db.collection(ITEMS).updateOne({ itemId }, { $setOnInsert: row }, { upsert: true });
+    return { added: !!r.upsertedCount };
+  } catch (e) {
+    console.error("addCreatedItem:", e && e.message);
+    return { added: false, error: e && e.message };
+  }
+}
+
+module.exports = { runStockItemsSync, getStockItemsSyncState, markFullRefresh, addCreatedItem };
