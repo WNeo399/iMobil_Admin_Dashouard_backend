@@ -127,7 +127,7 @@ function cleanQuality(v) {
   return { quality: q };
 }
 
-// The cost price as typed (2026-10-16 — required to create, it goes to Zoho
+// The cost price as typed (2026-10-16; optional since 2026-10-20 — it goes to Zoho
 // as the purchase rate): { cost } (null when blank) or { error }.
 function readCost(v) {
   if (v === undefined || v === null || v === "") return { cost: null };

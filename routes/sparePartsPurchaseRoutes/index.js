@@ -695,11 +695,11 @@ router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, asyn
     if (!Number.isFinite(rate) || rate < 0) return bad(res, "Selling price must be 0 or more");
     const { rates: listRates, error: priceError } = zohoItem.parsePriceLists(b.prices);
     if (priceError) return bad(res, priceError);
-    // the cost price (→ Zoho purchase rate) and the store category, both
-    // required as on New Products (user ask 2026-10-16)
+    // the cost price (→ Zoho purchase rate; optional since 2026-10-20 —
+    // blank leaves it 0, as on Listing) and the store category (required,
+    // user ask 2026-10-16)
     const { cost, error: costError } = zohoItem.readCost(b.cost);
     if (costError) return bad(res, costError);
-    if (cost === null) return bad(res, "Enter the cost price");
     const categoryId = str(b.categoryId);
     if (!categoryId) return bad(res, "Pick the store category");
     if (!/^\d{1,30}$/.test(categoryId)) return bad(res, "Bad category");

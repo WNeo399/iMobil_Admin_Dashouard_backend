@@ -1091,9 +1091,11 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     // the price lists given (blank = left unset), checked before creating
     const { rates: listRates, error: priceError } = parsePriceLists(b.prices);
     if (priceError) return bad(res, priceError);
+    // the cost price — optional since 2026-10-20 ("we might not have the
+    // cost price yet"): blank leaves Zoho's purchase price at 0, set later
+    // on the Edit dialog or Price Monitoring
     const { cost, error: costError } = readCost(b.cost);
     if (costError) return bad(res, costError);
-    if (cost === null) return bad(res, "Enter the cost price");
     // the store category is the model's own link (2026-10-16), never picked per item
     const categoryId = str(model.categoryId);
     if (!categoryId) return bad(res, `Link ${model.model} to a store category first`);
