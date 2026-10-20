@@ -170,6 +170,10 @@ const ROLE_PERMISSIONS = {
     "refurb:stock:manage",
     "refurb:supply:view",
     "refurb:supply:manage",
+    // Pending Stock 待入库 (2026-10-20): their devices listed before Blackbelt / Stock,
+    // scoped to their stock source like the Stock page
+    "refurb:precheck:view",
+    "refurb:precheck:manage",
   ],
   // Consignment Shop — scoped to the shop on the user record (consignShopId).
   [ROLES.CONSIGNMENT_SHOP]: [

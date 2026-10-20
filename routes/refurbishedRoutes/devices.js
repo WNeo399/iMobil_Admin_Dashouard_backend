@@ -719,6 +719,14 @@ router.post("/", MANAGE, async (req, res) => {
       createdBy: (req.user && req.user.username) || null,
     };
     const r = await db.collection(DEVICES).insertOne(doc);
+    // the supplier's Pending Stock record of this IMEI (or serial) is now
+    // "Added to Stock" — from Pending Stock's own action or typed in here
+    // (user 2026-10-20); same shelf only, a failure never fails the add
+    const codes = [...new Set([imei, String(doc.serialNumber || "").trim().toUpperCase()].filter(Boolean))];
+    await db.collection("refurb_precheck").updateMany(
+      { stockSource: doc.stockSource, imei: { $in: codes }, addedToStock: { $exists: false } },
+      { $set: { addedToStock: { at: now, by: doc.createdBy, deviceId: r.insertedId } } },
+    ).catch((err) => console.error("Pre-check mark error:", err && err.message));
     return res.json({ success: true, id: r.insertedId, device: doc });
   } catch (e) {
     console.error("Refurb device create error:", e);

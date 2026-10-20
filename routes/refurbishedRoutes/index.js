@@ -24,6 +24,7 @@ router.use("/customers", require("./customers"));
 router.use("/repairers", require("./repairers"));
 // A phone supplier's own upstream suppliers (scoped to their stock source).
 router.use("/suppliers", require("./suppliers"));
+router.use("/precheck", require("./precheck"));     // a phone supplier's devices before Blackbelt / Stock (2026-10-20)
 // Supplier shipments to iMobile — creates the matching incoming record.
 router.use("/supply", require("./supplyBatches"));
 router.use("/transfers", require("./transfers"));   // the records left by bulk shelf moves (2026-10-09)
