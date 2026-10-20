@@ -41,6 +41,9 @@ const ROLES = {
   // Exyon's admin (2026-10-20) — Exyon Accessories, SQT (admin side),
   // Blackbelt and ExEngine.
   EXYON_ADMIN: "exyon-admin",
+  // Exyon's warehouse staff (2026-10-21) — the Exyon Accessories menu only,
+  // for now.
+  EXYON_WAREHOUSE: "exyon-warehouse",
 };
 
 const ROLE_LABELS = {
@@ -62,6 +65,7 @@ const ROLE_LABELS = {
   [ROLES.IMOBILE_FRONT_DESK]: "iMobile Front Desk",
   [ROLES.EXYON_OPERATION]: "Exyon Operation",
   [ROLES.EXYON_ADMIN]: "Exyon Admin",
+  [ROLES.EXYON_WAREHOUSE]: "Exyon Warehouse",
 };
 
 // UI grouping for the System → Users role-tree panel. Roles inside the
@@ -102,6 +106,7 @@ const ROLE_GROUP_OF = {
   [ROLES.IMOBILE_FRONT_DESK]: ROLE_GROUPS.IMOBILE,
   [ROLES.EXYON_OPERATION]: ROLE_GROUPS.EXYON,
   [ROLES.EXYON_ADMIN]: ROLE_GROUPS.EXYON,
+  [ROLES.EXYON_WAREHOUSE]: ROLE_GROUPS.EXYON,
 };
 
 // Shop-side case actions shared by both shop roles. The two roles differ only in
@@ -300,8 +305,16 @@ const ROLE_PERMISSIONS = {
   ],
   // Exyon Operation (2026-10-08): the Exyon Accessories menu — Orders,
   // Dispatch (processing orders: tracking numbers, shipping labels) and Pick
-  // Lists. Only Admin (*:*:*) and this role hold exyon:accessory:*.
+  // Lists. Only Admin (*:*:*), Exyon Admin (exyon:*:*), this role and
+  // Exyon Warehouse hold exyon:accessory:*.
   [ROLES.EXYON_OPERATION]: [
+    "exyon:accessory:view",
+    "exyon:accessory:picklist",
+  ],
+  // Exyon Warehouse (2026-10-21, user: "only have access to Exyon Accessories
+  // for now"): the same as Exyon Operation — Orders, Dispatch (process,
+  // tracking, labels), Pick Lists incl. Confirm dispatch.
+  [ROLES.EXYON_WAREHOUSE]: [
     "exyon:accessory:view",
     "exyon:accessory:picklist",
   ],

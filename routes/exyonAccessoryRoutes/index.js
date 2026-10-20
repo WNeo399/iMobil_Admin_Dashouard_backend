@@ -27,8 +27,9 @@ const { imageUrlFromId } = require("../../utils/productImage");
 const { zohoIdsForSkus, netoCall } = require("../../utils/neto");
 const { envelopeOf } = require("../../utils/exyonEnvelope");
 
-// Admin (*:*:*) and the Exyon Operation role (2026-10-08) — nobody else
-// holds exyon:accessory:* (constants/roles.js).
+// Admin (*:*:*) and the Exyon roles — Operation (2026-10-08), Admin
+// (2026-10-20), Warehouse (2026-10-21); nobody else holds exyon:accessory:*
+// (constants/roles.js).
 const VIEW = requirePermission("exyon:accessory:view");
 // Processing orders onto a pick list / taking one off.
 const PICK_EDIT = requirePermission("exyon:accessory:picklist");
