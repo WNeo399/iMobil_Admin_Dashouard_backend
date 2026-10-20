@@ -229,6 +229,10 @@ function itemCatalogueFields(item) {
       .split(/\s*;\s*/)
       .map((s) => s.trim())
       .filter(Boolean),
+    // The "TE" checkbox (2026-10-20): an item made for SQT (Tech Elite)
+    // use only — kept out of Stock Monitoring and iMobile Listing (its
+    // scope becomes TE_SCOPE, see utils/stockItems).
+    te: /^(true|1|yes)$/i.test(itemCustomField(item, "TE")),
   };
 }
 

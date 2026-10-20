@@ -35,7 +35,7 @@ const { getViewData } = require("../utils/zohoRequest");
 const { isNoiseName, ARCHIVE_COLLECTION } = require("../utils/stockUniverse");
 // Zoho's id for the item's main image; only the id is stored, routes build
 // the URL when a page reads it. null = the item has no image.
-const { imageIdOf } = require("../utils/productImage");
+const { mainImageId } = require("../utils/productImage");
 const { evaluatePriceRule } = require("../utils/priceRules");
 // A collection is a filter over the register (2026-09-22): its members are
 // found with a Mongo query, so the tags are stamped AFTER the rows are
@@ -46,6 +46,7 @@ const {
   ITEMS,
   ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
+  TE_SCOPE,
   openPurchasesBySku,
   skuKey,
   num,
@@ -159,6 +160,12 @@ async function main() {
     (await db.collection(ARCHIVE_COLLECTION).find({}).toArray()).map((d) => [String(d.itemId), d.mode]),
   );
   log(`  overrides:  ${overrideByItem.size} manual archive/keep entries`);
+  // Main photos picked on Listing → Edit (see utils/productImage mainImageId).
+  const imagePickByItem = new Map(
+    (await db.collection(ITEMS).find({ imagePick: { $exists: true } }, { projection: { itemId: 1, imagePick: 1 } }).toArray())
+      .map((d) => [String(d.itemId), d.imagePick]),
+  );
+  const staleImagePicks = [];
 
   // ── 2. live stock ─────────────────────────────────────────────────
   const details = await stage("stock", () => fetchItemDetails(itemIds));
@@ -358,11 +365,13 @@ async function main() {
       // accessory (accessory-collection membership used to as well, but
       // a collection is now a filter over these very rows, and a filter
       // cannot decide the scope it is filtered by); the rest is parts.
-      scope:
-        ACCESSORY_CLASSIFICATIONS.has(classification) ||
+      // An item ticked "TE" in Zoho (SQT use only) is neither.
+      scope: cf.te ? TE_SCOPE
+        : ACCESSORY_CLASSIFICATIONS.has(classification) ||
         ACCESSORY_BRANDS.has(String(a.Brand || "").trim())
           ? "accessory"
           : "parts",
+      te: cf.te,
       classification,
       subClassification: cf.subClassification,
       quality: cf.quality,
@@ -389,7 +398,11 @@ async function main() {
       brand: product && product.brand ? product.brand.name : null,
       category: product && product.category ? product.category.name : null,
       inCatalogue: !!product,
-      imageId: imageIdOf(d),
+      imageId: (() => {
+        const m = mainImageId(d, imagePickByItem.get(id));
+        if (m.stale) staleImagePicks.push(id);
+        return m.imageId;
+      })(),
       // From the items list: shown in the online store, and Zoho's own
       // item category (accessories are organised by it; parts are not).
       showInStore: !!(listById.get(id) || {}).showInStore,
@@ -523,6 +536,8 @@ async function main() {
     const r = await items.bulkWrite(ops.slice(i, i + 1000), { ordered: false });
     inserted += r.upsertedCount || 0;
   }
+  // a pick Zoho has moved on from (its main image changed there) goes
+  if (staleImagePicks.length) await items.updateMany({ itemId: { $in: staleImagePicks } }, { $unset: { imagePick: "" } });
   const gone = await items.updateMany(
     { active: true, lastSeenAt: { $lt: finishedAt } },
     { $set: { active: false, inactiveAt: finishedAt } },

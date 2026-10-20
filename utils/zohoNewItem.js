@@ -89,7 +89,7 @@ function parsePriceLists(asked) {
 // after the Quality clean-up). A new one may be typed in the dialogs.
 async function qualityOptions(db) {
   const rows = await db.collection("imb_stock_items").aggregate([
-    { $match: { active: { $ne: false }, quality: { $nin: [null, ""] } } },
+    { $match: { active: { $ne: false }, scope: { $ne: "te" }, quality: { $nin: [null, ""] } } },
     { $group: { _id: "$quality", n: { $sum: 1 } } },
     { $sort: { n: -1, _id: 1 } },
   ]).toArray();
@@ -244,6 +244,22 @@ async function uploadItemPhotos(itemId, files, { primary = true } = {}) {
   }
 }
 
+// Put an item's photos in this order (document ids, every one the item
+// has). Zoho's item image follows the first (tested 2026-10-20 — the
+// "image_name" moves at once). { ok } or { error }.
+async function reorderItemPhotos(itemId, documentIds) {
+  try {
+    const r = await handleZohoInventoryPostRequest(
+      `${ZOHO}/items/${encodeURIComponent(itemId)}/images/reorder?organization_id=${ORG}`,
+      { documents: documentIds.map((document_id, i) => ({ document_id: String(document_id), order: i + 1 })) },
+    );
+    if (r && r.code === 0) return { ok: true };
+    return { error: (r && (r.message || (r.error && r.error.message))) || "Zoho did not reorder the photos" };
+  } catch (e) {
+    return { error: (e && e.message) || "Zoho did not reorder the photos" };
+  }
+}
+
 // Photos stored in S3 (public URLs — a draft's, a purchase line's), read back
 // as upload files (re-encoded JPEGs). { files, errors: [ids] }.
 async function readImagesFromUrls(images) {
@@ -277,5 +293,6 @@ module.exports = {
   setItemCategory,
   setPriceLists,
   uploadItemPhotos,
+  reorderItemPhotos,
   readImagesFromUrls,
 };

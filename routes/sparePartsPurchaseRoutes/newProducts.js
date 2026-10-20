@@ -31,7 +31,7 @@
 //   POST /new-products/items                create one Zoho item for a model + part (+ photos, price lists; or from a draft)
 //   GET  /new-products/items/:itemId        an existing item as Zoho has it (the Edit item dialog)
 //   PUT  /new-products/items/:itemId        change it: name, quality, classification, category, Compatible Models, selling price (Zoho + register)
-//   POST /new-products/items/:itemId/photos add photos to it
+//   POST /new-products/items/:itemId/photos its photos: new ones added, all put in order (the first = main image)
 //   POST /new-products/drafts               save the create dialog as a draft (not in Zoho)
 //   GET  /new-products/drafts/:id           one draft
 //   PUT  /new-products/drafts/:id           change a draft (fields, photos and their order)
@@ -48,13 +48,16 @@ const { ObjectId } = require("mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
+// an item ticked "TE" in Zoho (SQT use only) is no product of this page
+const { TE_SCOPE } = require("../../utils/stockItems");
 const { refreshToken, handleZohoInventoryRequest, handleZohoInventoryPutRequest } = require("../../utils/zohoRequest");
-const { imageUrlFromId } = require("../../utils/productImage");
+const { imageUrlFromId, imageIdOf } = require("../../utils/productImage");
+const { fetchItemDetails } = require("../../utils/zohoStock");
 const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
   ORG, ZOHO, PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
-  skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, readImagesFromUrls, readCost,
+  skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, reorderItemPhotos, readImagesFromUrls, readCost,
 } = require("../../utils/zohoNewItem");
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
@@ -245,7 +248,7 @@ function createdPart(cfg, c) {
 function brandItems(db, brand) {
   const cfg = BRANDS[brand];
   return db.collection(ITEMS).find(
-    { deviceBrand: new RegExp(`^${cfg.deviceBrand}$`, "i"), active: { $ne: false } },
+    { deviceBrand: new RegExp(`^${cfg.deviceBrand}$`, "i"), active: { $ne: false }, scope: { $ne: TE_SCOPE } },
     { projection: { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, subClassification: 1, quality: 1, compatibleModels: 1, archived: 1, imageId: 1, scope: 1, "metrics.available": 1 } },
   ).toArray();
 }
@@ -257,7 +260,7 @@ async function brandsItems(db, brands) {
   if (!brands.length) return out;
   const byDevice = new Map(brands.map((b) => [BRANDS[b].deviceBrand.toLowerCase(), b]));
   const items = await db.collection(ITEMS).find(
-    { deviceBrand: { $in: brands.map((b) => new RegExp(`^${BRANDS[b].deviceBrand}$`, "i")) }, active: { $ne: false } },
+    { deviceBrand: { $in: brands.map((b) => new RegExp(`^${BRANDS[b].deviceBrand}$`, "i")) }, active: { $ne: false }, scope: { $ne: TE_SCOPE } },
     { projection: { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, subClassification: 1, quality: 1, compatibleModels: 1, archived: 1, imageId: 1, scope: 1, deviceBrand: 1, "metrics.available": 1 } },
   ).toArray();
   for (const it of items) {
@@ -720,10 +723,16 @@ const PRICE_EDIT = "zoho:stock:edit";
 const canPrice = (req) => hasPermission((req.user && req.user.permissions) || [], PRICE_EDIT);
 const cfOf = (item) => new Map((item.custom_fields || []).map((c) => [c.api_name, str(c.value)]));
 const splitList = (v) => str(v).split(/\s*;\s*/).filter(Boolean);
+// The item from Zoho: the item, null when Zoho says there is none, or a
+// thrown "unreachable" (no token, network) — told apart so a Zoho outage
+// doesn't read as a missing item.
 async function readZohoItem(itemId) {
   const r = await handleZohoInventoryRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`);
-  return (r && r.item) || null;
+  if (r && r.item) return r.item;
+  if (r && r.code !== undefined && r.code !== 0) return null;
+  throw Object.assign(new Error("Zoho can't be reached right now — try again in a minute"), { unreachable: true });
 }
+const unreachable = (res, e) => res.status(502).json({ success: false, message: e.message });
 // The Compatible Model list as sent: trimmed, single spaces, no repeats
 // (any case), no ";" (the field's separator). { models } or { error }.
 function cleanModels(raw) {
@@ -771,17 +780,17 @@ router.get("/items/:itemId", CREATE, async (req, res, next) => {
   try {
     const itemId = str(req.params.itemId);
     if (!/^\d{6,25}$/.test(itemId)) return bad(res, "Bad item");
-    const item = await readZohoItem(itemId);
+    let item;
+    try { item = await readZohoItem(itemId); } catch (e) { if (e.unreachable) return unreachable(res, e); throw e; }
     if (!item) return res.status(404).json({ success: false, message: "Zoho has no such item" });
-    const db = await connectToDatabase();
-    const reg = await db.collection(ITEMS).findOne({ itemId }, { projection: { _id: 0, imageId: 1 } });
     const cf = cfOf(item);
-    // the main image: the register's id, else the document Zoho names as the item's image
-    const docs = (item.documents || []).filter((d) => d && d.document_id);
-    const mainId = (reg && reg.imageId) || ((docs.find((d) => d.file_name === item.image_name) || {}).document_id) || null;
-    const photos = docs
-      .map((d) => ({ id: String(d.document_id), name: d.file_name || "", url: imageUrlFromId(String(d.document_id)), main: String(d.document_id) === String(mainId), order: Number(d.attachment_order) || 0 }))
-      .sort((a, b) => (b.main - a.main) || (a.order - b.order));
+    // the photos in Zoho's order — the first is the item's image (Zoho's
+    // image_name follows it; the dialog reorders them, 2026-10-20)
+    const photos = (item.documents || [])
+      .filter((d) => d && d.document_id)
+      .map((d) => ({ id: String(d.document_id), name: d.file_name || "", url: imageUrlFromId(String(d.document_id)), order: Number(d.attachment_order) || 0 }))
+      .sort((a, b) => a.order - b.order)
+      .map((p, i) => ({ ...p, main: i === 0 }));
     const out = {
       itemId,
       name: item.name || "",
@@ -854,7 +863,8 @@ router.put("/items/:itemId", CREATE, async (req, res, next) => {
     if (!Object.keys(ask).length) return bad(res, "Nothing to change");
 
     await refreshToken();
-    const item = await readZohoItem(itemId);
+    let item;
+    try { item = await readZohoItem(itemId); } catch (e) { if (e.unreachable) return unreachable(res, e); throw e; }
     if (!item) return res.status(404).json({ success: false, message: "Zoho has no such item" });
     const cf = cfOf(item);
     const now = {
@@ -955,27 +965,83 @@ router.put("/items/:itemId", CREATE, async (req, res, next) => {
 });
 
 // ── POST /new-products/items/:itemId/photos ──────────────────────────
-// Add photos to an existing item (multipart "images", up to 10; main=1 makes
-// the first of them the item's main image — otherwise the main one stays).
+// The item's photos in a new order, new ones added (user 2026-10-20: "allow
+// rearrange the order"). Multipart: "images" (new files, up to 10) and
+// `order` — JSON list of "d:<document id>" (a photo the item has) and
+// "n:<i>" (the i-th new file). Every photo the item has must be in it:
+// removing one needs Zoho's items DELETE right, which we don't hold. New
+// files go up first, then the whole list is put in order; the first is the
+// main image (Zoho's item image follows the first).
 router.post("/items/:itemId/photos", CREATE, acceptPhotos, async (req, res, next) => {
   try {
     const itemId = str(req.params.itemId);
     if (!/^\d{6,25}$/.test(itemId)) return bad(res, "Bad item");
     const files = req.files || [];
-    if (!files.length) return bad(res, "No photos");
-    const main = ["1", "true"].includes(str(req.body && req.body.main));
+    let order;
+    try { order = JSON.parse(str(req.body && req.body.order) || "[]"); } catch (e) { return bad(res, "Bad photo order"); }
+    const tokens = Array.isArray(order) ? order.map(String) : [];
+    if (!tokens.length || tokens.some((t) => !/^(d:\d{6,25}|n:\d{1,2})$/.test(t)) || new Set(tokens).size !== tokens.length) return bad(res, "Bad photo order");
+    const newAt = tokens.filter((t) => t.startsWith("n:")).map((t) => Number(t.slice(2)));
+    if (newAt.length !== files.length || newAt.some((i) => i >= files.length)) return bad(res, "The photo order doesn't match the new photos");
+
     await refreshToken();
-    const photos = await uploadItemPhotos(itemId, files, { primary: main });
-    if (photos.error) return res.status(502).json({ success: false, message: `Zoho: ${photos.error}` });
-    const db = await connectToDatabase();
-    if (photos.imageId) {
-      await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId: photos.imageId } });
-      await db.collection(MODELS).updateMany({ "created.itemId": itemId }, { $set: { "created.$[c].imageId": photos.imageId } }, { arrayFilters: [{ "c.itemId": itemId }] });
+    let item;
+    try { item = await readZohoItem(itemId); } catch (e) { if (e.unreachable) return unreachable(res, e); throw e; }
+    if (!item) return res.status(404).json({ success: false, message: "Zoho has no such item" });
+    const docsOf = (it) => ((it && it.documents) || []).filter((d) => d && d.document_id);
+    const had = docsOf(item).map((d) => String(d.document_id));
+    const listed = tokens.filter((t) => t.startsWith("d:")).map((t) => t.slice(2));
+    if (listed.some((id) => !had.includes(id)) || had.some((id) => !listed.includes(id))) {
+      return res.status(409).json({ success: false, message: "The photos changed in Zoho since the item was opened — open it again" });
     }
+
+    // the new files: up first (the item's main image stays until the
+    // reorder — unless it had none), each under a name the item doesn't
+    // have yet, so its new document is told apart from the rest
+    const newIds = [];
+    if (files.length) {
+      const taken = new Set(docsOf(item).map((d) => String(d.file_name || "").toLowerCase()));
+      const named = files.map((f, i) => {
+        const orig = String(f.originalname || `photo-${i + 1}.jpg`);
+        const dot = orig.lastIndexOf(".");
+        const [base, ext] = dot > 0 ? [orig.slice(0, dot), orig.slice(dot)] : [orig, ""];
+        let name = orig;
+        for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base} (${n})${ext}`;
+        taken.add(name.toLowerCase());
+        return { ...f, originalname: name };
+      });
+      const up = await uploadItemPhotos(itemId, named, { primary: !had.length });
+      if (up.error) return res.status(502).json({ success: false, message: `Zoho: ${up.error}` });
+      const fresh = docsOf(await readZohoItem(itemId)).filter((d) => !had.includes(String(d.document_id)));
+      for (const [i, f] of named.entries()) {
+        const d = fresh.find((x) => x.file_name === f.originalname) || fresh[i];
+        if (!d) return res.status(502).json({ success: false, message: "Zoho took the new photos but didn't list them — open the item again" });
+        newIds.push(String(d.document_id));
+      }
+    }
+
+    // then the order (only when it isn't Zoho's already: the old ones, then the new)
+    const ids = tokens.map((t) => (t.startsWith("d:") ? t.slice(2) : newIds[Number(t.slice(2))]));
+    if (ids.join(",") !== [...had, ...newIds].join(",")) {
+      const ro = await reorderItemPhotos(itemId, ids);
+      if (ro.error) return res.status(502).json({ success: false, message: `Zoho: ${ro.error}${files.length ? " (the new photos were added)" : ""}` });
+    }
+    // the main image is the first — the register's thumbnail too. Zoho's
+    // bulk record (what the refresh reads) keeps its old main image, so the
+    // pick is kept beside it (utils/productImage mainImageId).
+    const db = await connectToDatabase();
+    const imageId = ids[0];
+    const [detail] = await fetchItemDetails([itemId]).catch(() => []);
+    const zohoId = imageIdOf(detail);
+    await db.collection(ITEMS).updateOne({ itemId }, zohoId === imageId
+      ? { $set: { imageId }, $unset: { imagePick: "" } }
+      : { $set: { imageId, imagePick: { id: imageId, zohoId, at: new Date() } } });
+    await db.collection(MODELS).updateMany({ "created.itemId": itemId }, { $set: { "created.$[c].imageId": imageId } }, { arrayFilters: [{ "c.itemId": itemId }] });
     await db.collection(ITEM_EDITS).insertOne({
-      itemId, changes: { photos: { added: files.length, main } }, at: new Date(), by: actor(req),
+      itemId, sku: item.sku || "", name: item.name || "",
+      changes: { photos: { from: had, to: ids, added: newIds } }, at: new Date(), by: actor(req),
     });
-    return res.json({ success: true, uploaded: photos.uploaded, imageId: photos.imageId || null });
+    return res.json({ success: true, added: newIds.length, order: ids, imageId });
   } catch (error) {
     next(error);
   }

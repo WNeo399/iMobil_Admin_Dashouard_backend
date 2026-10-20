@@ -18,7 +18,7 @@
 // evaluated in milliseconds on every read — no Analytics call, no lag, no
 // raw criteria strings.
 
-const { ITEMS } = require("./stockItems");
+const { ITEMS, TE_SCOPE } = require("./stockItems");
 
 // type: how a value is entered and matched.
 //   text — free text, matched case-insensitively (contains / starts / is …)
@@ -175,14 +175,14 @@ function compileRows(rows) {
 // The register rows a collection holds: its rule within its own business
 // (parts or accessories; archived items only when the collection includes
 // them), plus whatever was pinned by hand — pinned items count wherever
-// they sit.
+// they sit, except a TE item (SQT use only, 2026-10-20).
 function collectionMatch(doc, scope) {
   const rows = doc && doc.filter && doc.filter.rows;
   const rule = compileRows(rows);
   const archivedCond = archiveMode(rows) === "include" ? {} : { archived: { $ne: true } };
   const pinned = ((doc && doc.products) || []).map((p) => String(p && p.itemId)).filter(Boolean);
   const ruleMatch = rule ? { scope, ...archivedCond, ...rule } : null;
-  const pinMatch = pinned.length ? { itemId: { $in: pinned } } : null;
+  const pinMatch = pinned.length ? { itemId: { $in: pinned }, scope: { $ne: TE_SCOPE } } : null;
   if (ruleMatch && pinMatch) return { active: true, $or: [ruleMatch, pinMatch] };
   if (ruleMatch) return { active: true, ...ruleMatch };
   if (pinMatch) return { active: true, ...pinMatch };

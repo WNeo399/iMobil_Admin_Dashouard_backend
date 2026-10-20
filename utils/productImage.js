@@ -20,4 +20,18 @@ function imageUrlFromId(imageId) {
   return imageId ? `${STORE_IMAGE_BASE}/image/${imageId}/400x400` : null;
 }
 
-module.exports = { imageIdOf, imageUrlFromId };
+// The main image for the register. Photos put in order on Listing → Edit
+// (2026-10-20) make the first the item's image in Zoho, but the bulk record
+// keeps its old image_document_id (tested: minutes later, and after
+// update_primary_image too). So the register keeps that pick as
+// `imagePick: { id, zohoId }` and uses it while Zoho's id is still the one it
+// had then; once Zoho's moves (a main image changed in Zoho itself), Zoho's
+// wins. Returns { imageId, stale } — stale: the pick no longer applies.
+function mainImageId(detail, pick) {
+  const zohoId = imageIdOf(detail);
+  if (!pick || !pick.id) return { imageId: zohoId, stale: false };
+  if (String(pick.zohoId || "") === String(zohoId || "")) return { imageId: String(pick.id), stale: false };
+  return { imageId: zohoId, stale: true };
+}
+
+module.exports = { imageIdOf, imageUrlFromId, mainImageId };

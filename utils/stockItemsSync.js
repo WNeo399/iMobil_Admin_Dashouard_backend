@@ -40,13 +40,14 @@ const {
   refreshOnOrder,
   ACCESSORY_CLASSIFICATIONS,
   ACCESSORY_BRANDS,
+  TE_SCOPE,
   skuKey,
   num,
   stockFlags,
   emptySaleUnits,
   stampArchivedAt,
 } = require("./stockItems");
-const { imageIdOf } = require("./productImage");
+const { mainImageId } = require("./productImage");
 const { isNoiseName, ARCHIVE_COLLECTION } = require("./stockUniverse");
 
 const STATE = "imb_sync_state";
@@ -150,7 +151,7 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
     if (ids.length) {
       const [details, existingRows, overrides, products, poBySku] = await Promise.all([
         fetchItemDetails(ids),
-        items.find({ itemId: { $in: ids } }, { projection: { itemId: 1, active: 1, scope: 1, "metrics.units30": 1 } }).toArray(),
+        items.find({ itemId: { $in: ids } }, { projection: { itemId: 1, active: 1, scope: 1, imagePick: 1, "metrics.units30": 1 } }).toArray(),
         db.collection(ARCHIVE_COLLECTION).find({ itemId: { $in: ids } }, { projection: { itemId: 1, mode: 1 } }).toArray(),
         // Same joins as the nightly run: our catalogue, and open purchase
         // lines (Spare Parts Purchase), by SKU.
@@ -187,6 +188,7 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
         const flags = stockFlags({ available, units30, openPoQty });
         const zohoBrand = String(d.brand || "");
         const cf = itemCatalogueFields(d);
+        const image = mainImageId(d, existing && existing.imagePick);
 
         const set = {
           sku,
@@ -194,7 +196,8 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
           location: String(itemLocation(d) || ""),
           zohoBrand,
           purchasePrice: num(d.purchase_rate),
-          imageId: imageIdOf(d),
+          // the main photo picked on Listing → Edit while Zoho's bulk record lags it
+          imageId: image.imageId,
           showInStore: !!(listById.get(id) || {}).showInStore,
           zohoCategoryId: (listById.get(id) || {}).categoryId || "",
           zohoCategory: (listById.get(id) || {}).category || "",
@@ -206,6 +209,7 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
           deviceBrand: cf.deviceBrand,
           deviceSeries: cf.deviceSeries,
           compatibleModels: cf.compatibleModels,
+          te: cf.te,
           reorderLevel: num(d.reorder_level),
           brand: product && product.brand ? product.brand.name : null,
           category: product && product.category ? product.category.name : null,
@@ -226,11 +230,17 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
         };
         for (const [k, v] of Object.entries(flags)) set[`metrics.${k}`] = v;
 
+        // The scope: TE ticked in Zoho takes the item out of parts /
+        // accessories at once (and unticked brings it back); otherwise only
+        // a new item gets one here — the nightly run settles the rest.
+        const scope = cf.te ? TE_SCOPE
+          : ACCESSORY_CLASSIFICATIONS.has(cf.classification) || ACCESSORY_BRANDS.has(zohoBrand) ? "accessory" : "parts";
+        if (cf.te || (existing && existing.scope === TE_SCOPE)) set.scope = scope;
         // A new item: the fields only the nightly run can fill start empty.
         const setOnInsert = {
           firstSeenAt: startedAt,
           metricsAt,
-          scope: ACCESSORY_CLASSIFICATIONS.has(cf.classification) || ACCESSORY_BRANDS.has(zohoBrand) ? "accessory" : "parts",
+          ...(set.scope ? {} : { scope }),
           preferVendor: "",
           collections: [],
           accessoryCollections: [],
@@ -254,7 +264,9 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
           "metrics.daysSinceSale": null,
           "metrics.stale": true,
         };
-        ops.push({ updateOne: { filter: { itemId: id }, update: { $set: set, $setOnInsert: setOnInsert }, upsert: true } });
+        const update = { $set: set, $setOnInsert: setOnInsert };
+        if (image.stale) update.$unset = { imagePick: "" };
+        ops.push({ updateOne: { filter: { itemId: id }, update, upsert: true } });
         changed++;
       }
       for (let i = 0; i < ops.length; i += 500) {

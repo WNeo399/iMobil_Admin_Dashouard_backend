@@ -98,6 +98,12 @@ function roundSaleUnits(u) {
 // Samsung, which brand real parts too. The sync only has the brand to go
 // on for a brand-new item; the night's run settles it.
 const ACCESSORY_CLASSIFICATIONS = new Set(["Accessory", "Accessory Special Offer"]);
+// An item ticked "TE" in Zoho (made for SQT / Tech Elite use only,
+// 2026-10-20) is neither: its own scope, so every parts / accessory view —
+// Stock Monitoring, the Listing Widget, Missing Images, Browse Items —
+// leaves it out without a filter of its own. The register still holds it
+// (te: true) for lookups by id or SKU.
+const TE_SCOPE = "te";
 const ACCESSORY_BRANDS = new Set([
   "Accessory", "iShield", "Roar", "Ugly Rubber UR", "X.One", "Halosure",
   "Remax", "JoyRoom", "HOCO", "COTECi", "Rock", "Blue Nation", "Baseus",
@@ -256,6 +262,7 @@ async function ensureIndexes(db) {
 
 module.exports = {
   ITEMS,
+  TE_SCOPE,
   METRIC_KEYS,
   OFFLINE_SALE_SCOPES,
   SALE_SCOPES,
