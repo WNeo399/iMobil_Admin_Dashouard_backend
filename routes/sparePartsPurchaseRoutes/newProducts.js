@@ -247,10 +247,28 @@ function brandItems(db, brand) {
   ).toArray();
 }
 
-// The register's items for a brand, by model key, then the part they are.
-async function registerIndex(db, brand) {
+// Several brands' items in ONE query, by brand (2026-10-20: with 616 models
+// over six brands a query per brand took ~3.7 s, one ~0.7 s).
+async function brandsItems(db, brands) {
+  const out = new Map(brands.map((b) => [b, []]));
+  if (!brands.length) return out;
+  const byDevice = new Map(brands.map((b) => [BRANDS[b].deviceBrand.toLowerCase(), b]));
+  const items = await db.collection(ITEMS).find(
+    { deviceBrand: { $in: brands.map((b) => new RegExp(`^${BRANDS[b].deviceBrand}$`, "i")) }, active: { $ne: false } },
+    { projection: { _id: 0, itemId: 1, sku: 1, name: 1, classification: 1, subClassification: 1, quality: 1, compatibleModels: 1, archived: 1, imageId: 1, scope: 1, deviceBrand: 1, "metrics.available": 1 } },
+  ).toArray();
+  for (const it of items) {
+    const b = byDevice.get(String(it.deviceBrand || "").toLowerCase());
+    if (b) out.get(b).push(it);
+  }
+  return out;
+}
+
+// The register's items for a brand, by model key, then the part they are
+// (`items`: the brand's, when already read).
+async function registerIndex(db, brand, items) {
   const cfg = BRANDS[brand];
-  const items = await brandItems(db, brand);
+  if (!items) items = await brandItems(db, brand);
   const index = new Map(); // modelKey → partKey → [items]
   for (const it of items) {
     const part = partOf(cfg, it);
@@ -315,10 +333,13 @@ router.get("/", VIEW, async (req, res, next) => {
       seriesOptions[brand] = [...new Set([...seriesOptions[brand], ...zoho])];
     }
     const allModels = await db.collection(MODELS).find({ brand: { $in: brandList }, active: { $ne: false } }).sort({ seriesOrder: 1, series: 1, sortKey: 1, model: 1 }).toArray();
+    // the register's items of every brand with models, in one query (a brand
+    // with no models yet has nothing to read)
+    const itemsOf = await brandsItems(db, brandList.filter((b) => allModels.some((m) => m.brand === b)));
     for (const brand of brandList) {
       const models = allModels.filter((m) => m.brand === brand);
-      if (!models.length) continue; // a brand with no models yet: nothing to read from the register
-      const index = await registerIndex(db, brand);
+      if (!models.length) continue;
+      const index = await registerIndex(db, brand, itemsOf.get(brand));
       const cfg = BRANDS[brand];
       for (const m of models) {
         const have = coverage(m, index);
@@ -460,10 +481,19 @@ router.post("/models", CREATE, async (req, res, next) => {
     const { doc, error } = modelFromBody(req.body || {});
     if (error) return bad(res, error);
     const db = await connectToDatabase();
-    // already listed: the same name once brand words, 4G/5G, case and punctuation are set aside
+    // already listed: the same name once brand words, 4G/5G, case and punctuation
+    // are set aside — unless both carry model codes and none are shared: the
+    // A15 4G (A155) and A15 5G (A156) are two phones with their own parts
+    // (2026-10-20, Samsung's selling models brought in)
     const key = modelKey(doc.model);
-    const listed = await db.collection(MODELS).find({ brand: doc.brand, active: { $ne: false } }, { projection: { model: 1 } }).toArray();
-    const dup = listed.find((m) => modelKey(m.model) === key);
+    const codesOf = (m) => (m.codes || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean);
+    const mine = codesOf(doc);
+    const listed = await db.collection(MODELS).find({ brand: doc.brand, active: { $ne: false } }, { projection: { model: 1, codes: 1 } }).toArray();
+    const dup = listed.find((m) => {
+      if (modelKey(m.model) !== key) return false;
+      const theirs = codesOf(m);
+      return !mine.length || !theirs.length || theirs.some((c) => mine.includes(c));
+    });
     if (dup) return bad(res, `${doc.brand} ${dup.model} is already listed`);
     // its store category, when one is picked already
     let link = {};
