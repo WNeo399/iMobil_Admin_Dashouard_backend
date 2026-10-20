@@ -224,11 +224,12 @@ async function setPriceLists(itemId, rates) {
   return out;
 }
 
-// Upload photos to a new Zoho item (the first becomes its main image) and
+// Upload photos to a Zoho item (the first becomes its main image — unless
+// primary is false: photos added to an existing item keep its main one) and
 // read back the main image id. Errors come back as a message, not a throw.
-async function uploadItemPhotos(itemId, files) {
+async function uploadItemPhotos(itemId, files, { primary = true } = {}) {
   try {
-    const url = `${ZOHO}/items/${encodeURIComponent(itemId)}/images?organization_id=${ORG}&update_primary_image=true`;
+    const url = `${ZOHO}/items/${encodeURIComponent(itemId)}/images?organization_id=${ORG}&update_primary_image=${primary ? "true" : "false"}`;
     const buildForm = () => {
       const form = new FormData();
       for (const f of files) form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });

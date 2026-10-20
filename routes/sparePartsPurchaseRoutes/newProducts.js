@@ -29,6 +29,9 @@
 //   GET  /new-products/next-sku             the next free parts SKU (22xxx) — asks Zoho
 //   GET  /new-products/categories           the store categories to file a new item under (Zoho Commerce)
 //   POST /new-products/items                create one Zoho item for a model + part (+ photos, price lists; or from a draft)
+//   GET  /new-products/items/:itemId        an existing item as Zoho has it (the Edit item dialog)
+//   PUT  /new-products/items/:itemId        change it: name, quality, classification, category, Compatible Models, selling price (Zoho + register)
+//   POST /new-products/items/:itemId/photos add photos to it
 //   POST /new-products/drafts               save the create dialog as a draft (not in Zoho)
 //   GET  /new-products/drafts/:id           one draft
 //   PUT  /new-products/drafts/:id           change a draft (fields, photos and their order)
@@ -45,12 +48,12 @@ const { ObjectId } = require("mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { hasPermission } = require("../../constants/roles");
 const { connectToDatabase } = require("../../utils/mongodb");
-const { refreshToken } = require("../../utils/zohoRequest");
+const { refreshToken, handleZohoInventoryRequest, handleZohoInventoryPutRequest } = require("../../utils/zohoRequest");
 const { imageUrlFromId } = require("../../utils/productImage");
 const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
-  PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
+  ORG, ZOHO, PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
   skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, readImagesFromUrls, readCost,
 } = require("../../utils/zohoNewItem");
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
@@ -351,7 +354,11 @@ router.get("/", VIEW, async (req, res, next) => {
         defaultNames[OTHER] = `${cfg.namePrefix(m)} `;
         // a brand with a series rule (Motorola) works it out; the others use the model's own series
         const deviceSeries = cfg.series ? seriesFor(cfg, [m.compatibleModel || cfg.compatibleModel(m)]) : str(m.series);
-        rows.push({ ...m, _id: String(m._id), have, missing, defaultNames, deviceSeries });
+        // the model in an item name — first in the name ("Samsung Galaxy S24
+        // (S921)") and after a " / " ("S24 Plus (S926)"): the dialogs put the
+        // Compatible Model list into the name with these (2026-10-20)
+        const nameModel = { full: cfg.namePrefix(m).replace(/\s*Compatible$/i, "").trim(), short: withCodes(m) };
+        rows.push({ ...m, _id: String(m._id), have, missing, defaultNames, deviceSeries, nameModel });
       }
     }
     return res.json({
@@ -369,6 +376,8 @@ router.get("/", VIEW, async (req, res, next) => {
         codesHint: BRANDS[b].codesHint || "",
         words: BRANDS[b].words || [],
         categoryPrefix: BRANDS[b].categoryPrefix || "",
+        // how an item name starts before a model not on the page ("MOTO", "Samsung Galaxy", "" for Apple)
+        nameLead: BRANDS[b].namePrefix({ brand: b, model: "", codes: [] }).replace(/\s*Compatible$/i, "").trim(),
         parts: BRANDS[b].parts.map((p) => ({
           key: p.key, label: p.label, classification: p.classification, subClassification: p.subClassification,
           // which formula prices it (a "Service Pack" quality switches the dialog to that one)
@@ -696,6 +705,282 @@ async function categoryLink(id) {
   return { link: { categoryId: category.id, categoryName: category.name, categoryPath: names.join(" › ") } };
 }
 
+// ── An existing item: read it, change it (user 2026-10-20) ──────────
+// "a dialog like Create in Zoho Inventory that shows the product detail and
+// can update the item". Opened from a model's part cards. Read live from
+// Zoho (one call); a save sends Zoho only the fields that differ from what
+// Zoho has, in ONE item update, then mirrors them into the register (and the
+// page's own `created` records) so the page shows them at once. The selling
+// price needs the Price Monitoring right (zoho:stock:edit) — the price lists
+// and the cost go through Price Monitoring's own route from the dialog. SKU,
+// Device Brand and the photos already on the item are shown, not changed;
+// new photos can be added. Every save is logged (imb_spp_item_edits).
+const ITEM_EDITS = "imb_spp_item_edits";
+const PRICE_EDIT = "zoho:stock:edit";
+const canPrice = (req) => hasPermission((req.user && req.user.permissions) || [], PRICE_EDIT);
+const cfOf = (item) => new Map((item.custom_fields || []).map((c) => [c.api_name, str(c.value)]));
+const splitList = (v) => str(v).split(/\s*;\s*/).filter(Boolean);
+async function readZohoItem(itemId) {
+  const r = await handleZohoInventoryRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`);
+  return (r && r.item) || null;
+}
+// The Compatible Model list as sent: trimmed, single spaces, no repeats
+// (any case), no ";" (the field's separator). { models } or { error }.
+function cleanModels(raw) {
+  if (!Array.isArray(raw)) return { error: "compatibleModels must be a list" };
+  const models = [];
+  const seen = new Set();
+  for (const x of raw) {
+    const m = str(x).replace(/\s+/g, " ");
+    if (!m) continue;
+    if (m.includes(";")) return { error: `"${m}" can't contain ;` };
+    if (m.length > 80) return { error: `"${m.slice(0, 30)}…" is too long (80 characters at most)` };
+    if (!seen.has(m.toLowerCase())) { seen.add(m.toLowerCase()); models.push(m); }
+  }
+  if (models.length > 40) return { error: "Up to 40 models" };
+  return { models };
+}
+// The item's Device Series for a new Compatible Model list. Motorola: the
+// brand's rule. The others: the page's own series of the models listed, in
+// the list's order — when one isn't on the page its series isn't known, so
+// the current ones are kept and the page's added. The same series in another
+// order keep Zoho's text.
+async function seriesForList(db, deviceBrand, models, current) {
+  let out = current;
+  const brand = Object.keys(BRANDS).find((b) => BRANDS[b].deviceBrand.toLowerCase() === str(deviceBrand).toLowerCase());
+  if (!brand || !models.length) return current;
+  const cfg = BRANDS[brand];
+  if (cfg.series) {
+    out = seriesFor(cfg, models) || current;
+  } else {
+    const onPage = await db.collection(MODELS).find({ brand, active: { $ne: false } }, { projection: { model: 1, compatibleModel: 1, aliases: 1, series: 1 } }).toArray();
+    const seriesOf = models.map((x) => { const k = modelKey(x); const m = onPage.find((p) => modelKeysOf(p).includes(k)); return m ? str(m.series) : null; });
+    const known = seriesOf.filter(Boolean);
+    const keep = seriesOf.includes(null) ? splitList(current) : [];
+    if (known.length) out = [...new Set([...keep, ...known])].join("; ");
+  }
+  const set = (v) => [...new Set(splitList(v))].sort().join("|");
+  return set(out) === set(current) ? current : out;
+}
+
+// ── GET /new-products/items/:itemId ──────────────────────────────────
+// The item as Zoho has it now: name, SKU, classification, quality, store
+// category, Device Brand / Series, Compatible Models, its photos (main one
+// first) and — with the Price Monitoring right — its selling price.
+router.get("/items/:itemId", CREATE, async (req, res, next) => {
+  try {
+    const itemId = str(req.params.itemId);
+    if (!/^\d{6,25}$/.test(itemId)) return bad(res, "Bad item");
+    const item = await readZohoItem(itemId);
+    if (!item) return res.status(404).json({ success: false, message: "Zoho has no such item" });
+    const db = await connectToDatabase();
+    const reg = await db.collection(ITEMS).findOne({ itemId }, { projection: { _id: 0, imageId: 1 } });
+    const cf = cfOf(item);
+    // the main image: the register's id, else the document Zoho names as the item's image
+    const docs = (item.documents || []).filter((d) => d && d.document_id);
+    const mainId = (reg && reg.imageId) || ((docs.find((d) => d.file_name === item.image_name) || {}).document_id) || null;
+    const photos = docs
+      .map((d) => ({ id: String(d.document_id), name: d.file_name || "", url: imageUrlFromId(String(d.document_id)), main: String(d.document_id) === String(mainId), order: Number(d.attachment_order) || 0 }))
+      .sort((a, b) => (b.main - a.main) || (a.order - b.order));
+    const out = {
+      itemId,
+      name: item.name || "",
+      sku: item.sku || "",
+      status: item.status || "",
+      classification: cf.get("cf_tags") || "",
+      subClassification: cf.get("cf_sub_classification") || "",
+      quality: cf.get("cf_quality") || "",
+      deviceBrand: cf.get("cf_device_brand") || "",
+      deviceSeries: cf.get("cf_device_series") || "",
+      compatibleModels: splitList(cf.get("cf_compatible_model")),
+      categoryId: item.category_id ? String(item.category_id) : "",
+      categoryName: item.category_name || "",
+      photos,
+    };
+    if (canPrice(req)) out.rate = item.rate == null ? null : Number(item.rate);
+    return res.json({ success: true, item: out, canPrice: canPrice(req) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── PUT /new-products/items/:itemId ──────────────────────────────────
+// Body: any of { name, quality, classification, subClassification,
+// categoryId, compatibleModels, rate } — only those sent are looked at, and
+// only those that differ from Zoho's go out. A new Compatible Model list also
+// sets the Device Series (seriesForList); an item made here for a model no
+// longer listed stops counting for it. Reply { item, changed: [fields] }.
+router.put("/items/:itemId", CREATE, async (req, res, next) => {
+  try {
+    const itemId = str(req.params.itemId);
+    if (!/^\d{6,25}$/.test(itemId)) return bad(res, "Bad item");
+    const b = req.body || {};
+    const has = (k) => Object.prototype.hasOwnProperty.call(b, k);
+    // what was asked, checked before anything is read
+    const ask = {};
+    if (has("name")) {
+      ask.name = str(b.name).replace(/[\r\n]+/g, " ").replace(/\s+/g, " ");
+      if (ask.name.length < 5) return bad(res, "Item name is too short");
+      if (ask.name.length > 200) return bad(res, "Item name is too long (200 characters at most)");
+    }
+    if (has("quality")) {
+      const { quality, error } = cleanQuality(b.quality);
+      if (error) return bad(res, error);
+      ask.quality = quality;
+    }
+    if (has("classification")) {
+      ask.classification = str(b.classification);
+      if (!ZOHO_CLASSIFICATIONS.includes(ask.classification)) return bad(res, "Pick the classification");
+    }
+    if (has("subClassification")) {
+      ask.subClassification = str(b.subClassification).replace(/\s+/g, " ").slice(0, 60);
+      if (/[[\]]/.test(ask.subClassification)) return bad(res, "Sub classification can't contain [ or ]");
+    }
+    if (has("compatibleModels")) {
+      const { models, error } = cleanModels(b.compatibleModels);
+      if (error) return bad(res, error);
+      ask.compatibleModels = models;
+    }
+    if (has("categoryId")) {
+      ask.categoryId = str(b.categoryId);
+      if (!/^\d{6,25}$/.test(ask.categoryId)) return bad(res, "Pick the store category");
+    }
+    if (has("rate")) {
+      if (!canPrice(req)) return res.status(403).json({ success: false, message: "Changing the selling price needs the Price Monitoring right" });
+      const n = Number(b.rate);
+      if (b.rate === null || b.rate === "" || !Number.isFinite(n) || n < 0 || n > 1000000) return bad(res, "Selling price must be 0 or more");
+      ask.rate = Math.round(n * 100) / 100;
+    }
+    if (!Object.keys(ask).length) return bad(res, "Nothing to change");
+
+    await refreshToken();
+    const item = await readZohoItem(itemId);
+    if (!item) return res.status(404).json({ success: false, message: "Zoho has no such item" });
+    const cf = cfOf(item);
+    const now = {
+      name: item.name || "",
+      quality: cf.get("cf_quality") || "",
+      classification: cf.get("cf_tags") || "",
+      subClassification: cf.get("cf_sub_classification") || "",
+      compatibleModels: splitList(cf.get("cf_compatible_model")),
+      deviceSeries: cf.get("cf_device_series") || "",
+      categoryId: item.category_id ? String(item.category_id) : "",
+      categoryName: item.category_name || "",
+      rate: item.rate == null ? null : Number(item.rate),
+    };
+    const db = await connectToDatabase();
+
+    // the item update: only what differs
+    const body = {};
+    const custom = {};
+    const changes = {};
+    const note = (field, from, to) => { changes[field] = { from, to }; };
+    if (ask.name !== undefined && ask.name !== now.name) { body.name = ask.name; note("name", now.name, ask.name); }
+    if (ask.rate !== undefined && ask.rate !== now.rate) { body.rate = ask.rate; note("rate", now.rate, ask.rate); }
+    if (ask.quality !== undefined && ask.quality !== now.quality) { custom.cf_quality = ask.quality; note("quality", now.quality, ask.quality); }
+    if (ask.classification !== undefined && ask.classification !== now.classification) { custom.cf_tags = ask.classification; note("classification", now.classification, ask.classification); }
+    if (ask.subClassification !== undefined && ask.subClassification !== now.subClassification) { custom.cf_sub_classification = ask.subClassification; note("subClassification", now.subClassification, ask.subClassification); }
+    let deviceSeries = now.deviceSeries;
+    if (ask.compatibleModels !== undefined && ask.compatibleModels.join("; ") !== now.compatibleModels.join("; ")) {
+      custom.cf_compatible_model = ask.compatibleModels.join("; ");
+      note("compatibleModels", now.compatibleModels, ask.compatibleModels);
+      deviceSeries = await seriesForList(db, cf.get("cf_device_brand"), ask.compatibleModels, now.deviceSeries);
+      if (deviceSeries !== now.deviceSeries) { custom.cf_device_series = deviceSeries; note("deviceSeries", now.deviceSeries, deviceSeries); }
+    }
+    let category = null;
+    if (ask.categoryId !== undefined && ask.categoryId !== now.categoryId) {
+      const found = await findCategory(ask.categoryId);
+      if (found.error) return res.status(found.status || 400).json({ success: false, message: found.status === 400 ? "That store category no longer exists" : found.error });
+      category = found.category;
+      body.category_id = category.id;
+      note("category", now.categoryName || now.categoryId, category.name);
+    }
+    if (!Object.keys(changes).length) return res.json({ success: true, changed: [], item: { itemId } });
+    if (Object.keys(custom).length) body.custom_fields = Object.entries(custom).map(([api_name, value]) => ({ api_name, value }));
+
+    const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`, body);
+    if (!r || r.code !== 0 || !r.item) {
+      return res.status(502).json({ success: false, message: `Zoho: ${(r && (r.message || (r.error && r.error.message))) || "did not update the item"}` });
+    }
+    // what Zoho kept (a value it dropped is said so, not mirrored)
+    const after = cfOf(r.item);
+    const lost = Object.entries(custom).filter(([k, v]) => v && after.get(k) !== v).map(([k]) => k);
+    if (body.category_id && String(r.item.category_id || "") !== body.category_id) lost.push("category");
+    if (lost.length) return res.status(502).json({ success: false, message: `Zoho did not keep ${lost.join(", ")}` });
+
+    // the register (the page, the Listing Widget, Stock Monitoring read it)
+    const set = {};
+    if (body.name) set.name = r.item.name || body.name;
+    if (custom.cf_quality !== undefined) set.quality = custom.cf_quality;
+    if (custom.cf_tags !== undefined) set.classification = custom.cf_tags;
+    if (custom.cf_sub_classification !== undefined) set.subClassification = custom.cf_sub_classification;
+    if (custom.cf_compatible_model !== undefined) { set.compatibleModels = ask.compatibleModels; set.deviceSeries = deviceSeries; }
+    if (category) { set.zohoCategoryId = category.id; set.zohoCategory = r.item.category_name || category.name; }
+    if (Object.keys(set).length) await db.collection(ITEMS).updateOne({ itemId }, { $set: set });
+
+    // the page's own records of items made here: the same name / quality /
+    // classification; one moved to another classification is no longer the
+    // needed part it was made as
+    const cset = {};
+    if (set.name) cset["created.$[c].name"] = set.name;
+    if (set.quality !== undefined) cset["created.$[c].quality"] = set.quality;
+    if (set.classification !== undefined || set.subClassification !== undefined) {
+      cset["created.$[c].part"] = OTHER;
+      cset["created.$[c].classification"] = custom.cf_tags !== undefined ? custom.cf_tags : now.classification;
+      cset["created.$[c].subClassification"] = custom.cf_sub_classification !== undefined ? custom.cf_sub_classification : now.subClassification;
+    }
+    if (set.compatibleModels) { cset["created.$[c].compatibleModels"] = set.compatibleModels; cset["created.$[c].compatibleModel"] = set.compatibleModels.join("; "); }
+    if (category) { cset["created.$[c].categoryId"] = category.id; cset["created.$[c].categoryName"] = set.zohoCategory; }
+    if (Object.keys(cset).length) {
+      await db.collection(MODELS).updateMany({ "created.itemId": itemId }, { $set: cset }, { arrayFilters: [{ "c.itemId": itemId }] });
+    }
+    // …and it stops counting for a model no longer on its list
+    let dropped = [];
+    if (set.compatibleModels) {
+      const keys = new Set(set.compatibleModels.map(modelKey));
+      const makers = await db.collection(MODELS).find({ "created.itemId": itemId }, { projection: { model: 1, compatibleModel: 1, aliases: 1, created: 1 } }).toArray();
+      dropped = makers.filter((m) => !modelKeysOf(m).some((k) => keys.has(k)));
+      if (dropped.length) await db.collection(MODELS).updateMany({ _id: { $in: dropped.map((m) => m._id) } }, { $pull: { created: { itemId } } });
+    }
+    await db.collection(ITEM_EDITS).insertOne({
+      itemId, sku: r.item.sku || item.sku || "", name: r.item.name || now.name,
+      changes, at: new Date(), by: actor(req),
+      // the page models it no longer counts for, with what they had kept
+      droppedFrom: dropped.map((m) => ({ modelId: m._id, model: m.model, created: (m.created || []).filter((c) => String(c.itemId) === itemId) })),
+    });
+    return res.json({ success: true, changed: Object.keys(changes), item: { itemId, ...set } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /new-products/items/:itemId/photos ──────────────────────────
+// Add photos to an existing item (multipart "images", up to 10; main=1 makes
+// the first of them the item's main image — otherwise the main one stays).
+router.post("/items/:itemId/photos", CREATE, acceptPhotos, async (req, res, next) => {
+  try {
+    const itemId = str(req.params.itemId);
+    if (!/^\d{6,25}$/.test(itemId)) return bad(res, "Bad item");
+    const files = req.files || [];
+    if (!files.length) return bad(res, "No photos");
+    const main = ["1", "true"].includes(str(req.body && req.body.main));
+    await refreshToken();
+    const photos = await uploadItemPhotos(itemId, files, { primary: main });
+    if (photos.error) return res.status(502).json({ success: false, message: `Zoho: ${photos.error}` });
+    const db = await connectToDatabase();
+    if (photos.imageId) {
+      await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId: photos.imageId } });
+      await db.collection(MODELS).updateMany({ "created.itemId": itemId }, { $set: { "created.$[c].imageId": photos.imageId } }, { arrayFilters: [{ "c.itemId": itemId }] });
+    }
+    await db.collection(ITEM_EDITS).insertOne({
+      itemId, changes: { photos: { added: files.length, main } }, at: new Date(), by: actor(req),
+    });
+    return res.json({ success: true, uploaded: photos.uploaded, imageId: photos.imageId || null });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ── POST /new-products/items ─────────────────────────────────────────
 // Create one Zoho Inventory item for a model + part. Body: { modelId, part,
 // cost, name?, sku?, quality?, rate?, prices?, compatibleModels? } — the
@@ -731,6 +1016,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     }
     const name = (str(b.name) || part.name(model)).replace(/[\r\n]+/g, " ");
     if (name.length < 5) return bad(res, "Item name is too short");
+    if (name.length > 200) return bad(res, "Item name is too long (200 characters at most)");
     if (part.key === OTHER && name.toLowerCase() === cfg.namePrefix(model).toLowerCase()) return bad(res, "Type what the product is after the model");
     const { quality, error: qualityError } = cleanQuality(b.quality);
     if (qualityError) return bad(res, qualityError);
