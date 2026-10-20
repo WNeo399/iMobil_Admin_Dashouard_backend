@@ -8,7 +8,8 @@
 //   GET /exyon-accessories/orders?from&to&channel&status&q&page&pageSize
 //     → { rows, total, summary, channels, statuses }
 //   GET /exyon-accessories/dispatch?channel&status&q
-//     → { bySku, sameItems, multiLine, summary, channels, statuses }
+//     → { bySku, multiLine, onPickList, summary, channels, statuses }
+//     every order carries `envelope` { size, reasons } (utils/exyonEnvelope)
 //   GET  /exyon-accessories/pick-lists              → { lists, today }
 //   GET  /exyon-accessories/pick-lists/:day         → { list, lines, summary }
 //   POST /exyon-accessories/pick-lists/:day/remove  { orderId }
@@ -22,6 +23,7 @@ const { exQuery } = require("../../utils/exDb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
 const { zohoIdsForSkus, netoCall } = require("../../utils/neto");
+const { envelopeOf } = require("../../utils/exyonEnvelope");
 
 // Admin (*:*:*) and the Exyon Operation role (2026-10-08) — nobody else
 // holds exyon:accessory:* (constants/roles.js).
@@ -526,10 +528,12 @@ router.get("/dispatch", VIEW, async function (req, res) {
     //   multiLine — multi-line orders, one by one
     // and onPickList — the orders already on a pick list (processed or not)
     const entry = await pickEntriesOf(orders.map((o) => o.orderId));
+    // envelope: the size the order ships in, from its items (user 2026-10-20)
     const brief = (o) => {
       const e = entry.get(o.orderId) || {};
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
-        status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, tracking: e.tracking || "" };
+        status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, tracking: e.tracking || "",
+        envelope: envelopeOf(o.items) };
     };
     const sku = new Map();
     const multiLine = [];
