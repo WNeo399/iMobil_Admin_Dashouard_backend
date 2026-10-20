@@ -455,6 +455,25 @@ router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
       const other = usable(list).filter((r) => lineFreight(r) !== freight);
       return other.length ? { freight: lineFreight(other[0]), label: FREIGHT_LABEL[lineFreight(other[0])], count: other.length, orderNo: other[0].orderNo } : null;
     };
+    // A line's own number (the Special Order label, user 2026-10-20 — any
+    // line answers to it): that line, when it waits to ship on this kind of
+    // batch; else why not, for the scanner to say.
+    if (/^SP-\d+$/i.test(sku)) {
+      const orderNo = sku.toUpperCase();
+      const row = await db.collection(ORDERS).findOne({ orderNo }, { projection: { history: 0 } });
+      if (!row) return res.json({ success: true, match: null, orderNo: { orderNo, message: `${orderNo} is not a Purchase Order line` } });
+      if (["ordered", "pending"].includes(row.status)) {
+        const open = openOnes([row]);
+        if (open.length) return res.json({ success: true, match: open[0], remaining: 0, all: open, byOrderNo: true });
+        const otherFreight = elsewhere([row]);
+        if (otherFreight) return res.json({ success: true, match: null, otherFreight });
+      }
+      const why = exclude.has(String(row._id)) ? "is on this batch already"
+        : awaitsQuote(row) ? "is waiting for its quote"
+        : row.status === "toConfirm" ? "is waiting in To Confirm"
+        : ({ shipped: "is shipped already", received: "is received already", cancelled: "is cancelled", shortage: "is a shortage line" })[row.status] || `is ${row.status}`;
+      return res.json({ success: true, match: null, orderNo: { orderNo, status: row.status, message: `${orderNo} ${why}` } });
+    }
     const oc = sku.match(OSCAR_CODE);
     if (oc) {
       // Oscar's return code (user 2026-10-14): the line raised for OSCAR
