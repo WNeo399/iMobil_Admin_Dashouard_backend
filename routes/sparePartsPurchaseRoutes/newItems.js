@@ -5,7 +5,8 @@
 // The products are read where the dashboard records them — no list of its
 // own to keep in step:
 //   · Listing's Create: the `created` entries on the Listing models
-//     (imb_spp_new_products), one item can sit on several models;
+//     (imb_spp_new_products), one item can sit on several models — and items
+//     made by hand in Zoho filed there afterwards (source "zoho");
 //   · Purchase Order's "Create in Zoho": the line's `zohoItem` (imb_spp_orders);
 //   · the register rows those two insert at once (addedBy "dashboard create",
 //     since 2026-10-20) — a fallback for when and where.
@@ -125,7 +126,7 @@ async function createdProducts(db) {
     db.collection(MODELS).aggregate([
       { $match: { "created.0": { $exists: true } } },
       { $unwind: "$created" },
-      { $project: { _id: 1, brand: 1, model: 1, itemId: "$created.itemId", at: "$created.at", by: "$created.by" } },
+      { $project: { _id: 1, brand: 1, model: 1, itemId: "$created.itemId", at: "$created.at", by: "$created.by", source: "$created.source" } },
     ]).toArray(),
     db.collection(ORDERS)
       .find({ "zohoItem.at": { $exists: true }, itemId: { $nin: [null, ""] } }, { projection: { itemId: 1, orderNo: 1, zohoItem: 1 } })
@@ -133,7 +134,8 @@ async function createdProducts(db) {
     db.collection(ITEMS).find({ addedBy: "dashboard create" }, { projection: { _id: 0, itemId: 1, firstSeenAt: 1 } }).toArray(),
   ]);
   for (const c of listing) {
-    const e = note(c.itemId, c.at, c.by, "Listing");
+    // source "zoho": made by hand in Zoho, then filed under the model (2026-10-21)
+    const e = note(c.itemId, c.at, c.by, c.source === "zoho" ? "Zoho" : "Listing");
     if (e && !e.models.some((m) => m.id === String(c._id))) e.models.push({ id: String(c._id), brand: c.brand || "", model: c.model || "" });
   }
   for (const o of po) note(o.itemId, o.zohoItem.at, o.zohoItem.by, "Purchase Order", { orderNo: o.orderNo || "" });

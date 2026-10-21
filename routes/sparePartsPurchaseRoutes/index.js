@@ -1230,7 +1230,14 @@ const orderBatchLine = (r) => ({
   note: r.note || "",
   unitPrice: null,
 });
-const placeable = (r) => r && (r.status === "pending" || r.status === "shortage") && !awaitsQuote(r);
+// A line an order batch can take: still pending / shortage. A Special Order /
+// New Product line waiting for its quote is taken too (user 2026-10-21: "need
+// to be able to add Special Order and new items into an order batch") — the
+// quote no longer blocks ordering it this way; single Place order, the
+// shipping and the scan lookup still wait for it (awaitsQuote).
+const placeable = (r) => r && (r.status === "pending" || r.status === "shortage");
+// the fields a short shipment's remainder line keeps from the line it came from
+const SPLIT_CARRY = ["forCustomer", "dispatchRef", "requestedFor", "urgent", "needsQuote", "confirmed", "warranty"];
 const qtyOf = (lines) => lines.reduce((t, l) => t + (l.orderQty || 0), 0);
 
 // The draft's lines from the picked ids: still pending / shortage and not
@@ -1370,7 +1377,8 @@ router.post("/order-batches/:id/confirm", SUPPLY, async (req, res, next) => {
           { _id: rec._id, status: { $in: ["pending", "shortage"] } },
           {
             $set: { supplier: draft.supplier, orderedAt: now, orderedBy: by, shortageNote: "", status: "ordered", orderBatchId: draft._id, orderBatchNo: batchNo, updatedAt: now },
-            $push: { history: hist("ordered", by, { supplier: draft.supplier, orderBatch: batchNo }) },
+            // (one still waiting for its quote is noted as ordered without it)
+            $push: { history: hist("ordered", by, { supplier: draft.supplier, orderBatch: batchNo, ...(awaitsQuote(rec) ? { withoutQuote: true } : {}) }) },
           },
         );
         if (r.modifiedCount) placed.push(rec);
@@ -2004,7 +2012,14 @@ async function shipBatch(db, req, b, draft) {
         const { seq: rSeq, no: rNo } = await nextNo(db, "order", "SP", 10001, ORDERS);
         const supplier = p.supplier || rec.supplier || "";
         const unitPrice = p.price != null ? round2(p.price) : rec.unitPrice != null ? rec.unitPrice : null;
+        // who and what the line is for stays with the rest (user 2026-10-21: a
+        // short-shipped Order Dispatch line's remainder lost its customer label
+        // and its link back to the dispatch) — the customer and the dispatch
+        // line, a Special Order's requester / urgency / quote mark, Warranty
+        const carry = {};
+        for (const k of SPLIT_CARRY) if (rec[k] !== undefined && rec[k] !== null && rec[k] !== "") carry[k] = rec[k];
         await col.insertOne({
+          ...carry,
           orderNo: rNo,
           seq: rSeq,
           itemId: rec.itemId || null,
