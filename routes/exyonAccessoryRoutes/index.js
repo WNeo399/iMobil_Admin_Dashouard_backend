@@ -12,7 +12,8 @@
 //     every order carries `envelope` { size, reasons } (utils/exyonEnvelope)
 //   GET  /exyon-accessories/pick-lists              → { lists, today }
 //   GET  /exyon-accessories/pick-lists/find?q=      → { matches } — which list an order is on
-//   GET  /exyon-accessories/pick-lists/:day         → { list, lines, summary }
+//   GET  /exyon-accessories/pick-lists/:day         → { list, lines, summary, batches, open }
+//   POST /exyon-accessories/pick-lists/:day/print   { orderIds } closes the new batch | { batch } a reprint
 //   POST /exyon-accessories/pick-lists/:day/remove  { orderId }
 //   POST /exyon-accessories/pick-lists/today/process { orders: [{ orderId, tracking }] }
 //   POST /exyon-accessories/pick-lists/:day/dispatch { orders: [...] } — Confirm dispatch → Neto
@@ -278,9 +279,9 @@ async function pickEntriesOf(orderIds) {
   if (!orderIds.length) return out;
   try {
     const col = await pickLists();
-    const docs = await col.find({ "orders.orderId": { $in: orderIds }, ...LIVE_LIST }, { projection: { day: 1, "orders.orderId": 1, "orders.tracking": 1, "orders.dispatch": 1 } }).toArray();
+    const docs = await col.find({ "orders.orderId": { $in: orderIds }, ...LIVE_LIST }, { projection: { day: 1, "orders.orderId": 1, "orders.tracking": 1, "orders.dispatch": 1, "orders.batch": 1 } }).toArray();
     const wanted = new Set(orderIds);
-    for (const d of docs) for (const o of d.orders || []) if (wanted.has(o.orderId)) out.set(o.orderId, { day: d.day, tracking: o.tracking || "", dispatch: o.dispatch || null });
+    for (const d of docs) for (const o of d.orders || []) if (wanted.has(o.orderId)) out.set(o.orderId, { day: d.day, batch: o.batch || null, tracking: o.tracking || "", dispatch: o.dispatch || null });
   } catch (e) {
     console.error("Exyon pick lists — days:", e.message);
   }
@@ -355,6 +356,24 @@ function pickSummaryOf(list) {
   };
 }
 
+// ── Batches (user 2026-10-21: "one batch in the morning and one in the
+// afternoon") ──
+// Printing a list's new orders closes them as a batch: each gets `batch` (1, 2,
+// … per day) and the list records { no, printedAt, printedBy, orderIds } in
+// `batches`. An order added after that has no batch yet — it is in the next,
+// new batch. A batch can be printed again (nothing changes). The lists from
+// before batches were made batch 1 (`legacy`, no print time).
+function batchesOf(list) {
+  const orders = list.orders || [];
+  const out = (list.batches || []).slice().sort((a, b) => a.no - b.no).map((b) => {
+    const part = { orders: orders.filter((o) => o.batch === b.no) };
+    return { no: b.no, printedAt: b.printedAt || null, printedBy: b.printedBy || "", legacy: !!b.legacy, reprints: b.reprints || 0,
+      orderIds: part.orders.map((o) => o.orderId), summary: pickSummaryOf(part), lines: pickLinesOf(part) };
+  });
+  const fresh = { orders: orders.filter((o) => !o.batch) };
+  return { batches: out, open: { orderIds: fresh.orders.map((o) => o.orderId), summary: pickSummaryOf(fresh), lines: pickLinesOf(fresh) } };
+}
+
 router.get("/pick-lists", VIEW, async function (req, res) {
   try {
     const col = await pickLists();
@@ -362,7 +381,12 @@ router.get("/pick-lists", VIEW, async function (req, res) {
     return res.json({
       success: true,
       today: todayKey(),
-      lists: docs.map((d) => ({ day: d.day, ...pickSummaryOf(d), createdAt: d.createdAt, createdBy: d.createdBy, updatedAt: d.updatedAt, updatedBy: d.updatedBy })),
+      lists: docs.map((d) => ({
+        day: d.day, ...pickSummaryOf(d), createdAt: d.createdAt, createdBy: d.createdBy, updatedAt: d.updatedAt, updatedBy: d.updatedBy,
+        // batches printed, and the orders waiting for the next print
+        batches: (d.batches || []).length,
+        unprinted: (d.orders || []).filter((o) => !o.batch).length,
+      })),
     });
   } catch (error) {
     console.error("Exyon pick lists error:", error);
@@ -405,10 +429,64 @@ router.get("/pick-lists/:day", VIEW, async function (req, res) {
     const orders = [...(list.orders || [])].sort(byPlaced)
       .map((o) => ({ ...o, items: (o.items || []).map((it) => ({ ...it, ...(zoho.get(String(it.sku || "").trim()) || {}) })) }));
     const now = { ...list, orders };
-    return res.json({ success: true, list: now, lines: pickLinesOf(now), summary: pickSummaryOf(now) });
+    return res.json({ success: true, list: now, lines: pickLinesOf(now), summary: pickSummaryOf(now), ...batchesOf(now) });
   } catch (error) {
     console.error("Exyon pick list error:", error);
     return res.status(502).json({ success: false, message: error.message || "Failed to load the pick list" });
+  }
+});
+
+// Print (user 2026-10-21): printing the new orders closes them as the day's
+// next batch — exactly the ones in the printed list (sent back), so an order
+// added while the preview was open waits for the next batch. { batch: n }
+// prints batch n again and changes nothing.
+//   POST /pick-lists/:day/print { orderIds: [...] } → { batch, orders }
+//   POST /pick-lists/:day/print { batch: n }        → { batch, reprint: true }
+router.post("/pick-lists/:day/print", PICK_EDIT, async function (req, res) {
+  const bad = (message, status = 400) => res.status(status).json({ success: false, message });
+  try {
+    const day = req.params.day;
+    if (!DAY_RE.test(day)) return bad("Bad day");
+    const col = await pickLists();
+    const list = await col.findOne({ day, ...LIVE_LIST }, { projection: { history: 0 } });
+    if (!list) return bad("No pick list for that day", 404);
+    const now = new Date();
+    const by = actor(req);
+    const b = req.body || {};
+    if (b.batch != null) {
+      const no = Number(b.batch);
+      if (!(list.batches || []).some((x) => x.no === no)) return bad(`There is no batch ${b.batch} on this list`);
+      await col.updateOne({ _id: list._id, "batches.no": no }, {
+        $inc: { "batches.$.reprints": 1 },
+        $push: { history: { at: now, by, action: "reprinted", batch: no } },
+      });
+      return res.json({ success: true, batch: no, reprint: true });
+    }
+    const asked = [...new Set((Array.isArray(b.orderIds) ? b.orderIds : []).map((x) => String(x || "").trim()).filter(Boolean))];
+    if (!asked.length) return bad("Nothing to print");
+    const byId = new Map((list.orders || []).map((o) => [o.orderId, o]));
+    const missing = asked.filter((id) => !byId.has(id));
+    if (missing.length) return bad(`${missing.join(", ")}: not on this list any more — refresh the page`, 409);
+    const ids = asked.filter((id) => !byId.get(id).batch);
+    if (!ids.length) {
+      const was = byId.get(asked[0]).batch;
+      return bad(`These orders were printed already, as batch ${was} — refresh the page`, 409);
+    }
+    const no = Math.max(0, ...(list.batches || []).map((x) => x.no)) + 1;
+    // a print at the same moment by someone else takes the number first: say so
+    const r = await col.updateOne(
+      { _id: list._id, "batches.no": { $ne: no } },
+      {
+        $set: { "orders.$[o].batch": no, updatedAt: now, updatedBy: by },
+        $push: { batches: { no, printedAt: now, printedBy: by, orderIds: ids }, history: { at: now, by, action: "printed", batch: no, orderIds: ids } },
+      },
+      { arrayFilters: [{ "o.orderId": { $in: ids }, "o.batch": { $exists: false } }] },
+    );
+    if (!r.modifiedCount) return bad("Someone printed this list at the same moment — refresh the page", 409);
+    return res.json({ success: true, batch: no, orders: ids.length });
+  } catch (error) {
+    console.error("Exyon pick list print error:", error);
+    return res.status(502).json({ success: false, message: error.message || "Failed to record the print" });
   }
 });
 
@@ -762,7 +840,7 @@ router.get("/dispatch", VIEW, async function (req, res) {
     const brief = (o) => {
       const e = entry.get(o.orderId) || {};
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
-        status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, tracking: e.tracking || "",
+        status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, pickBatch: e.batch || null, tracking: e.tracking || "",
         dispatch: e.dispatch || null, envelope: envelopeOf(o.items) };
     };
     const sku = new Map();
