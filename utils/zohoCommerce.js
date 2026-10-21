@@ -48,4 +48,29 @@ async function commerce(method, path, { params, data } = {}) {
   return d;
 }
 
-module.exports = { commerce, COMMERCE_BASE: BASE, COMMERCE_ORG: ORG };
+// The store product of an Inventory item: its variant's variant_id is the
+// item_id (a part is a one-variant product, product_id ≠ item_id). Found by
+// a search on the SKU → { productId, name, status, shown } or null.
+async function productOfItem(itemId, sku) {
+  const d = await commerce("get", "/products", { params: { search_text: String(sku || ""), per_page: 25 } });
+  if (!d || d.code !== 0) throw new Error(`Zoho Commerce: ${(d && d.message) || "the product search failed"}`);
+  const p = (d.products || []).find((x) => (x.variants || []).some((v) => String(v.variant_id) === String(itemId)));
+  return p ? { productId: String(p.product_id), name: p.name || "", status: p.status || "", shown: p.show_in_storefront === true } : null;
+}
+
+// "Show in store" on (Listing → New Products' Approve, 2026-10-21): the
+// product's show_in_storefront, one partial PUT /products/{id}, then read back
+// — Zoho can answer code 0 without keeping a field. → { productId, already } ;
+// throws with Zoho's reason when it isn't shown afterwards.
+async function showItemInStore(itemId, sku) {
+  const p = await productOfItem(itemId, sku);
+  if (!p) throw new Error("not found in the store (Zoho Commerce)");
+  if (p.shown) return { productId: p.productId, already: true };
+  const r = await commerce("put", `/products/${p.productId}`, { data: { show_in_storefront: true } });
+  if (!r || r.code !== 0) throw new Error(`Zoho Commerce: ${(r && r.message) || "the update failed"}`);
+  const after = await productOfItem(itemId, sku);
+  if (!after || !after.shown) throw new Error("Zoho Commerce took the update but the product is still hidden");
+  return { productId: p.productId, already: false };
+}
+
+module.exports = { commerce, productOfItem, showItemInStore, COMMERCE_BASE: BASE, COMMERCE_ORG: ORG };

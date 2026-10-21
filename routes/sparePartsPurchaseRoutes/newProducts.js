@@ -406,6 +406,52 @@ router.get("/", VIEW, async (req, res, next) => {
   }
 });
 
+// ── GET /new-products/edit-context?brand= ────────────────────────────
+// What the product dialog needs around an item, without the whole page
+// (Listing → New Products opens it, 2026-10-21; GET / takes seconds — it
+// works out every model's parts): the brands' naming facts, the brand's
+// models (their names in an item name, Compatible Model, other names, store
+// category), the qualities, classifications and price formulas. `brand` = a
+// page brand or a Device Brand ("Motorola"); none / unknown → no models.
+router.get("/edit-context", CREATE, async (req, res, next) => {
+  try {
+    const asked = str(req.query.brand).toLowerCase();
+    const brand = Object.keys(BRANDS).find((b) => b.toLowerCase() === asked || BRANDS[b].deviceBrand.toLowerCase() === asked) || "";
+    const db = await connectToDatabase();
+    const [models, qualities, byClass, classifications] = await Promise.all([
+      brand
+        ? db.collection(MODELS).find(
+          { brand, active: { $ne: false } },
+          { projection: { brand: 1, series: 1, model: 1, compatibleModel: 1, codes: 1, aliases: 1, categoryId: 1, categoryName: 1, categoryPath: 1 } },
+        ).sort({ seriesOrder: 1, series: 1, sortKey: 1, model: 1 }).toArray()
+        : [],
+      qualityOptions(db),
+      qualitiesByClassification(db),
+      classificationOptions(db),
+    ]);
+    const cfg = BRANDS[brand];
+    return res.json({
+      success: true,
+      brand,
+      brands: Object.keys(BRANDS).map((b) => ({
+        value: b,
+        deviceBrand: BRANDS[b].deviceBrand,
+        words: BRANDS[b].words || [],
+        nameLead: BRANDS[b].namePrefix({ brand: b, model: "", codes: [] }).replace(/\s*Compatible$/i, "").trim(),
+      })),
+      // as GET / sends them (nameModel = the model in an item name)
+      rows: models.map((m) => ({ ...m, _id: String(m._id), nameModel: { full: cfg.namePrefix(m).replace(/\s*Compatible$/i, "").trim(), short: withCodes(m) } })),
+      qualities,
+      qualitiesByClass: byClass,
+      classifications,
+      priceFamilies: Object.fromEntries(ZOHO_CLASSIFICATIONS.map((c) => [c, priceRuleFamily({ classification: c })])),
+      priceFormulas: PRICE_FORMULAS,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // ── GET /new-products/models/:id/items ───────────────────────────────
 // Every register item filed under the model (its name, Compatible Model or
 // an alias — any classification), plus the ones created from this page that

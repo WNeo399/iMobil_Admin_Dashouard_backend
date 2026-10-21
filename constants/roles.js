@@ -146,6 +146,10 @@ const ROLE_PERMISSIONS = {
     // iMobile Listing, all of it (user 2026-10-16): Categories, Qualities,
     // New Products, Listing Widget
     "listing:*:*",
+    // Listing → New Products (2026-10-21): the products created in the
+    // dashboard — review + order. Admin, iMobile Admin and iMobile Warehouse
+    // only (user), so NOT inside listing:* (Purchase / Parts Supplier hold that).
+    "newproduct:*:*",
   ],
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
@@ -271,6 +275,8 @@ const ROLE_PERMISSIONS = {
     "spp:*:*",
     // iMobile Listing (2026-10-16): Categories, New Products, Listing Widget
     "listing:*:*",
+    // Listing → New Products (2026-10-21): review + order the products created in the dashboard
+    "newproduct:*:*",
     "inflow:order:view", "inflow:order:create", "inflow:customer:view",
     "refurb:stock:view", "refurb:stock:manage",
     "refurb:sale:view", "refurb:sale:manage",
