@@ -286,6 +286,9 @@ const ROLE_PERMISSIONS = {
     "consign:*:*",
     // iMobile → Screen Buyback: the ABCD grade price list (2026-10-13)
     "buyback:price:view", "buyback:price:manage",
+    // Exyon Accessories (user 2026-10-21): as the Exyon Warehouse role —
+    // Orders, Dispatch (incl. AusPost labels), Pick Lists (incl. Confirm dispatch)
+    "exyon:accessory:view", "exyon:accessory:picklist",
   ],
   // iMobile Front Desk (2026-10-05): SQT like TechElite Admin (every action,
   // and the admin-side view the frontend / the group filter give by role:
