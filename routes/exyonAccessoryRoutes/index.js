@@ -18,6 +18,8 @@
 //   POST /exyon-accessories/pick-lists/today/process { orders: [{ orderId, tracking }] }
 //   POST /exyon-accessories/pick-lists/:day/dispatch { orders: [...] } — Confirm dispatch → Neto
 //   GET  /exyon-accessories/labels?orderIds=A,B   → shipping label data (address from Neto)
+//   POST /exyon-accessories/auspost/labels { orders: [{ orderId, parcel? }], dryRun? } — AusPost eParcel labels (Large / Other)
+//   POST /exyon-accessories/auspost/labels/:orderId/cancel — the AusPost shipment deleted (before lodging)
 
 var express = require("express");
 var router = express.Router();
@@ -805,6 +807,191 @@ router.get("/labels", VIEW, async function (req, res) {
   }
 });
 
+// ── Australia Post labels (user 2026-10-21) ─────────────────────────────
+// A Large / Other envelope ships as an AusPost eParcel (Small / Medium as
+// before): "AusPost label" on an order in Process creates its shipment
+// (utils/auspost — Parcel Post, Authority to Leave, 0.49 kg, 30 × 25 × 5 cm
+// unless changed), the article id fills the order's tracking box, and the A6
+// label PDF comes back to print. One live shipment per order: asked again,
+// the same one is reprinted. Lodging stays in AusPost (user). Records in
+// exyon_auspost_shipments { orderId, live, status creating | created |
+// deleted, shipmentId, articleId, consignmentId, productId, parcel, cost, … }.
+//   POST /auspost/labels { orders: [{ orderId, parcel?, envelope? }], dryRun?, reprintOnly? }
+//     (envelope: the package the page shows — large / other — else worked out from the order)
+//     → { results: [{ orderId, ok, articleId, reused, cost, error }], pdf: base64 | null, labelError }
+//     dryRun: AusPost's price check only — nothing created
+//   POST /auspost/labels/:orderId/cancel → the shipment deleted (before lodging)
+const auspost = require("../../utils/auspost");
+const AUSPOST = "exyon_auspost_shipments";
+const AUSPOST_SIZES = ["large", "other"];
+const NETO_POST_FIELDS = ["OrderID", "ShipAddress", "DeliveryInstruction", "OrderLine", "OrderLine.SKU", "OrderLine.ProductName", "OrderLine.Quantity"];
+let auspostIndexReady = false;
+async function auspostCol() {
+  const db = await connectToDatabase();
+  const col = db.collection(AUSPOST);
+  if (!auspostIndexReady) {
+    // one live shipment an order — a double click can't make two
+    await col.createIndex({ orderId: 1 }, { unique: true, partialFilterExpression: { live: true } });
+    auspostIndexReady = true;
+  }
+  return col;
+}
+// orderId → its live AusPost shipment
+async function auspostOf(orderIds) {
+  if (!orderIds.length) return new Map();
+  const col = await auspostCol();
+  const docs = await col.find({ orderId: { $in: orderIds }, live: true, status: "created" }).toArray();
+  return new Map(docs.map((d) => [d.orderId, d]));
+}
+// a parcel as asked (blank = the default) → { parcel } | { error }
+function parcelOf(raw) {
+  const p = { ...auspost.DEFAULT_PARCEL, ...(raw && typeof raw === "object" ? raw : {}) };
+  if (!auspost.PRODUCTS[p.productId]) return { error: "Unknown AusPost product" };
+  const n = (v) => Number(v);
+  if (!(n(p.weight) >= 0.01 && n(p.weight) <= 22)) return { error: "The weight must be 0.01–22 kg" };
+  for (const k of ["length", "width", "height"]) if (!(n(p[k]) >= 1 && n(p[k]) <= 105)) return { error: `The ${k} must be 1–105 cm` };
+  return { parcel: { productId: p.productId, weight: n(p.weight), length: n(p.length), width: n(p.width), height: n(p.height) } };
+}
+router.post("/auspost/labels", PICK_EDIT, async function (req, res) {
+  const bad = (message, status = 400) => res.status(status).json({ success: false, message });
+  try {
+    if (!auspost.configured()) return bad("Australia Post isn't set up", 503);
+    const b = req.body || {};
+    const dryRun = !!b.dryRun;
+    // reprintOnly: the labels made already, never a new shipment (Print all labels, Reprint)
+    const reprintOnly = !!b.reprintOnly;
+    const asked = [];
+    for (const x of Array.isArray(b.orders) ? b.orders : []) {
+      const orderId = String((x && x.orderId) || "").trim();
+      if (!orderId || asked.some((a) => a.orderId === orderId)) continue;
+      const p = parcelOf(x.parcel);
+      if (p.error) return bad(`${orderId}: ${p.error}`);
+      // the package the page shows for it — a SKU's orders share one (user 2026-10-21)
+      const envelope = AUSPOST_SIZES.includes(String(x.envelope || "")) ? String(x.envelope) : "";
+      asked.push({ orderId, parcel: p.parcel, envelope });
+    }
+    if (!asked.length) return bad("Which orders?");
+    if (asked.length > 20) return bad("Up to 20 labels at a time");
+    const ids = asked.map((a) => a.orderId);
+    const col = await auspostCol();
+    const have = await auspostOf(ids);
+    const open = new Map((await openOrders()).map((o) => [o.orderId, o]));
+    const results = new Map();
+    const fresh = [];
+    for (const a of asked) {
+      if (have.has(a.orderId)) continue;
+      if (reprintOnly) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: "has no AusPost label to print — make it in Process" }); continue; }
+      const o = open.get(a.orderId);
+      if (!o) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: "no longer an open order — refresh the page" }); continue; }
+      const size = a.envelope || envelopeOf(o.items).size;
+      if (!AUSPOST_SIZES.includes(size)) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: `a ${size} envelope doesn't take an AusPost label` }); continue; }
+      fresh.push({ ...a, order: o });
+    }
+    // Neto: the delivery address, phone and instructions
+    const neto = new Map();
+    for (let i = 0; i < fresh.length; i += 100) {
+      const d = await netoCall("GetOrder", { Filter: { OrderID: fresh.slice(i, i + 100).map((f) => f.orderId), OutputSelector: NETO_POST_FIELDS } });
+      for (const o of [].concat(d.Order || [])) neto.set(String(o.OrderID), o);
+    }
+    const s = (v) => String(v == null ? "" : v).trim();
+    const now = new Date();
+    const by = actor(req);
+    for (const f of fresh) {
+      const n = neto.get(f.orderId);
+      if (!n || !(s(n.ShipStreetLine1) && s(n.ShipPostCode))) { results.set(f.orderId, { orderId: f.orderId, ok: false, error: "no delivery address in Neto" }); continue; }
+      const shipment = auspost.shipmentOf({
+        orderId: f.orderId,
+        to: { name: [s(n.ShipFirstName), s(n.ShipLastName)].filter(Boolean).join(" "), company: s(n.ShipCompany), street1: s(n.ShipStreetLine1), street2: s(n.ShipStreetLine2), city: s(n.ShipCity), state: s(n.ShipState), postcode: s(n.ShipPostCode), phone: s(n.ShipPhone) },
+        items: f.order.items.map((it) => ({ sku: it.sku, quantity: it.quantity })),
+        // as on the eParcel labels so far: Neto's delivery instruction (the product), else the products
+        deliveryInstructions: s(n.DeliveryInstruction) || f.order.items.map((it) => it.productName).join(" / "),
+        parcel: f.parcel,
+      });
+      if (dryRun) {
+        try {
+          const p = await auspost.priceShipment(shipment);
+          results.set(f.orderId, { orderId: f.orderId, ok: true, dryRun: true, cost: p.cost, parcel: f.parcel });
+        } catch (e) {
+          results.set(f.orderId, { orderId: f.orderId, ok: false, error: e.message });
+        }
+        continue;
+      }
+      // claim the order first (a second click finds it taken)
+      let claim;
+      try {
+        claim = await col.insertOne({ orderId: f.orderId, live: true, status: "creating", createdAt: now, createdBy: by });
+      } catch (e) {
+        results.set(f.orderId, { orderId: f.orderId, ok: false, error: "its label is being created already" });
+        continue;
+      }
+      try {
+        const r = await auspost.createShipment(shipment);
+        await col.updateOne({ _id: claim.insertedId }, { $set: {
+          status: "created", shipmentId: r.shipmentId, articleId: r.articleId, consignmentId: r.consignmentId, cost: r.cost,
+          productId: f.parcel.productId, parcel: f.parcel, to: { suburb: shipment.to.suburb, state: shipment.to.state, postcode: shipment.to.postcode },
+        } });
+        have.set(f.orderId, { orderId: f.orderId, shipmentId: r.shipmentId, articleId: r.articleId, cost: r.cost, fresh: true });
+      } catch (e) {
+        await col.deleteOne({ _id: claim.insertedId });
+        results.set(f.orderId, { orderId: f.orderId, ok: false, error: e.message });
+      }
+    }
+    if (dryRun) return res.json({ success: true, dryRun: true, results: ids.map((id) => results.get(id) || { orderId: id, ok: true, reused: true, articleId: have.get(id).articleId }) });
+
+    // one PDF for every order that has its shipment (new or from before)
+    const ok = ids.filter((id) => have.has(id));
+    let pdf = null;
+    let labelError = "";
+    if (ok.length) {
+      try {
+        pdf = await auspost.labelsPdf(ok.map((id) => have.get(id).shipmentId));
+        await col.updateMany({ orderId: { $in: ok }, live: true }, { $inc: { labelPrints: 1 }, $set: { labelAt: new Date() } });
+      } catch (e) {
+        labelError = e.message;
+      }
+    }
+    for (const id of ok) {
+      const h = have.get(id);
+      results.set(id, { orderId: id, ok: true, articleId: h.articleId, cost: h.cost == null ? null : h.cost, reused: !h.fresh });
+    }
+    return res.json({ success: true, results: ids.map((id) => results.get(id)), pdf: pdf ? pdf.toString("base64") : null, labelError });
+  } catch (error) {
+    console.error("Exyon AusPost labels error:", error.message);
+    return res.status(502).json({ success: false, message: error.message || "Failed to create the AusPost labels" });
+  }
+});
+
+// A wrong label (address, weight…) before it is lodged: the shipment deleted
+// in AusPost, and the tracking number taken off the order's pick list entry.
+router.post("/auspost/labels/:orderId/cancel", PICK_EDIT, async function (req, res) {
+  try {
+    const orderId = String(req.params.orderId || "").trim();
+    const col = await auspostCol();
+    const doc = await col.findOne({ orderId, live: true, status: "created" });
+    if (!doc) return res.status(404).json({ success: false, message: "No AusPost label for that order" });
+    const entry = (await pickEntriesOf([orderId])).get(orderId);
+    if (entry && dispatchStatusOf(entry) === "dispatched") {
+      return res.status(400).json({ success: false, message: `${orderId} is dispatched already — its label stays` });
+    }
+    await auspost.deleteShipment(doc.shipmentId);
+    const now = new Date();
+    const by = actor(req);
+    await col.updateOne({ _id: doc._id }, { $set: { live: false, status: "deleted", deletedAt: now, deletedBy: by } });
+    if (entry && entry.tracking === doc.articleId) {
+      const lists = await pickLists();
+      await lists.updateOne(
+        { day: entry.day, ...LIVE_LIST },
+        { $set: { "orders.$[o].tracking": "", updatedAt: now, updatedBy: by }, $push: { history: { at: now, by, action: "auspost label cancelled", orderId, tracking: doc.articleId } } },
+        { arrayFilters: [{ "o.orderId": orderId, "o.tracking": doc.articleId }] },
+      );
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Exyon AusPost cancel error:", error.message);
+    return res.status(502).json({ success: false, message: error.message || "Failed to cancel the AusPost label" });
+  }
+});
+
 router.get("/dispatch", VIEW, async function (req, res) {
   try {
 
@@ -836,12 +1023,15 @@ router.get("/dispatch", VIEW, async function (req, res) {
     // dispatched from a pick list = done, whatever Neto's cached answer says
     orders = orders.filter((o) => dispatchStatusOf(entry.get(o.orderId)) !== "dispatched");
     // envelope: the size the order ships in, from its items (user 2026-10-20);
-    // dispatch: held back / a failed push, from its pick list
+    // dispatch: held back / a failed push, from its pick list; auspost: its
+    // AusPost label (2026-10-21) — the article id is its tracking number
+    const posted = await auspostOf(orders.map((o) => o.orderId)).catch(() => new Map());
     const brief = (o) => {
       const e = entry.get(o.orderId) || {};
+      const ap = posted.get(o.orderId);
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
         status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, pickBatch: e.batch || null, tracking: e.tracking || "",
-        dispatch: e.dispatch || null, envelope: envelopeOf(o.items) };
+        dispatch: e.dispatch || null, envelope: envelopeOf(o.items), auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
     };
     const sku = new Map();
     const multiLine = [];
