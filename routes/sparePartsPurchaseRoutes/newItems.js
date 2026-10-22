@@ -23,7 +23,10 @@
 // read back) — a product the store can't show isn't approved. Undoing an
 // approval leaves the store as it is.
 //
-//   GET  /sparePartsPurchase/new-items?search=&reviewed=yes|no|changed&by=&brand=&issues=1&order=yes|no&page=&pageSize=
+//   GET  /sparePartsPurchase/new-items?search=&reviewed=yes|no|changed&by=&brand=&series=&model=&issues=1&order=yes|no&page=&pageSize=
+//     → { rows, total, counts, creators, brands, tree } — tree: Brand › Series › Model
+//       with counts (user 2026-10-22), over the list as filtered except the
+//       node itself; brand / series / model pick a node ("__none__" = none)
 //   POST /sparePartsPurchase/new-items/review { itemIds: [...], reviewed: true | false, dryRun? }
 //
 // Ordering: the page adds Spare Parts Purchase lines with POST /orders (the
@@ -50,6 +53,69 @@ const str = (v) => String(v == null ? "" : v).trim();
 const actor = (req) => (req.user && (req.user.username || req.user.email)) || null;
 const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const time = (d) => (d ? new Date(d).getTime() || 0 : 0);
+
+// ── the Brand › Series › Model tree (2026-10-22) ──
+// An item has one brand, one or more series ("; "-separated) and its
+// compatible models. Each model is filed under ONE series of its brand — the
+// one it is paired with most often across every created product — so an item
+// fitting two series doesn't put every model under both.
+const NONE = "__none__";
+const brandOf = (r) => r.deviceBrand || NONE;
+const seriesListOf = (r) => {
+  const list = String(r.deviceSeries || "").split(/\s*;\s*/).filter(Boolean);
+  return list.length ? list : [NONE];
+};
+function modelHomes(rows) {
+  const tally = new Map(); // brand \u0001 model → Map(series → n)
+  for (const r of rows) {
+    for (const m of r.compatibleModels || []) {
+      const k = brandOf(r) + "\u0001" + m;
+      if (!tally.has(k)) tally.set(k, new Map());
+      for (const sr of seriesListOf(r)) tally.get(k).set(sr, (tally.get(k).get(sr) || 0) + 1);
+    }
+  }
+  const home = new Map();
+  for (const [k, m] of tally) home.set(k, [...m].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0]);
+  return (brand, model) => home.get(brand + "\u0001" + model) || NONE;
+}
+// is the item under the picked node? sel: { brand?, series?, model? }
+function inNode(r, sel, home) {
+  if (sel.brand && brandOf(r) !== sel.brand) return false;
+  if (sel.model) return (r.compatibleModels || []).includes(sel.model);
+  if (sel.series) {
+    const models = r.compatibleModels || [];
+    if (models.length) return models.some((m) => home(brandOf(r), m) === sel.series);
+    return seriesListOf(r).includes(sel.series);
+  }
+  return true;
+}
+// [{ brand, n, series: [{ series, n, models: [{ model, n }] }] }] — n = products
+function treeOf(rows, home) {
+  const brands = new Map();
+  for (const r of rows) {
+    const b = brandOf(r);
+    if (!brands.has(b)) brands.set(b, { items: new Set(), series: new Map() });
+    const B = brands.get(b);
+    B.items.add(r.itemId);
+    const sOf = (name) => { if (!B.series.has(name)) B.series.set(name, { items: new Set(), models: new Map() }); return B.series.get(name); };
+    const models = r.compatibleModels || [];
+    if (models.length) {
+      for (const m of models) {
+        const S = sOf(home(b, m));
+        S.items.add(r.itemId);
+        if (!S.models.has(m)) S.models.set(m, new Set());
+        S.models.get(m).add(r.itemId);
+      }
+    } else {
+      for (const name of seriesListOf(r)) sOf(name).items.add(r.itemId);
+    }
+  }
+  return [...brands].map(([brand, B]) => ({
+    brand,
+    n: B.items.size,
+    series: [...B.series].map(([series, S]) => ({ series, n: S.items.size, models: [...S.models].map(([model, set]) => ({ model, n: set.size })) })),
+  }));
+}
 // where a Spare Parts Purchase line for it files — the same rule as
 // sparePartsPurchaseRoutes categoryOfItem (MacBook screens apart; the server
 // works it out again when the line is created)
@@ -240,6 +306,8 @@ router.get("/", VIEW, async (req, res, next) => {
       };
     });
 
+    // each model's series, over every created product
+    const home = modelHomes(rows);
     // the filters' options and counts, before the filters themselves
     const creators = [...new Set(rows.map((r) => r.createdBy).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     const brands = [...new Set(rows.map((r) => r.deviceBrand).filter(Boolean))].sort((a, b) => a.localeCompare(b));
@@ -254,27 +322,31 @@ router.get("/", VIEW, async (req, res, next) => {
       });
     }
     if (str(q.by)) rows = rows.filter((r) => r.createdBy === str(q.by));
-    if (str(q.brand)) rows = rows.filter((r) => r.deviceBrand === str(q.brand));
     if (q.issues === "1" || q.issues === "true") rows = rows.filter((r) => r.issues.length);
     // on order = an open Spare Parts Purchase line for it
     if (q.order === "no") rows = rows.filter((r) => !r.onOrder);
     else if (q.order === "yes") rows = rows.filter((r) => r.onOrder);
+    // the tree's node (brand / series / model): the tree itself is counted
+    // over the list as the other filters and the Reviewed tab leave it
+    const sel = { brand: str(q.brand), series: str(q.series), model: str(q.model) };
+    const reviewedOk = (r) => (q.reviewed === "no" ? !r.reviewed : q.reviewed === "yes" ? !!r.reviewed
+      : q.reviewed === "changed" ? !!r.reviewed && r.changedSinceReview.length > 0 : true);
+    const tree = treeOf(rows.filter(reviewedOk), home);
+    rows = rows.filter((r) => inNode(r, sel, home));
     const counts = {
       all: rows.length,
       notReviewed: rows.filter((r) => !r.reviewed).length,
       reviewed: rows.filter((r) => r.reviewed).length,
       changed: rows.filter((r) => r.reviewed && r.changedSinceReview.length).length,
     };
-    if (q.reviewed === "no") rows = rows.filter((r) => !r.reviewed);
-    else if (q.reviewed === "yes") rows = rows.filter((r) => r.reviewed);
-    else if (q.reviewed === "changed") rows = rows.filter((r) => r.reviewed && r.changedSinceReview.length);
+    rows = rows.filter(reviewedOk);
 
     // newest first (the SKU breaks a tie — one create batch shares a minute)
     rows.sort((a, b) => time(b.createdAt) - time(a.createdAt) || String(b.sku).localeCompare(String(a.sku), undefined, { numeric: true }));
     const total = rows.length;
     const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
 
-    return res.json({ success: true, total, page, pageSize, counts, creators, brands, issueLabels: Object.fromEntries(ISSUES), rows: pageRows });
+    return res.json({ success: true, total, page, pageSize, counts, creators, brands, tree, issueLabels: Object.fromEntries(ISSUES), rows: pageRows });
   } catch (error) {
     next(error);
   }
