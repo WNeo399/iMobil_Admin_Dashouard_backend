@@ -13,6 +13,8 @@
 //   · "SHIELD" counts as a case only as a word of its own — not the iShield
 //     brand, nor WINDSHIELD
 // Reasons come back as codes so the page can word (and translate) them.
+// An item's envelope can also be chosen by hand on the Dispatch page
+// (2026-10-22): it replaces the rules for that item (reason code "set").
 
 const SIZES = ["small", "medium", "large", "other"];
 
@@ -39,9 +41,32 @@ function classify(productName) {
   return { sp, phoneCase, ipad, large, small, recognised: sp || phoneCase || ipad || large || small };
 }
 
-// items: [{ productName, quantity }] → { size, reasons: [{ code, n?, names? }] }
-//   codes: ipad · largeItem · cases (n) · screenProtectors (n) · unknown (names)
-function envelopeOf(items) {
+const RANK = { small: 0, medium: 1, large: 2, other: 3 };
+const skuKeyOf = (sku) => String(sku || "").trim().toLowerCase();
+
+// items: [{ sku, productName, quantity }], overrides: Map(sku lower-cased → size)
+//   → { size, reasons: [{ code, n?, names? }] }
+//   codes: ipad · largeItem · cases (n) · screenProtectors (n) · unknown (names) · set (names)
+// An item chosen by hand counts as its size; the other items go through the
+// rules together; the order takes the bigger ("other" the biggest).
+function envelopeOf(items, overrides) {
+  const set = [];
+  const rest = [];
+  for (const it of items || []) {
+    const size = overrides && overrides.get(skuKeyOf(it && it.sku));
+    if (size && SIZES.includes(size)) set.push({ size, name: String((it && it.productName) || "").trim() || String((it && it.sku) || "") });
+    else rest.push(it);
+  }
+  if (!set.length) return byRules(rest);
+  const chosen = set.reduce((m, x) => (RANK[x.size] > RANK[m] ? x.size : m), "small");
+  const reasons = [{ code: "set", names: [...new Set(set.map((x) => x.name))] }];
+  if (!rest.length) return { size: chosen, reasons };
+  const auto = byRules(rest);
+  return RANK[auto.size] > RANK[chosen] ? { size: auto.size, reasons: [...auto.reasons, ...reasons] } : { size: chosen, reasons: [...reasons, ...auto.reasons] };
+}
+
+// the rules alone
+function byRules(items) {
   let screenProtectors = 0;
   let cases = 0;
   let ipad = false;
@@ -73,4 +98,4 @@ function envelopeOf(items) {
   return { size: "small", reasons: screenProtectors ? [{ code: "screenProtectors", n: screenProtectors }] : [] };
 }
 
-module.exports = { SIZES, classify, envelopeOf };
+module.exports = { SIZES, classify, envelopeOf, skuKeyOf };

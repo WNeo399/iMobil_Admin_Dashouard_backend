@@ -20,6 +20,7 @@
 //   GET  /exyon-accessories/labels?orderIds=A,B   → shipping label data (address from Neto)
 //   POST /exyon-accessories/auspost/labels { orders: [{ orderId, parcel? }], dryRun? } — AusPost eParcel labels (Large / Other)
 //   POST /exyon-accessories/auspost/labels/:orderId/cancel — the AusPost shipment deleted (before lodging)
+//   PUT  /exyon-accessories/envelopes/:sku { size } — an item's envelope chosen by hand ("" = the rules)
 
 var express = require("express");
 var router = express.Router();
@@ -28,7 +29,7 @@ const { exQuery } = require("../../utils/exDb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { imageUrlFromId } = require("../../utils/productImage");
 const { zohoIdsForSkus, netoCall } = require("../../utils/neto");
-const { envelopeOf } = require("../../utils/exyonEnvelope");
+const { envelopeOf, skuKeyOf, SIZES: ENVELOPE_SIZES } = require("../../utils/exyonEnvelope");
 
 // Admin (*:*:*), the Exyon roles — Operation (2026-10-08), Admin
 // (2026-10-20), Warehouse (2026-10-21) — and iMobile Warehouse (2026-10-21);
@@ -876,6 +877,7 @@ router.post("/auspost/labels", PICK_EDIT, async function (req, res) {
     const col = await auspostCol();
     const have = await auspostOf(ids);
     const open = new Map((await openOrders()).map((o) => [o.orderId, o]));
+    const envSet = await envelopeOverrides();
     const results = new Map();
     const fresh = [];
     for (const a of asked) {
@@ -883,7 +885,7 @@ router.post("/auspost/labels", PICK_EDIT, async function (req, res) {
       if (reprintOnly) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: "has no AusPost label to print — make it in Process" }); continue; }
       const o = open.get(a.orderId);
       if (!o) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: "no longer an open order — refresh the page" }); continue; }
-      const size = a.envelope || envelopeOf(o.items).size;
+      const size = a.envelope || envelopeOf(o.items, envSet).size;
       if (!AUSPOST_SIZES.includes(size)) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: `a ${size} envelope doesn't take an AusPost label` }); continue; }
       fresh.push({ ...a, order: o });
     }
@@ -992,6 +994,34 @@ router.post("/auspost/labels/:orderId/cancel", PICK_EDIT, async function (req, r
   }
 });
 
+// Envelopes chosen by hand on the Dispatch page (user 2026-10-22: "allow
+// changing the envelope for the items") — one per Neto SKU, for every order
+// of it from then on, until set back to the rules. Mongo
+// exyon_envelope_overrides { _id: sku lower-cased, sku, size, setAt, setBy }.
+const ENVELOPE_OVERRIDES = "exyon_envelope_overrides";
+async function envelopeOverrides() {
+  const db = await connectToDatabase();
+  const rows = await db.collection(ENVELOPE_OVERRIDES).find({}, { projection: { size: 1 } }).toArray();
+  return new Map(rows.map((r) => [String(r._id), r.size]));
+}
+
+router.put("/envelopes/:sku", PICK_EDIT, async function (req, res) {
+  try {
+    const sku = String(req.params.sku || "").trim();
+    if (!sku) return res.status(400).json({ success: false, message: "Which item?" });
+    const size = String((req.body && req.body.size) || "").trim().toLowerCase();
+    if (size && !ENVELOPE_SIZES.includes(size)) return res.status(400).json({ success: false, message: "Small, Medium, Large or Other" });
+    const db = await connectToDatabase();
+    const col = db.collection(ENVELOPE_OVERRIDES);
+    if (!size) await col.deleteOne({ _id: skuKeyOf(sku) });
+    else await col.updateOne({ _id: skuKeyOf(sku) }, { $set: { sku, size, setAt: new Date(), setBy: actor(req) } }, { upsert: true });
+    return res.json({ success: true, sku, size: size || null });
+  } catch (error) {
+    console.error("Exyon envelope set error:", error.message);
+    return res.status(500).json({ success: false, message: "Failed to change the envelope" });
+  }
+});
+
 router.get("/dispatch", VIEW, async function (req, res) {
   try {
 
@@ -1026,12 +1056,13 @@ router.get("/dispatch", VIEW, async function (req, res) {
     // dispatch: held back / a failed push, from its pick list; auspost: its
     // AusPost label (2026-10-21) — the article id is its tracking number
     const posted = await auspostOf(orders.map((o) => o.orderId)).catch(() => new Map());
+    const envSet = await envelopeOverrides();
     const brief = (o) => {
       const e = entry.get(o.orderId) || {};
       const ap = posted.get(o.orderId);
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
         status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, pickBatch: e.batch || null, tracking: e.tracking || "",
-        dispatch: e.dispatch || null, envelope: envelopeOf(o.items), auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
+        dispatch: e.dispatch || null, envelope: envelopeOf(o.items, envSet), auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
     };
     const sku = new Map();
     const multiLine = [];
@@ -1042,7 +1073,8 @@ router.get("/dispatch", VIEW, async function (req, res) {
       } else if (o.items.length === 1) {
         const it = o.items[0];
         const k = skuKey(it.sku);
-        const g = sku.get(k) || { key: k, sku: it.sku, productName: it.productName, image: it.image || null, zohoSku: it.zohoSku || "", zohoName: it.zohoName || "", location: it.location || "", units: 0, orders: [] };
+        // envelopeSet: the item's envelope chosen by hand, if any
+        const g = sku.get(k) || { key: k, sku: it.sku, productName: it.productName, image: it.image || null, zohoSku: it.zohoSku || "", zohoName: it.zohoName || "", location: it.location || "", envelopeSet: envSet.get(skuKeyOf(it.sku)) || null, units: 0, orders: [] };
         g.units += it.quantity;
         g.orders.push({ ...brief(o), quantity: it.quantity, unitPrice: it.unitPrice, lineIds: it.lineIds });
         sku.set(k, g);
