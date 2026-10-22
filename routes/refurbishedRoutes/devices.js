@@ -220,6 +220,9 @@ router.get("/", VIEW, async (req, res) => {
         : { $in: batchDeviceIds };
     }
     if (req.query.grade) match.grade = String(req.query.grade);
+    // Storage (the Stock page's filter, 2026-10-22); "none" = not recorded
+    if (req.query.storage === "none") match.storage = { $in: [null, ""] };
+    else if (req.query.storage) match.storage = String(req.query.storage);
     if (req.query.stockSource) match.stockSource = String(req.query.stockSource);
     // Applied after the query params so a crafted stockSource= can't widen
     // a supplier's view.
