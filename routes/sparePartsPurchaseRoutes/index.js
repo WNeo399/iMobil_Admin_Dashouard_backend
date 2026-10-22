@@ -279,16 +279,18 @@ router.get("/products/search", requireAny("spp:order:view", "spp:batch:create"),
     // SKU that happens to contain it
     const words = q.split(/\s+/).filter(Boolean).map((w) => new RegExp(escapeRegex(w), "i"));
     const db = await connectToDatabase();
-    const rows = await db
-      .collection(ITEMS)
-      .find(
-        { active: true, scope: "parts", $or: [{ sku: new RegExp("^" + escapeRegex(q), "i") }, { $and: words.map((rx) => ({ name: rx })) }] },
-        { projection: { _id: 0, itemId: 1, sku: 1, name: 1, imageId: 1, classification: 1, subClassification: 1, "metrics.available": 1 } },
-      )
-      .limit(25)
-      .toArray();
+    // Every item active in Zoho, shown in the store or not (user 2026-10-22:
+    // "they will need items active in Zoho Inventory no matter it is shown in
+    // store or not") — parts first, then accessories / TE items in the room left
+    const match = { active: true, $or: [{ sku: new RegExp("^" + escapeRegex(q), "i") }, { $and: words.map((rx) => ({ name: rx })) }] };
+    const projection = { _id: 0, itemId: 1, sku: 1, name: 1, imageId: 1, classification: 1, subClassification: 1, scope: 1, "metrics.available": 1 };
+    const rows = await db.collection(ITEMS).find({ ...match, scope: "parts" }, { projection }).limit(25).toArray();
+    if (rows.length < 20) {
+      rows.push(...(await db.collection(ITEMS).find({ ...match, scope: { $ne: "parts" } }, { projection }).limit(25 - rows.length).toArray()));
+    }
     const exact = (r) => (String(r.sku).toLowerCase() === q.toLowerCase() ? 0 : 1);
-    rows.sort((a, b) => exact(a) - exact(b) || String(a.name).localeCompare(String(b.name)));
+    const isPart = (r) => (r.scope === "parts" ? 0 : 1);
+    rows.sort((a, b) => exact(a) - exact(b) || isPart(a) - isPart(b) || String(a.name).localeCompare(String(b.name)));
     const products = rows.slice(0, 20).map((r) => ({
       itemId: r.itemId,
       sku: r.sku || "",
@@ -296,6 +298,8 @@ router.get("/products/search", requireAny("spp:order:view", "spp:batch:create"),
       imageId: r.imageId || null,
       imageUrl: imageUrlFromId(r.imageId),
       classification: r.classification || "",
+      // parts / accessory / te — the dialog tags the last two
+      scope: r.scope || "parts",
       available: r.metrics ? r.metrics.available : null,
       // where a line for it files (the server derives the same on create)
       suggestedCategory: categoryOfItem(r),
