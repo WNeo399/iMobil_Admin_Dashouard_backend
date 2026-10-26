@@ -140,10 +140,13 @@ const stripWords = (model, words) => {
   }
   return s;
 };
-function otherBrand({ label, deviceBrand = label, words, display, cm, categoryPrefix, modelHint, codesHint = "" }) {
+function otherBrand({ label, deviceBrand = label, onlySeries = null, words, display, cm, categoryPrefix, modelHint, codesHint = "" }) {
   const cfg = {
     label,
     deviceBrand,
+    // a brand Zoho files under another Device Brand as a series (ASUS = "Other" › "Asus"):
+    // only those Device Series are its own
+    onlySeries,
     words,
     short: (m) => stripWords(m.model, words),
     compatibleModel: (m) => cm(m, cfg.short(m)),
@@ -173,6 +176,10 @@ Object.assign(BRANDS, {
   Huawei: otherBrand({ label: "Huawei", words: ["huawei"], display: (m) => `Huawei ${withCodes(m)}`, cm: (m, s) => `Huawei ${s}`, categoryPrefix: "Huawei ", modelHint: "e.g. P60 Pro" }),
   Sony: otherBrand({ label: "Sony", words: ["sony"], display: (m) => `Sony ${withCodes(m)}`, cm: (m, s) => `Sony ${s}`, categoryPrefix: "Sony ", modelHint: "e.g. Xperia 1 VII" }),
   Nokia: otherBrand({ label: "Nokia", words: ["nokia"], display: (m) => `Nokia ${withCodes(m)}`, cm: (m, s) => `Nokia ${s}`, categoryPrefix: "Nokia ", modelHint: "e.g. G42" }),
+  // ASUS (user 2026-10-26, "I need ASUS models first"): Zoho has no ASUS Device
+  // Brand — its parts are Device Brand "Other", Device Series "Asus" ("Asus
+  // Zenfone 3 Max (ZC520TL) Compatible …", Compatible Model "Asus Zenfone 3 Max")
+  ASUS: otherBrand({ label: "ASUS", deviceBrand: "Other", onlySeries: ["Asus"], words: ["asus"], display: (m) => `Asus ${withCodes(m)}`, cm: (m, s) => `Asus ${s}`, categoryPrefix: "Asus ", modelHint: "e.g. Zenfone 11 Ultra, ROG Phone 9" }),
 });
 // The Device Series for a set of Compatible Models ("; "-joined, like the
 // other brands' items); "" when the brand has no series rule.
@@ -334,7 +341,10 @@ router.get("/", VIEW, async (req, res, next) => {
       for (const x of zohoSeries) {
         if (String(x._id.b).toLowerCase() !== BRANDS[brand].deviceBrand.toLowerCase()) continue;
         // an item filed under several ("S Series; Note Series") counts for each
-        for (const s of String(x._id.s).split(";").map((y) => y.trim()).filter(Boolean)) counts.set(s, (counts.get(s) || 0) + x.n);
+        for (const s of String(x._id.s).split(";").map((y) => y.trim()).filter(Boolean)) {
+          if (BRANDS[brand].onlySeries && !BRANDS[brand].onlySeries.includes(s)) continue;
+          counts.set(s, (counts.get(s) || 0) + x.n);
+        }
       }
       const zoho = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([s]) => s);
       seriesOptions[brand] = [...new Set([...seriesOptions[brand], ...zoho])];
