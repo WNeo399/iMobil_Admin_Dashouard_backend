@@ -20,6 +20,7 @@
 //   GET  /exyon-accessories/labels?orderIds=A,B   → shipping label data (address from Neto)
 //   POST /exyon-accessories/auspost/labels { orders: [{ orderId, parcel? }], dryRun? } — AusPost eParcel labels (Large / Other)
 //   POST /exyon-accessories/auspost/labels/:orderId/cancel — the AusPost shipment deleted (before lodging)
+//   POST /exyon-accessories/neto-sync { orderIds } — Neto's current lines for those orders (kept; Dispatch uses them)
 //   PUT  /exyon-accessories/envelopes/:sku { size } — an item's envelope chosen by hand ("" = the rules)
 
 var express = require("express");
@@ -204,8 +205,103 @@ async function openOrders({ channel, status } = {}) {
   if (channel) { parts.push("sales_channel = ?"); params.push(String(channel)); }
   if (status) { parts.push("order_status = ?"); params.push(String(status)); }
   const rows = await exQuery(`SELECT ${COLUMNS} FROM ${TABLE} WHERE ${parts.join(" AND ")} ORDER BY date_placed, id LIMIT 5000`, params);
-  return ordersOf(rows);
+  return withNetoLines(ordersOf(rows));
 }
+
+// ── Neto's lines (2026-10-27) ───────────────────────────────────────────
+// Exyon's table never drops a line cancelled in Neto (RB-A3481675's black case
+// stayed at Pick after Neto removed it). "Sync with Neto" on the Dispatch page
+// (a SKU tile's orders, or one order) reads each order's lines from Neto and
+// keeps them here; from then on the order's items are Neto's — Dispatch,
+// Process (the pick list snapshot) and the AusPost labels all read them.
+// Mongo exyon_neto_lines { _id: orderId, status, lines: [{ lineId, sku,
+// productName, quantity, unitPrice }], netoUpdatedAt, syncedAt, syncedBy }.
+const NETO_LINES = "exyon_neto_lines";
+const NETO_LINE_FIELDS = ["OrderID", "OrderStatus", "DateUpdated", "OrderLine", "OrderLine.SKU", "OrderLine.ProductName", "OrderLine.Quantity", "OrderLine.UnitPrice", "OrderLine.OrderLineID"];
+// an order's items from Neto's lines (one per SKU, as ordersOf makes them)
+function itemsOfNetoLines(lines) {
+  const items = new Map();
+  for (const l of lines || []) {
+    const k = skuKey(l.sku);
+    const it = items.get(k);
+    if (it) { it.quantity += Number(l.quantity) || 0; it.lineIds.push(l.lineId); }
+    else items.set(k, { sku: String(l.sku || "").trim(), productName: l.productName || "", quantity: Number(l.quantity) || 0, unitPrice: l.unitPrice, lineIds: [l.lineId] });
+  }
+  return [...items.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, it]) => it);
+}
+// the open orders with their synced Neto lines in place (an order Neto left
+// no lines on drops out)
+async function withNetoLines(orders) {
+  if (!orders.length) return orders;
+  let docs = [];
+  try {
+    const db = await connectToDatabase();
+    docs = await db.collection(NETO_LINES).find({ _id: { $in: orders.map((o) => o.orderId) } }).toArray();
+  } catch (e) {
+    console.error("Exyon accessories — Neto lines:", e.message);
+    return orders;
+  }
+  if (!docs.length) return orders;
+  const byId = new Map(docs.map((d) => [d._id, d]));
+  return orders
+    .map((o) => {
+      const d = byId.get(o.orderId);
+      if (!d) return o;
+      return { ...o, items: itemsOfNetoLines(d.lines), netoSynced: { at: d.syncedAt, by: d.syncedBy || "", changed: !!d.changed } };
+    })
+    .filter((o) => o.items.length);
+}
+const fmtLine = (l) => ({ sku: l.sku, productName: l.productName, quantity: Number(l.quantity) || 0 });
+router.post("/neto-sync", PICK_EDIT, async function (req, res) {
+  try {
+    const ids = [...new Set((Array.isArray(req.body && req.body.orderIds) ? req.body.orderIds : []).map((x) => String(x || "").trim()).filter(Boolean))];
+    if (!ids.length) return res.status(400).json({ success: false, message: "Which orders?" });
+    if (ids.length > 300) return res.status(400).json({ success: false, message: "Up to 300 orders at a time" });
+    // Exyon's lines as they are (to say what changed)
+    const exRows = await exQuery(`SELECT ${COLUMNS} FROM ${TABLE} WHERE order_id IN (?) ORDER BY id`, [ids]);
+    const exLines = new Map();
+    for (const r of exRows) {
+      if (!exLines.has(r.orderId)) exLines.set(r.orderId, []);
+      exLines.get(r.orderId).push({ lineId: String(r.lineId || ""), sku: String(r.sku || "").trim(), productName: r.productName || "", quantity: Number(r.quantity) || 0 });
+    }
+    const got = new Map();
+    for (let i = 0; i < ids.length; i += 100) {
+      const d = await netoCall("GetOrder", { Filter: { OrderID: ids.slice(i, i + 100), OutputSelector: NETO_LINE_FIELDS } });
+      for (const o of [].concat(d.Order || [])) got.set(String(o.OrderID), o);
+    }
+    const db = await connectToDatabase();
+    const now = new Date();
+    const by = actor(req);
+    const results = [];
+    const ops = [];
+    const statusOps = [];
+    for (const id of ids) {
+      const o = got.get(id);
+      if (!o) { results.push({ orderId: id, notInNeto: true }); continue; }
+      const status = String(o.OrderStatus || "");
+      const lines = [].concat(o.OrderLine || []).map((l) => ({
+        lineId: String(l.OrderLineID || ""), sku: String(l.SKU || "").trim(), productName: String(l.ProductName || ""),
+        quantity: Number(l.Quantity) || 0, unitPrice: l.UnitPrice == null ? null : Number(l.UnitPrice),
+      }));
+      const before = exLines.get(id) || [];
+      const neto = new Map(lines.map((l) => [l.lineId, l]));
+      const removed = before.filter((l) => !neto.has(l.lineId)).map(fmtLine);
+      const added = lines.filter((l) => !before.some((b) => b.lineId === l.lineId)).map(fmtLine);
+      const qty = before.filter((l) => neto.has(l.lineId) && neto.get(l.lineId).quantity !== l.quantity)
+        .map((l) => ({ sku: l.sku, productName: l.productName, from: l.quantity, to: neto.get(l.lineId).quantity }));
+      const changed = removed.length + added.length + qty.length > 0;
+      results.push({ orderId: id, status, removed, added, qty, changed });
+      ops.push({ updateOne: { filter: { _id: id }, update: { $set: { status, lines, changed, netoUpdatedAt: o.DateUpdated || null, syncedAt: now, syncedBy: by } }, upsert: true } });
+      statusOps.push({ updateOne: { filter: { _id: id }, update: { $set: { status, checkedAt: now } }, upsert: true } });
+    }
+    if (ops.length) await db.collection(NETO_LINES).bulkWrite(ops, { ordered: false });
+    if (statusOps.length) await db.collection(NETO_STATUS).bulkWrite(statusOps, { ordered: false });
+    return res.json({ success: true, results });
+  } catch (error) {
+    console.error("Exyon Neto sync error:", error.message);
+    return res.status(502).json({ success: false, message: error.message || "Failed to sync with Neto" });
+  }
+});
 
 // ── Neto's status of the open orders (2026-10-20) ───────────────────────
 // Exyon's table keeps an order at Pick for good — it is dispatched in Neto
@@ -321,9 +417,14 @@ function pickLinesOf(list) {
   for (const o of list.orders || []) {
     for (const it of o.items || []) {
       const k = lineKeyOf(it);
-      const l = lines.get(k) || { key: k, zohoSku: it.zohoSku || "", zohoName: it.zohoName || "", location: it.location || "", productName: it.productName || "", netoSkus: [], image: it.image || null, single: 0, multi: 0, total: 0, orders: 0 };
+      const l = lines.get(k) || { key: k, zohoSku: it.zohoSku || "", zohoName: it.zohoName || "", location: it.location || "", productName: it.productName || "", netoSkus: [], image: it.image || null, single: 0, multi: 0, total: 0, orders: 0, singleAt: null, multiAt: null };
       const q = Number(it.quantity) || 0;
       if (o.multi) l.multi += q; else l.single += q;
+      // when the team first processed an order with it — per kind (the printed
+      // list runs earliest first, user 2026-10-27)
+      const at = o.processedAt || o.addedAt || null;
+      const slot = o.multi ? "multiAt" : "singleAt";
+      if (at && (!l[slot] || new Date(at) < new Date(l[slot]))) l[slot] = at;
       l.total += q;
       l.orders += 1;
       if (it.sku && !l.netoSkus.includes(it.sku)) l.netoSkus.push(it.sku);
@@ -515,6 +616,48 @@ router.post("/pick-lists/:day/remove", PICK_EDIT, async function (req, res) {
   } catch (error) {
     console.error("Exyon pick list remove error:", error);
     return res.status(502).json({ success: false, message: error.message || "Failed to remove the order" });
+  }
+});
+
+// A processed order's tracking number changed (user 2026-10-27: "allow
+// updating the tracking number if it is not yet dispatched") — only the
+// number: its processed time (the printed list's order) stays. Not for a
+// dispatched order (Neto has its number), nor one whose number is a live
+// AusPost label (cancel that label first), nor a number another order on a
+// pick list already has.
+//   POST /pick-lists/:day/tracking { orderId, tracking }
+router.post("/pick-lists/:day/tracking", PICK_EDIT, async function (req, res) {
+  const bad = (message, code = 400) => res.status(code).json({ success: false, message });
+  try {
+    const day = String(req.params.day || "");
+    const orderId = String((req.body && req.body.orderId) || "").trim();
+    const tracking = String((req.body && req.body.tracking) || "").replace(/\s+/g, "");
+    if (!DAY_RE.test(day) || !orderId) return bad("Which order?");
+    if (!TRACKING_RE.test(tracking)) return bad(`"${tracking}" doesn't look like a tracking number`);
+    const col = await pickLists();
+    const on = await col.findOne({ day, ...LIVE_LIST }, { projection: { orders: { $elemMatch: { orderId } } } });
+    const entry = on && on.orders && on.orders[0];
+    if (!entry) return bad("That order is not on this list", 404);
+    if (dispatchStatusOf(entry) === "dispatched") return bad(`${orderId} is already dispatched — Neto has its tracking number`);
+    if (entry.tracking === tracking) return res.json({ success: true, unchanged: true });
+    const ap = (await auspostOf([orderId]).catch(() => new Map())).get(orderId);
+    if (ap && ap.articleId && entry.tracking === ap.articleId) return bad(`${orderId}'s tracking number is its AusPost label — cancel that label first`);
+    const clash = await col.findOne({ ...LIVE_LIST, orders: { $elemMatch: { tracking, orderId: { $ne: orderId } } } }, { projection: { day: 1, orders: { $elemMatch: { tracking } } } });
+    if (clash) return bad(`${tracking} is already the tracking number of ${clash.orders[0].orderId} (${clash.day})`);
+    const now = new Date();
+    const by = actor(req);
+    const r = await col.updateOne(
+      { day, ...LIVE_LIST, "orders.orderId": orderId },
+      {
+        $set: { "orders.$.tracking": tracking, "orders.$.trackingChangedAt": now, "orders.$.trackingChangedBy": by, updatedAt: now, updatedBy: by },
+        $push: { history: { at: now, by, action: "tracking changed", orderId, tracking, was: entry.tracking || "" } },
+      },
+    );
+    if (!r.modifiedCount) return bad("That order is not on this list", 404);
+    return res.json({ success: true, orderId, tracking, was: entry.tracking || "" });
+  } catch (error) {
+    console.error("Exyon pick list tracking error:", error);
+    return res.status(502).json({ success: false, message: error.message || "Failed to change the tracking number" });
   }
 });
 
@@ -1062,7 +1205,7 @@ router.get("/dispatch", VIEW, async function (req, res) {
       const ap = posted.get(o.orderId);
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
         status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, pickBatch: e.batch || null, tracking: e.tracking || "",
-        dispatch: e.dispatch || null, envelope: envelopeOf(o.items, envSet), auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
+        dispatch: e.dispatch || null, netoSynced: o.netoSynced || null, envelope: envelopeOf(o.items, envSet), auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
     };
     const sku = new Map();
     const multiLine = [];
