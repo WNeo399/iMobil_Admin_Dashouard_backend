@@ -10,10 +10,11 @@ var router = express.Router();
 const { requirePermission } = require("../../middleware/auth");
 
 const REPAIRDESK_API_BASE = "https://api.repairdesk.co/api/web/v1";
-// `filter=45` is the saved RepairDesk filter the original standalone page
-// used — it scopes to active iMobile-store tickets only. Same value as in
-// Imobile-Repair/src/app/util/helper.js.
-const FILTER_ID = 45;
+// The saved RepairDesk filter the list (and the invoice join) reads. Each
+// looks like a rolling window of tickets created in the last N days: #45
+// (the original standalone page's, 45 days) → #60 (user 2026-10-27: 60 days —
+// 435 tickets from 28 Aug vs 330 from 14 Sep, every #45 ticket included).
+const FILTER_ID = 60;
 const PAGE_SIZE = 1000;
 const MAX_PAGES = 50; // safety net so a runaway response can't loop forever
 
@@ -251,6 +252,51 @@ router.get("/tickets", GATE_LIST, async function (req, res) {
       success: false,
       message: `Failed to fetch tickets: ${error.message || error}`,
     });
+  }
+});
+
+// ── GET /repair/tickets/search?q= ────────────────────────────────────
+// A ticket-number search over EVERY RepairDesk ticket (user 2026-10-27:
+// "in case it is older than the 60 days but is in RepairDesk") — the list
+// above only holds the saved filter's window. RepairDesk's `keyword` finds
+// "0-33512", "33512" or a part ("3351"); a saved filter would narrow it back
+// to the window, so none is sent. Answers the same groups as /tickets (up
+// to 50 tickets, newest first) with repaired dates from a keyword invoice
+// search where RepairDesk gives one.
+router.get("/tickets/search", GATE_LIST, async function (req, res) {
+  try {
+    const apiKey = getApiKey();
+    const q = String(req.query.q || "").trim();
+    if (q.length < 3) return res.json({ success: true, data: { ticketGrouped: groupTickets([]), total: 0 } });
+    const key = encodeURIComponent(apiKey);
+    const kw = encodeURIComponent(q);
+    const [resp, invoiceMap] = await Promise.all([
+      axios.get(`${REPAIRDESK_API_BASE}/tickets?api_key=${key}&keyword=${kw}&pagesize=50&page=1`, { timeout: 30000 }),
+      axios.get(`${REPAIRDESK_API_BASE}/invoices?api_key=${key}&keyword=${kw}&pagesize=100`, { timeout: 30000 })
+        .then((r) => {
+          const map = {};
+          for (const inv of (r.data && r.data.data && r.data.data.invoiceData) || []) {
+            const order = inv && inv.summary && inv.summary.ticket && inv.summary.ticket.order_id;
+            const created = inv && inv.summary && inv.summary.created_date;
+            if (order && created) map[String(order)] = created;
+          }
+          return map;
+        })
+        .catch(() => ({})),
+    ]);
+    // RepairDesk answers "No Result Found" (success false, empty data) when nothing matches
+    const data = (resp.data && resp.data.data) || {};
+    const raw = Array.isArray(data.ticketData) ? data.ticketData : [];
+    const ticketGrouped = groupTickets(raw);
+    for (const k of ["repaired", "repairedDispatching", "repairedCollected"]) {
+      for (const t of ticketGrouped[k]) t.repaired_date = invoiceMap[String(t.ticketNumber)] || null;
+    }
+    const total = (data.pagination && data.pagination.total_records) || raw.length;
+    return res.json({ success: true, data: { ticketGrouped, total } });
+  } catch (error) {
+    const status = error.status || 500;
+    console.error("Repair /tickets/search error:", error.message || error);
+    return res.status(status).json({ success: false, message: `Failed to search RepairDesk: ${error.message || error}` });
   }
 });
 
