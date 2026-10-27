@@ -8,6 +8,7 @@ var express = require("express");
 var axios = require("axios");
 var router = express.Router();
 const { requirePermission } = require("../../middleware/auth");
+const { connectToDatabase } = require("../../utils/mongodb");
 
 const REPAIRDESK_API_BASE = "https://api.repairdesk.co/api/web/v1";
 // The saved RepairDesk filter the list (and the invoice join) reads. Each
@@ -20,6 +21,13 @@ const MAX_PAGES = 50; // safety net so a runaway response can't loop forever
 
 const GATE_LIST = requirePermission("repair:ticket:list");
 const GATE_DETAIL = requirePermission("repair:ticket:detail");
+// Changing a ticket's status / adding a note write to RepairDesk (user 2026-10-27).
+const GATE_STATUS = requirePermission("repair:ticket:status");
+const GATE_NOTE = requirePermission("repair:ticket:note");
+const NOTE_MAX = 2000;
+
+// Every dashboard status change, who made it and what RepairDesk answered.
+const STATUS_LOG = "imb_repair_status_log";
 
 function getApiKey() {
   const key = process.env.IMB_REPAIRDESK_API_KEY;
@@ -332,6 +340,230 @@ router.get("/tickets/:id", GATE_DETAIL, async function (req, res) {
     return res.status(status).json({
       success: false,
       message: `Failed to fetch ticket: ${error.message || error}`,
+    });
+  }
+});
+
+// RepairDesk's ticket statuses (GET /statuses), one per name — the account
+// lists Pending, Repaired, Waiting for Parts and Warranty Repair twice, and a
+// status is set by its name. Cached for 10 minutes.
+const STATUS_TTL_MS = 10 * 60 * 1000;
+let statusCache = { at: 0, list: null };
+async function fetchStatuses(apiKey) {
+  if (statusCache.list && Date.now() - statusCache.at < STATUS_TTL_MS) return statusCache.list;
+  const resp = await axios.get(
+    `${REPAIRDESK_API_BASE}/statuses?api_key=${encodeURIComponent(apiKey)}`,
+    { timeout: 30000 },
+  );
+  const seen = new Set();
+  const list = [];
+  for (const s of (resp.data && resp.data.data) || []) {
+    const name = String((s && s.name) || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    list.push({ name, type: s.type || "", color: s.color || "" });
+  }
+  if (list.length) statusCache = { at: Date.now(), list };
+  return list;
+}
+
+// One ticket's detail, or null when RepairDesk answers "No Result Found".
+// Its summary + devices have the list's shape, so groupTickets takes it.
+async function fetchTicket(apiKey, id) {
+  const resp = await axios.get(
+    `${REPAIRDESK_API_BASE}/tickets/${encodeURIComponent(id)}?api_key=${encodeURIComponent(apiKey)}`,
+    { timeout: 30000 },
+  );
+  const body = resp.data || {};
+  if (body.message === "No Result Found" || !body.data || !body.data.summary) return null;
+  return body.data;
+}
+
+// A ticket as the list holds it, with the status group it now falls in.
+function listShapeOf(raw) {
+  const grouped = groupTickets([{ summary: raw.summary, devices: raw.devices }]);
+  for (const [group, list] of Object.entries(grouped)) {
+    if (list.length) return { group, ticket: list[0] };
+  }
+  return { group: null, ticket: null };
+}
+
+const statusNameOf = (d) => (d && d.status && d.status.name) || "";
+const deviceNameOf = (d) => (d && ((d.device && d.device.name) || d.name)) || `line ${d && d.id}`;
+const refusalOf = (body) =>
+  (body && ((body.data && body.data.message) || body.message)) || "RepairDesk refused the change";
+
+// ── GET /repair/statuses ─────────────────────────────────────────────
+// The statuses a ticket can be set to, for the page's status menu.
+router.get("/statuses", GATE_STATUS, async function (req, res) {
+  try {
+    const list = await fetchStatuses(getApiKey());
+    return res.json({ success: true, data: list });
+  } catch (error) {
+    console.error("Repair /statuses error:", error.message || error);
+    return res.status(error.status || 500).json({
+      success: false,
+      message: `Failed to fetch RepairDesk statuses: ${error.message || error}`,
+    });
+  }
+});
+
+// ── POST /repair/tickets/:id/status { status, deviceIds? } ───────────
+// Sets a ticket's status in RepairDesk (user 2026-10-27: "update the ticket
+// status from iMobile Repair page and push back to RepairDesk"). RepairDesk
+// keeps a status per device line (POST /ticket/updateticketstatus { id,
+// ticketInvId, status }): every line on the ticket, or only `deviceIds`;
+// lines already in that status are left alone. Then an internal note on the
+// ticket says who changed it — RepairDesk logs an API change under the API
+// key's owner, not the dashboard user — and the change goes into
+// imb_repair_status_log. Answers the ticket re-read from RepairDesk in the
+// list's shape with the status group it now falls in.
+router.post("/tickets/:id/status", GATE_STATUS, async function (req, res) {
+  try {
+    const apiKey = getApiKey();
+    const id = String(req.params.id || "").trim();
+    const status = String((req.body && req.body.status) || "").trim();
+    const only = Array.isArray(req.body && req.body.deviceIds) ? req.body.deviceIds.map(String) : null;
+    if (!/^\d+$/.test(id)) return res.status(400).json({ success: false, message: "Bad ticket id" });
+    if (!status) return res.status(400).json({ success: false, message: "Pick a status" });
+    // an unknown name never reaches RepairDesk
+    const statuses = await fetchStatuses(apiKey);
+    if (!statuses.some((s) => s.name === status)) {
+      return res.status(400).json({ success: false, message: `"${status}" isn't a RepairDesk status` });
+    }
+    const ticket = await fetchTicket(apiKey, id);
+    if (!ticket) return res.status(404).json({ success: false, message: "Ticket not found" });
+    const devices = Array.isArray(ticket.devices) ? ticket.devices : [];
+    const picked = only ? devices.filter((d) => only.includes(String(d.id))) : devices;
+    if (only && picked.length !== only.length) {
+      return res.status(400).json({ success: false, message: "A device line isn't on this ticket" });
+    }
+    if (!picked.length) return res.status(400).json({ success: false, message: "This ticket has no device lines" });
+
+    const todo = picked.filter((d) => statusNameOf(d) !== status);
+    if (!todo.length) {
+      return res.json({ success: true, data: { unchanged: true, changed: [], failed: [], noteAdded: false, ...listShapeOf(ticket) } });
+    }
+
+    const key = encodeURIComponent(apiKey);
+    const changed = [];
+    const failed = [];
+    for (const d of todo) {
+      const line = { id: String(d.id), name: deviceNameOf(d), from: statusNameOf(d) };
+      try {
+        const resp = await axios.post(
+          `${REPAIRDESK_API_BASE}/ticket/updateticketstatus?api_key=${key}`,
+          { id: Number(id), ticketInvId: Number(d.id), status },
+          { timeout: 30000 },
+        );
+        if (resp.data && resp.data.success) changed.push(line);
+        else failed.push({ ...line, message: refusalOf(resp.data) });
+      } catch (e) {
+        failed.push({ ...line, message: e.response ? refusalOf(e.response.data) : e.message });
+      }
+    }
+
+    const by = (req.user && req.user.username) || "unknown";
+    let noteAdded = false;
+    if (changed.length) {
+      const note = changed.length === 1 && devices.length === 1
+        ? `Status changed from "${changed[0].from}" to "${status}" by ${by} (iMobile dashboard)`
+        : `Status changed to "${status}" by ${by} (iMobile dashboard): ` +
+          changed.map((c) => `${c.name} (was "${c.from}")`).join("; ");
+      try {
+        const resp = await axios.post(
+          `${REPAIRDESK_API_BASE}/ticket/addnote?api_key=${key}`,
+          { id: Number(id), type: 0, note, is_flag: 0 },
+          { timeout: 30000 },
+        );
+        noteAdded = !!(resp.data && resp.data.success);
+      } catch (e) {
+        console.warn(`[Repair] note on ticket ${id} failed:`, e.response ? refusalOf(e.response.data) : e.message);
+      }
+    }
+
+    try {
+      const db = await connectToDatabase();
+      await db.collection(STATUS_LOG).insertOne({
+        ticketId: id,
+        ticketNumber: ticket.summary.order_id || "",
+        status,
+        changed,
+        failed,
+        noteAdded,
+        by,
+        at: new Date(),
+      });
+    } catch (e) {
+      console.warn("[Repair] status log failed:", e.message || e);
+    }
+
+    if (!changed.length) {
+      return res.status(502).json({ success: false, message: `RepairDesk refused: ${failed[0].message}` });
+    }
+    // re-read so the page shows what RepairDesk now holds
+    const fresh = (await fetchTicket(apiKey, id).catch(() => null)) || ticket;
+    return res.json({ success: true, data: { changed, failed, noteAdded, ...listShapeOf(fresh) } });
+  } catch (error) {
+    console.error("Repair /tickets/:id/status error:", error.message || error);
+    return res.status(error.status || 500).json({
+      success: false,
+      message: `Failed to change the status: ${error.message || error}`,
+    });
+  }
+});
+
+// ── POST /repair/tickets/:id/notes { note, type, deviceId?, flag? } ──
+// Adds a note to a RepairDesk ticket (user 2026-10-27: "add an action to
+// add a note") — POST /ticket/addnote { id, type: 0 internal / 1 diagnostic,
+// note, deviceId (one device line, optional), is_flag }. RepairDesk files an
+// API note under the API key's owner, so the text is signed with the
+// dashboard user, like the status-change note. Answers RepairDesk's note.
+router.post("/tickets/:id/notes", GATE_NOTE, async function (req, res) {
+  try {
+    const apiKey = getApiKey();
+    const id = String(req.params.id || "").trim();
+    const body = req.body || {};
+    const note = String(body.note || "").trim();
+    const deviceId = body.deviceId ? String(body.deviceId) : "";
+    if (!/^\d+$/.test(id)) return res.status(400).json({ success: false, message: "Bad ticket id" });
+    if (!note) return res.status(400).json({ success: false, message: "Write a note" });
+    if (note.length > NOTE_MAX) {
+      return res.status(400).json({ success: false, message: `A note is at most ${NOTE_MAX} characters` });
+    }
+    const ticket = await fetchTicket(apiKey, id);
+    if (!ticket) return res.status(404).json({ success: false, message: "Ticket not found" });
+    if (deviceId && !(ticket.devices || []).some((d) => String(d.id) === deviceId)) {
+      return res.status(400).json({ success: false, message: "That device line isn't on this ticket" });
+    }
+    const by = (req.user && req.user.username) || "unknown";
+    const payload = {
+      id: Number(id),
+      type: body.type === "diagnostic" ? 1 : 0,
+      note: `${note}\n— ${by} (iMobile dashboard)`,
+      is_flag: body.flag ? 1 : 0,
+    };
+    if (deviceId) payload.deviceId = Number(deviceId);
+    let resp;
+    try {
+      resp = await axios.post(
+        `${REPAIRDESK_API_BASE}/ticket/addnote?api_key=${encodeURIComponent(apiKey)}`,
+        payload,
+        { timeout: 30000 },
+      );
+    } catch (e) {
+      return res.status(502).json({ success: false, message: `RepairDesk refused: ${e.response ? refusalOf(e.response.data) : e.message}` });
+    }
+    if (!(resp.data && resp.data.success)) {
+      return res.status(502).json({ success: false, message: `RepairDesk refused: ${refusalOf(resp.data)}` });
+    }
+    const saved = Array.isArray(resp.data.data) ? resp.data.data[0] || null : resp.data.data || null;
+    return res.json({ success: true, data: { note: saved } });
+  } catch (error) {
+    console.error("Repair /tickets/:id/notes error:", error.message || error);
+    return res.status(error.status || 500).json({
+      success: false,
+      message: `Failed to add the note: ${error.message || error}`,
     });
   }
 });
