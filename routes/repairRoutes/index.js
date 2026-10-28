@@ -116,6 +116,26 @@ const UNREPAIRABLE_RETURNED_VARIANTS = new Set([
   "Unrepairable & Returned",
   "Unrepairable and Returned",
 ]);
+// The plain status, and Under Testing — both in "Other" until 2026-10-28,
+// when the Tickets tree gave them nodes (user ask).
+const UNREPAIRABLE = "Unrepairable";
+const UNDER_TESTING = "Under Testing";
+// "In Progress" counts as Received (user 2026-10-28; it was in Other) — the
+// Received node, and Over Due once past its due date like Received
+const RECEIVED_STATUSES = new Set(["Received", "In Progress"]);
+
+// RepairDesk's warranty statuses (type "warranty repair") → their bucket,
+// matched without case and with "&" read as "and". Checked BEFORE the
+// `.includes("Repaired")` catch-all, which used to file "Warranty Repaired"
+// under plain Repaired (the other three landed in Other).
+const WARRANTY_BUCKETS = {
+  "warranty repair": "warrantyRepair",
+  "warranty repaired": "warrantyRepaired",
+  "warranty and dispatching": "warrantyDispatching",
+  "warranty and collected": "warrantyCollected",
+};
+const warrantyBucketOf = (name) =>
+  WARRANTY_BUCKETS[String(name).toLowerCase().replace(/\s*&\s*/g, " and ").replace(/\s+/g, " ").trim()] || null;
 
 // Group raw RepairDesk tickets into the buckets the page renders. The
 // status-name string-matches are intentionally verbatim — they're how
@@ -127,6 +147,7 @@ function groupTickets(raw) {
     overDue: [],
     pending: [],
     inProgress: [],
+    underTesting: [],
     onHold: [],
     // Three repaired sub-buckets — see the constants above for the
     // status-name strings each one matches. Anything else that contains
@@ -134,11 +155,17 @@ function groupTickets(raw) {
     repaired: [],
     repairedDispatching: [],
     repairedCollected: [],
-    // Two unrepairable sub-buckets. Matched by exact string (with both
-    // & / and spellings) before the fullfilled catch-all so they don't
-    // get lumped into "Other".
+    // Three unrepairable sub-buckets (the plain status since 2026-10-28).
+    // Matched by exact string (with both & / and spellings) before the
+    // fullfilled catch-all so they don't get lumped into "Other".
+    unrepairable: [],
     unrepairableDispatching: [],
     unrepairableReturned: [],
+    // The four warranty statuses (WARRANTY_BUCKETS)
+    warrantyRepair: [],
+    warrantyRepaired: [],
+    warrantyDispatching: [],
+    warrantyCollected: [],
     fullfilled: [],
   };
   // Hoist the "now" reference out of the per-ticket loop so every
@@ -155,6 +182,8 @@ function groupTickets(raw) {
       ticketNumber: each.summary.order_id,
       createDate: each.summary.created_date * 1000,
       customer: (each.summary.customer && each.summary.customer.fullName) || "",
+      // RepairDesk's customer id (= /customers cid) — Shops groups by it
+      customerId: String((each.summary.customer && (each.summary.customer.id || each.summary.customer.cid)) || ""),
       dueDate: "",
       overDue: false,
       devices: each.devices,
@@ -170,10 +199,18 @@ function groupTickets(raw) {
 
     const statusName =
       (each.devices[0].status && each.devices[0].status.name) || "";
+    const warranty = warrantyBucketOf(statusName);
+    const received = RECEIVED_STATUSES.has(statusName);
 
-    if (now > preformatedTs && statusName === "Received") {
+    if (now > preformatedTs && received) {
       t.overDue = true;
       groups.overDue.push(t);
+    } else if (warranty) {
+      groups[warranty].push(t);
+    } else if (statusName === UNDER_TESTING) {
+      groups.underTesting.push(t);
+    } else if (statusName === UNREPAIRABLE) {
+      groups.unrepairable.push(t);
     } else if (
       statusName === "Waiting for Parts" ||
       statusName === "Awaiting reply"
@@ -191,7 +228,7 @@ function groupTickets(raw) {
       groups.unrepairableReturned.push(t);
     } else if (statusName === "Pending") {
       groups.pending.push(t);
-    } else if (statusName === "Received") {
+    } else if (received) {
       groups.inProgress.push(t);
     } else {
       groups.fullfilled.push(t);
@@ -343,6 +380,9 @@ router.get("/tickets/:id", GATE_DETAIL, async function (req, res) {
     });
   }
 });
+
+// iMobile Repair → Shops: RepairDesk customers grouped under one customer
+router.use("/shops", require("./shops"));
 
 // RepairDesk's ticket statuses (GET /statuses), one per name — the account
 // lists Pending, Repaired, Waiting for Parts and Warranty Repair twice, and a
