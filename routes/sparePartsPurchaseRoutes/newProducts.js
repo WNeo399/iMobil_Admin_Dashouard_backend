@@ -1067,7 +1067,7 @@ router.post("/items/:itemId/photos", CREATE, acceptPhotos, async (req, res, next
         taken.add(name.toLowerCase());
         return { ...f, originalname: name };
       });
-      const up = await uploadItemPhotos(itemId, named, { primary: !had.length });
+      const up = await uploadItemPhotos(itemId, named, { primary: !had.length, sku: item.sku });
       if (up.error) return res.status(502).json({ success: false, message: `Zoho: ${up.error}` });
       const fresh = docsOf(await readZohoItem(itemId)).filter((d) => !had.includes(String(d.document_id)));
       for (const [i, f] of named.entries()) {
@@ -1197,7 +1197,7 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     // the photos go onto the new item; a failure there leaves the item made
     const fromDraft = draft ? await readImagesFromUrls(draft.images || []) : { files: [], errors: [] };
     const allFiles = [...fromDraft.files, ...files];
-    const photos = allFiles.length ? await uploadItemPhotos(String(z.item.item_id), allFiles) : null;
+    const photos = allFiles.length ? await uploadItemPhotos(String(z.item.item_id), allFiles, { sku: String(z.item.sku || sku) }) : null;
     if (fromDraft.errors.length) {
       const note = `${fromDraft.errors.length} saved photo(s) could not be read`;
       if (photos) photos.error = photos.error ? `${photos.error}; ${note}` : note;

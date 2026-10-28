@@ -39,7 +39,6 @@ const {
   getViewData,
   handleZohoInventoryRequest,
   handleZohoInventoryPutRequest,
-  handleZohoInventoryMultipartPostRequest,
   refreshToken,
 } = require("../../utils/zohoRequest");
 const { mapWithLimit, fetchItemDetails, fetchItemWindowRows, OFFLINE_SALE_SCOPES } = require("../../utils/zohoStock");
@@ -1415,14 +1414,16 @@ router.post("/item/:itemId/image/recheck", VIEW, async (req, res) => {
 });
 
 // ── POST /stock-monitor/item/:itemId/images ─────────────────────────
-// Upload product images to the item in Zoho Inventory (Missing Images
-// page). multipart/form-data, one or more files under "images"; the first
-// file becomes the main image when the item has none yet. Zoho's limits:
-// gif/png/jpeg/bmp/webp, 7 MB each. Three Zoho calls: read the item, the
-// upload, read it back — the new main image id is mirrored into today's
-// register so the page (and the no-image counts) update at once.
+// Upload product images to the item (Missing Images page). multipart/
+// form-data, one or more files under "images"; the first file becomes the
+// main image when the item has none yet. Zoho's limits: gif/png/jpeg/bmp/
+// webp, 7 MB each. Sent through the store product when the item is a
+// one-variant store product, so the storefront listings show it too (user
+// 2026-10-28 — see utils/zohoNewItem uploadItemPhotos); read back after, and
+// the main image id mirrored into the register so the page (and the
+// no-image counts) update at once.
 const multer = require("multer");
-const FormData = require("form-data");
+const { uploadItemPhotos } = require("../../utils/zohoNewItem");
 const IMAGE_MIME = /^image\/(gif|png|jpe?g|bmp|webp)$/i;
 const MAX_IMAGE_BYTES = 7 * 1024 * 1024;
 const MAX_IMAGES = 10;
@@ -1466,36 +1467,25 @@ router.post(
       // pictures to an item that has one must not replace it.
       const before = await readItemDetail(itemId);
       if (!before) return res.status(404).json(GONE);
-      const url =
-        `https://www.zohoapis.com/inventory/v1/items/${encodeURIComponent(itemId)}/images` +
-        `?organization_id=${ZOHO_ORG_ID}` +
-        (imageIdOf(before) ? "" : "&update_primary_image=true");
-      // A builder, not a form: a retry after a token refresh needs a fresh stream.
-      const buildForm = () => {
-        const form = new FormData();
-        for (const f of files) {
-          form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });
-        }
-        return form;
-      };
-      const resp = await handleZohoInventoryMultipartPostRequest(url, buildForm);
-      if (!resp || resp.code !== 0) {
-        return res.status(502).json({
-          success: false,
-          message: `Zoho did not accept the images${resp && resp.message ? `: ${resp.message}` : ""}`,
-        });
+      const up = await uploadItemPhotos(itemId, files, { primary: !imageIdOf(before), sku: before.sku });
+      if (up.error) {
+        return res.status(502).json({ success: false, message: `Zoho did not accept the images: ${up.error}` });
       }
-
-      const after = await readItemDetail(itemId);
-      const imageId = imageIdOf(after);
+      // Zoho's bulk record can lag behind a main image chosen by putting the
+      // photos in order — the register keeps that pick beside it
+      // (utils/productImage mainImageId)
+      const imageId = up.imageId;
       const db = await connectToDatabase();
-      await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId } });
+      await db.collection(ITEMS).updateOne({ itemId }, imageId && imageId !== up.zohoImageId
+        ? { $set: { imageId, imagePick: { id: imageId, zohoId: up.zohoImageId || null, at: new Date() } } }
+        : { $set: { imageId }, $unset: { imagePick: "" } });
       return res.json({
         success: true,
         itemId,
         uploaded: files.length,
         imageId,
         imageUrl: imageUrlFromId(imageId),
+        via: up.via,
       });
     } catch (error) {
       console.error("Image upload error:", error.message);

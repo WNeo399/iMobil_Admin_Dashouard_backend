@@ -787,7 +787,7 @@ router.post("/orders/:id/zoho-item", PRODUCT_CREATE, zohoItem.acceptPhotos, asyn
         files.push(req.files[o.new]);
       }
     }
-    const photos = files.length ? await zohoItem.uploadItemPhotos(itemId, files) : null;
+    const photos = files.length ? await zohoItem.uploadItemPhotos(itemId, files, { sku: finalSku }) : null;
     if (unreadable) {
       const note = `${unreadable} saved photo(s) could not be read`;
       if (photos) photos.error = photos.error ? `${photos.error}; ${note}` : note;

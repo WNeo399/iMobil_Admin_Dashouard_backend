@@ -11,6 +11,7 @@
 // call repeated.
 
 const axios = require("axios");
+const FormData = require("form-data");
 const { refreshToken } = require("./zohoRequest");
 
 const BASE = "https://commerce.zoho.com/store/api/v1";
@@ -55,7 +56,50 @@ async function productOfItem(itemId, sku) {
   const d = await commerce("get", "/products", { params: { search_text: String(sku || ""), per_page: 25 } });
   if (!d || d.code !== 0) throw new Error(`Zoho Commerce: ${(d && d.message) || "the product search failed"}`);
   const p = (d.products || []).find((x) => (x.variants || []).some((v) => String(v.variant_id) === String(itemId)));
-  return p ? { productId: String(p.product_id), name: p.name || "", status: p.status || "", shown: p.show_in_storefront === true } : null;
+  return p ? { productId: String(p.product_id), name: p.name || "", status: p.status || "", shown: p.show_in_storefront === true, variants: (p.variants || []).length } : null;
+}
+
+// The same, first by the id Zoho gives the product of a part — item_id − 1
+// (one GET, so a brand-new item needs no search index); else the SKU search.
+async function storeProductOf(itemId, sku) {
+  const id = String(itemId || "");
+  if (/^\d{6,25}$/.test(id)) {
+    const d = await commerce("get", `/products/${(BigInt(id) - 1n).toString()}`);
+    const p = d && d.code === 0 && d.product;
+    if (p && (p.variants || []).some((v) => String(v.variant_id) === id)) {
+      return { productId: String(p.product_id), name: p.name || "", status: p.status || "", shown: p.show_in_storefront === true, variants: p.variants.length };
+    }
+  }
+  return productOfItem(id, sku);
+}
+
+// Images onto a store PRODUCT (POST /products/{id}/images, one multipart
+// "image" per file, scope items.CREATE). For a one-variant product Zoho files
+// each as ONE document shared by the product, its variant and the Inventory
+// item (tested on SKU 21847, 2026-10-28) — the product's image is what the
+// storefront's listing and search pages show. → Zoho's body (code 0 = taken).
+async function uploadProductImages(productId, files) {
+  const call = async (force) => {
+    const token = await refreshToken(force);
+    if (!token) throw new Error("Could not get a Zoho token");
+    const form = new FormData();
+    for (const f of files) form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });
+    try {
+      const r = await axios.post(`${BASE}/products/${encodeURIComponent(productId)}/images`, form, {
+        timeout: 120000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        headers: { ...form.getHeaders(), Authorization: `Zoho-oauthtoken ${token}`, "X-com-zoho-store-organizationid": ORG },
+      });
+      return r.data;
+    } catch (e) {
+      if (e.response && e.response.data && typeof e.response.data === "object") return e.response.data;
+      throw e;
+    }
+  };
+  let d = await call(false);
+  if (isAuthError(d)) d = await call(true);
+  return d;
 }
 
 // "Show in store" on (Listing → New Products' Approve, 2026-10-21): the
@@ -73,4 +117,4 @@ async function showItemInStore(itemId, sku) {
   return { productId: p.productId, already: false };
 }
 
-module.exports = { commerce, productOfItem, showItemInStore, COMMERCE_BASE: BASE, COMMERCE_ORG: ORG };
+module.exports = { commerce, productOfItem, storeProductOf, uploadProductImages, showItemInStore, COMMERCE_BASE: BASE, COMMERCE_ORG: ORG };

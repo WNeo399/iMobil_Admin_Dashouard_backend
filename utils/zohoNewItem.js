@@ -17,6 +17,7 @@ const {
 } = require("./zohoRequest");
 const { fetchItemDetails } = require("./zohoStock");
 const { imageIdOf } = require("./productImage");
+const { storeProductOf, uploadProductImages } = require("./zohoCommerce");
 const { ZOHO_CLASSIFICATIONS } = require("./listingQualities");
 
 const ORG = "746138234";
@@ -227,18 +228,58 @@ async function setPriceLists(itemId, rates) {
 // Upload photos to a Zoho item (the first becomes its main image — unless
 // primary is false: photos added to an existing item keep its main one) and
 // read back the main image id. Errors come back as a message, not a throw.
-async function uploadItemPhotos(itemId, files, { primary = true } = {}) {
+//
+// Through the STORE when the item is a one-variant store product (user
+// 2026-10-28, SKU 21847): Zoho Commerce files each photo as one document shared
+// by the product, its variant and the Inventory item, so it is the product's
+// image — what the storefront's listing and search pages show. Sent straight
+// to the Inventory item (how every upload went before) a photo lands on the
+// variant only: the product page shows it, the listings show "no image".
+// Inventory stays the route for a multi-variant product, an item the store
+// doesn't have, or a store that refuses.
+// → { uploaded, imageId, zohoImageId, via: "store" | "inventory" } or { uploaded: 0, error }
+//   imageId: the main image; zohoImageId: what Zoho's bulk record says (it can lag)
+async function uploadItemPhotos(itemId, files, { primary = true, sku = "" } = {}) {
   try {
-    const url = `${ZOHO}/items/${encodeURIComponent(itemId)}/images?organization_id=${ORG}&update_primary_image=${primary ? "true" : "false"}`;
-    const buildForm = () => {
-      const form = new FormData();
-      for (const f of files) form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });
-      return form;
-    };
-    const r = await handleZohoInventoryMultipartPostRequest(url, buildForm);
-    if (!r || r.code !== 0) return { uploaded: 0, error: (r && r.message) || "Zoho did not accept the photos" };
+    let via = "inventory";
+    let product = null;
+    try {
+      product = await storeProductOf(itemId, sku);
+    } catch (e) {
+      console.warn(`[photos] no store product for ${itemId}: ${e.message}`);
+    }
+    if (product && product.variants === 1) {
+      const r = await uploadProductImages(product.productId, files);
+      if (r && r.code === 0) via = "store";
+      else console.warn(`[photos] the store refused ${itemId}'s photos (${(r && r.message) || "no answer"}) — sending them to the Inventory item`);
+    }
+    if (via === "inventory") {
+      const url = `${ZOHO}/items/${encodeURIComponent(itemId)}/images?organization_id=${ORG}&update_primary_image=${primary ? "true" : "false"}`;
+      const buildForm = () => {
+        const form = new FormData();
+        for (const f of files) form.append("image", f.buffer, { filename: f.originalname || "image.jpg", contentType: f.mimetype });
+        return form;
+      };
+      const r = await handleZohoInventoryMultipartPostRequest(url, buildForm);
+      if (!r || r.code !== 0) return { uploaded: 0, error: (r && r.message) || "Zoho did not accept the photos" };
+    }
     const [detail] = await fetchItemDetails([itemId]).catch(() => []);
-    return { uploaded: files.length, imageId: imageIdOf(detail) };
+    const zohoImageId = imageIdOf(detail);
+    let imageId = zohoImageId;
+    // the store route doesn't choose the item's main image: an item that had
+    // none puts its photos in upload order (Zoho's item image follows the first)
+    if (via === "store" && primary && !imageId) {
+      const it = await handleZohoInventoryRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`).catch(() => null);
+      const docs = ((it && it.item && it.item.documents) || []).filter((d) => d && d.document_id)
+        .sort((a, b) => (Number(a.attachment_order) || 0) - (Number(b.attachment_order) || 0));
+      const rank = (d) => { const i = files.findIndex((f) => (f.originalname || "image.jpg") === d.file_name); return i < 0 ? files.length : i; };
+      const ids = docs.slice().sort((a, b) => rank(a) - rank(b)).map((d) => String(d.document_id));
+      if (ids.length) {
+        await reorderItemPhotos(itemId, ids);
+        imageId = ids[0];
+      }
+    }
+    return { uploaded: files.length, imageId, zohoImageId, via };
   } catch (e) {
     return { uploaded: 0, error: (e && e.message) || "Could not upload the photos" };
   }
