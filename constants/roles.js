@@ -311,6 +311,10 @@ const ROLE_PERMISSIONS = {
     "zoho:salesOrder:create", "zoho:purchaseOrder:create",
     // iMobile → Screen Buyback: the ABCD grade price list (2026-10-13)
     "buyback:price:view", "buyback:price:manage",
+    // iMobile → Repair (2026-10-28, user: "full access to this page"): the
+    // RepairDesk ticket list + Detail, changing a ticket's status and adding
+    // notes — like iMobile Admin / iMobile Repair Admin
+    "repair:*:*",
   ],
   // Exyon Operation (2026-10-08): the Exyon Accessories menu — Orders,
   // Dispatch (processing orders: tracking numbers, shipping labels) and Pick
