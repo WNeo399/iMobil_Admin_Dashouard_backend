@@ -117,4 +117,23 @@ async function showItemInStore(itemId, sku) {
   return { productId: p.productId, already: false };
 }
 
-module.exports = { commerce, productOfItem, storeProductOf, uploadProductImages, showItemInStore, COMMERCE_BASE: BASE, COMMERCE_ORG: ORG };
+// The store product's NAME after its item was renamed (Listing → Edit, user
+// 2026-10-29): Inventory's item update renames the item = the product's
+// variant, but the product — what the storefront lists and heads its page
+// with — keeps its own name (SKU 22446 still had the old one a week later).
+// One-variant products only: a product of several variants is named for all
+// of them. One partial PUT, then read back. → { productId, renamed } or
+// { skipped: reason }; throws with Zoho's reason when the name didn't take.
+async function renameStoreProduct(itemId, sku, name) {
+  const p = await storeProductOf(itemId, sku);
+  if (!p) return { skipped: "not in the store" };
+  if (p.variants > 1) return { productId: p.productId, skipped: "the store product has several variants" };
+  if (p.name === name) return { productId: p.productId, renamed: false };
+  const r = await commerce("put", `/products/${p.productId}`, { data: { name } });
+  if (!r || r.code !== 0) throw new Error(`Zoho Commerce: ${(r && r.message) || "the rename failed"}`);
+  const d = await commerce("get", `/products/${p.productId}`);
+  if (!d || d.code !== 0 || !d.product || d.product.name !== name) throw new Error("Zoho Commerce took the rename but the product kept its old name");
+  return { productId: p.productId, renamed: true };
+}
+
+module.exports = { commerce, productOfItem, storeProductOf, uploadProductImages, showItemInStore, renameStoreProduct, COMMERCE_BASE: BASE, COMMERCE_ORG: ORG };

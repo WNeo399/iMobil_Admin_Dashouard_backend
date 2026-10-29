@@ -52,6 +52,7 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { TE_SCOPE } = require("../../utils/stockItems");
 const { addCreatedItem } = require("../../utils/stockItemsSync");
 const { refreshToken, handleZohoInventoryRequest, handleZohoInventoryPutRequest } = require("../../utils/zohoRequest");
+const { renameStoreProduct } = require("../../utils/zohoCommerce");
 const { imageUrlFromId, imageIdOf } = require("../../utils/productImage");
 const { fetchItemDetails } = require("../../utils/zohoStock");
 const { storeImage, removeImage } = require("../../utils/sppImages");
@@ -1009,13 +1010,20 @@ router.put("/items/:itemId", CREATE, async (req, res, next) => {
       dropped = makers.filter((m) => !modelKeysOf(m).some((k) => keys.has(k)));
       if (dropped.length) await db.collection(MODELS).updateMany({ _id: { $in: dropped.map((m) => m._id) } }, { $pull: { created: { itemId } } });
     }
+    // the store product's own name — the item update renames only its
+    // variant (renameStoreProduct); a failure keeps the item's new name
+    let store = null;
+    if (set.name) {
+      try { store = await renameStoreProduct(itemId, r.item.sku || item.sku, set.name); } catch (e) { store = { error: e.message || "Zoho Commerce did not rename the product" }; }
+    }
     await db.collection(ITEM_EDITS).insertOne({
       itemId, sku: r.item.sku || item.sku || "", name: r.item.name || now.name,
       changes, at: new Date(), by: actor(req),
       // the page models it no longer counts for, with what they had kept
       droppedFrom: dropped.map((m) => ({ modelId: m._id, model: m.model, created: (m.created || []).filter((c) => String(c.itemId) === itemId) })),
+      ...(store ? { store } : {}),
     });
-    return res.json({ success: true, changed: Object.keys(changes), item: { itemId, ...set } });
+    return res.json({ success: true, changed: Object.keys(changes), item: { itemId, ...set }, ...(store ? { store } : {}) });
   } catch (error) {
     next(error);
   }
