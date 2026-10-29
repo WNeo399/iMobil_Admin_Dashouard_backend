@@ -76,6 +76,7 @@ var stockSyncRouter = require('./routes/stockSyncRoutes/index');
 // shared-secret auth (CAMPAIGN_AGENT_KEY); can't send — a person reviews and
 // sends on iMobile Website → Campaign.
 var campaignAgentRouter = require('./routes/campaignAgentRoutes/index');
+var sqtEmailIngestRouter = require('./routes/sqtEmailIngestRoutes/index');
 // Public webhook endpoint that HandwritingOCR posts to when extraction
 // finishes. Mounted outside the authenticated chain (OCR doesn't hold
 // our JWT) — security is via the body's ocrId matching our own row.
@@ -142,6 +143,8 @@ app.use('/integration/inflow', inflowWebhookRouter);
 app.use('/integration/purchaseOrderSync', purchaseOrderSyncRouter);
 app.use('/integration/stockSync', stockSyncRouter);
 app.use('/integration/campaigns', campaignAgentRouter);
+// SQT follow-up emails from the user's pickup automation (SQT_INGEST_KEY).
+app.use('/integration/sqt-emails', sqtEmailIngestRouter);
 // HandwritingOCR webhook — public POST endpoint mounted before the
 // authenticated routers because OCR doesn't carry our JWT.
 app.use('/webhook', creditNoteWebhookRouter);
