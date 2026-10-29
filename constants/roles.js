@@ -323,6 +323,8 @@ const ROLE_PERMISSIONS = {
   [ROLES.EXYON_OPERATION]: [
     "exyon:accessory:view",
     "exyon:accessory:picklist",
+    // cancelling an order in Neto (2026-10-29) — not the warehouse roles
+    "exyon:accessory:cancel",
   ],
   // Exyon Warehouse (2026-10-21, user: "only have access to Exyon Accessories
   // for now"): the same as Exyon Operation — Orders, Dispatch (process,

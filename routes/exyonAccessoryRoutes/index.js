@@ -20,7 +20,10 @@
 //   GET  /exyon-accessories/labels?orderIds=A,B   → shipping label data (address from Neto)
 //   POST /exyon-accessories/auspost/labels { orders: [{ orderId, parcel? }], dryRun? } — AusPost eParcel labels (Large / Other)
 //   POST /exyon-accessories/auspost/labels/:orderId/cancel — the AusPost shipment deleted (before lodging)
-//   POST /exyon-accessories/neto-sync { orderIds } — Neto's current lines for those orders (kept; Dispatch uses them)
+//   POST /exyon-accessories/neto-sync { orderIds } — Neto's current lines for those orders (kept; Dispatch uses them);
+//        the Dispatch page calls it as Process opens
+//   POST /exyon-accessories/orders/:orderId/cancel { reason, note?, dryRun? } — the whole order Cancelled in Neto
+
 //   PUT  /exyon-accessories/envelopes/:sku { size } — an item's envelope chosen by hand ("" = the rules)
 
 var express = require("express");
@@ -38,6 +41,9 @@ const { envelopeOf, skuKeyOf, SIZES: ENVELOPE_SIZES } = require("../../utils/exy
 const VIEW = requirePermission("exyon:accessory:view");
 // Processing orders onto a pick list / taking one off.
 const PICK_EDIT = requirePermission("exyon:accessory:picklist");
+// Cancelling an order in Neto (2026-10-29): Admin, Exyon Admin, Exyon
+// Operation — not the warehouse roles.
+const CANCEL = requirePermission("exyon:accessory:cancel");
 const actor = (req) => (req.user && (req.user.username || req.user.email)) || null;
 
 const TABLE = "exyon.accessory_orders";
@@ -92,11 +98,31 @@ router.get("/orders", VIEW, async function (req, res) {
     ]);
 
     const zoho = await zohoItemsFor(rows.map((r) => r.sku));
+    // Exyon's status stays at Pick for good: Neto's final status as last seen
+    // (Dispatched / Cancelled — cached by Dispatch, no Neto call here) and a
+    // cancel made from the dashboard (2026-10-29)
+    const ids = [...new Set(rows.map((r) => r.orderId))];
+    let netoFinal = new Map();
+    let cancels = new Map();
+    if (ids.length) {
+      try {
+        const db = await connectToDatabase();
+        const [st, cn] = await Promise.all([
+          db.collection(NETO_STATUS).find({ _id: { $in: ids }, status: { $in: NETO_FINAL } }, { projection: { status: 1 } }).toArray(),
+          db.collection(ORDER_CANCELS).find({ _id: { $in: ids } }, { projection: { reason: 1, note: 1, at: 1, by: 1 } }).toArray(),
+        ]);
+        netoFinal = new Map(st.map((d) => [d._id, d.status]));
+        cancels = new Map(cn.map((d) => [d._id, { reason: d.reason, note: d.note || "", at: d.at, by: d.by || "" }]));
+      } catch (e) {
+        console.error("Exyon accessory orders — Neto status:", e.message);
+      }
+    }
     return res.json({
       success: true,
       rows: rows.map((r) => {
         const z = zoho.get(String(r.sku || "").trim()) || {};
-        return { ...r, notes: String(r.notes || "").trim(), zohoSku: z.zohoSku || "", zohoName: z.zohoName || "", image: z.image || null };
+        return { ...r, notes: String(r.notes || "").trim(), zohoSku: z.zohoSku || "", zohoName: z.zohoName || "", image: z.image || null,
+          netoStatus: netoFinal.get(r.orderId) || "", cancelled: cancels.get(r.orderId) || null };
       }),
       total: Number(summary.line_count) || 0,
       summary: {
@@ -210,12 +236,14 @@ async function openOrders({ channel, status } = {}) {
 
 // ── Neto's lines (2026-10-27) ───────────────────────────────────────────
 // Exyon's table never drops a line cancelled in Neto (RB-A3481675's black case
-// stayed at Pick after Neto removed it). "Sync with Neto" on the Dispatch page
-// (a SKU tile's orders, or one order) reads each order's lines from Neto and
-// keeps them here; from then on the order's items are Neto's — Dispatch,
-// Process (the pick list snapshot) and the AusPost labels all read them.
+// stayed at Pick after Neto removed it). Process on the Dispatch page (a SKU
+// tile's orders, or one order) first reads each order's lines from Neto (user
+// 2026-10-29 — it was a "Neto" button before) and keeps them here; from then
+// on the order's items are Neto's — Dispatch, Process (the pick list
+// snapshot) and the AusPost labels all read them.
 // Mongo exyon_neto_lines { _id: orderId, status, lines: [{ lineId, sku,
-// productName, quantity, unitPrice }], netoUpdatedAt, syncedAt, syncedBy }.
+// productName, quantity, unitPrice }], changed (vs Exyon's lines),
+// netoUpdatedAt, syncedAt, syncedBy }.
 const NETO_LINES = "exyon_neto_lines";
 const NETO_LINE_FIELDS = ["OrderID", "OrderStatus", "DateUpdated", "OrderLine", "OrderLine.SKU", "OrderLine.ProductName", "OrderLine.Quantity", "OrderLine.UnitPrice", "OrderLine.OrderLineID"];
 // an order's items from Neto's lines (one per SKU, as ordersOf makes them)
@@ -270,6 +298,10 @@ router.post("/neto-sync", PICK_EDIT, async function (req, res) {
       for (const o of [].concat(d.Order || [])) got.set(String(o.OrderID), o);
     }
     const db = await connectToDatabase();
+    // what the page showed: the last sync's lines, else Exyon's — the answer
+    // says what changed since then (`changed` stays "Neto differs from Exyon")
+    const shown = new Map((await db.collection(NETO_LINES).find({ _id: { $in: ids } }, { projection: { lines: 1 } }).toArray())
+      .map((d) => [d._id, d.lines || []]));
     const now = new Date();
     const by = actor(req);
     const results = [];
@@ -283,14 +315,17 @@ router.post("/neto-sync", PICK_EDIT, async function (req, res) {
         lineId: String(l.OrderLineID || ""), sku: String(l.SKU || "").trim(), productName: String(l.ProductName || ""),
         quantity: Number(l.Quantity) || 0, unitPrice: l.UnitPrice == null ? null : Number(l.UnitPrice),
       }));
-      const before = exLines.get(id) || [];
       const neto = new Map(lines.map((l) => [l.lineId, l]));
-      const removed = before.filter((l) => !neto.has(l.lineId)).map(fmtLine);
-      const added = lines.filter((l) => !before.some((b) => b.lineId === l.lineId)).map(fmtLine);
-      const qty = before.filter((l) => neto.has(l.lineId) && neto.get(l.lineId).quantity !== l.quantity)
-        .map((l) => ({ sku: l.sku, productName: l.productName, from: l.quantity, to: neto.get(l.lineId).quantity }));
-      const changed = removed.length + added.length + qty.length > 0;
-      results.push({ orderId: id, status, removed, added, qty, changed });
+      const diff = (before) => ({
+        removed: before.filter((l) => !neto.has(l.lineId)).map(fmtLine),
+        added: lines.filter((l) => !before.some((b) => b.lineId === l.lineId)).map(fmtLine),
+        qty: before.filter((l) => neto.has(l.lineId) && neto.get(l.lineId).quantity !== l.quantity)
+          .map((l) => ({ sku: l.sku, productName: l.productName, from: l.quantity, to: neto.get(l.lineId).quantity })),
+      });
+      const vsExyon = diff(exLines.get(id) || []);
+      const changed = vsExyon.removed.length + vsExyon.added.length + vsExyon.qty.length > 0;
+      const d = shown.has(id) ? diff(shown.get(id)) : vsExyon;
+      results.push({ orderId: id, status, ...d, changed: d.removed.length + d.added.length + d.qty.length > 0 });
       ops.push({ updateOne: { filter: { _id: id }, update: { $set: { status, lines, changed, netoUpdatedAt: o.DateUpdated || null, syncedAt: now, syncedBy: by } }, upsert: true } });
       statusOps.push({ updateOne: { filter: { _id: id }, update: { $set: { status, checkedAt: now } }, upsert: true } });
     }
@@ -699,6 +734,10 @@ router.post("/pick-lists/today/process", PICK_EDIT, async function (req, res) {
       const byId = new Map((await openOrders()).map((o) => [o.orderId, o]));
       const gone = newIds.filter((id) => !byId.has(id));
       if (gone.length) return bad(`${gone.join(", ")}: no longer an open order — refresh the page`);
+      // Neto's answer from the check as Process opened (2026-10-29)
+      const closed = await (await connectToDatabase()).collection(NETO_STATUS)
+        .find({ _id: { $in: newIds }, status: { $in: NETO_FINAL } }, { projection: { status: 1 } }).toArray();
+      if (closed.length) return bad(`${closed.map((c) => `${c._id} (${c.status} in Neto)`).join(", ")}: not open any more — refresh the page`);
       fresh = newIds.map((id) => byId.get(id));
     }
     const trackingOf = new Map(list.map((x) => [x.orderId, x.tracking]));
@@ -1134,6 +1173,103 @@ router.post("/auspost/labels/:orderId/cancel", PICK_EDIT, async function (req, r
   } catch (error) {
     console.error("Exyon AusPost cancel error:", error.message);
     return res.status(502).json({ success: false, message: error.message || "Failed to cancel the AusPost label" });
+  }
+});
+
+// Cancel an order in Neto (user 2026-10-29: "allow cancel order in Neto from
+// our dashboard", on the Orders and Dispatch pages). The WHOLE order — Neto's
+// UpdateOrder has no per-line cancel — set to OrderStatus "Cancelled", then
+// read back to be sure. Neto's API has no cancel email: the customer isn't
+// emailed by this. A reason is required (kept here, not in Neto). Refused
+// when Neto has it Dispatched or a pick list dispatched it; one Neto has as
+// Cancelled already is just recorded. Afterwards: Neto's status remembered
+// (Dispatch drops the order), the order taken off its pick list (history
+// keeps it), and a live AusPost label deleted (only possible before lodging
+// — else a warning, to do in AusPost).
+// Mongo exyon_order_cancels { _id: orderId, reason, note, netoStatusBefore,
+//   neto: cancelled | already, pickDay, tracking, auspost, at, by }.
+//   POST /orders/:orderId/cancel { reason, note?, dryRun? }
+//     → { outcome: cancelled | already | dry-run, warnings, payload? (dry run) }
+// dryRun (no reason needed): what would happen — the cancel dialog's preview
+// (Neto's status, the pick list it is on, its AusPost label), or why it can't
+// (`blocked`, a 200: the page's request wrapper toasts every 4xx).
+const ORDER_CANCELS = "exyon_order_cancels";
+const CANCEL_REASONS = ["Out of stock", "Customer request", "Address issue", "Duplicate order", "Other"];
+const cancelling = new Set(); // orders being cancelled right now
+const netoStatusOf = async (orderId) => {
+  const d = await netoCall("GetOrder", { Filter: { OrderID: [orderId], OutputSelector: ["OrderID", "OrderStatus"] } });
+  const o = [].concat(d.Order || []).find((x) => String(x.OrderID) === orderId);
+  return o ? String(o.OrderStatus || "") : null;
+};
+router.post("/orders/:orderId/cancel", CANCEL, async function (req, res) {
+  const bad = (message, code = 400) => res.status(code).json({ success: false, message });
+  const orderId = String(req.params.orderId || "").trim();
+  const reason = String((req.body && req.body.reason) || "").trim();
+  const note = String((req.body && req.body.note) || "").trim().slice(0, 300);
+  const dryRun = !!(req.body && req.body.dryRun);
+  if (!orderId) return bad("Which order?");
+  if (!dryRun && !CANCEL_REASONS.includes(reason)) return bad("Pick why the order is cancelled");
+  if (!dryRun && reason === "Other" && !note) return bad("Say why in the note");
+  if (cancelling.has(orderId)) return bad(`${orderId} is being cancelled right now`, 409);
+  if (!dryRun) cancelling.add(orderId);
+  const refuse = (message, code) => (dryRun ? res.json({ success: true, outcome: "dry-run", blocked: message }) : bad(message, code));
+  try {
+    const entry = (await pickEntriesOf([orderId])).get(orderId);
+    if (entry && dispatchStatusOf(entry) === "dispatched") return refuse(`${orderId} is dispatched already (pick list ${entry.day}) — it can't be cancelled`);
+    const before = await netoStatusOf(orderId);
+    if (before === null) return refuse(`Neto has no order ${orderId}`, 404);
+    if (before === "Dispatched") {
+      await rememberNetoStatus(orderId, before).catch(() => {});
+      return refuse(`${orderId} is Dispatched in Neto — it can't be cancelled`);
+    }
+    const payload = { Order: [{ OrderID: orderId, OrderStatus: "Cancelled" }] };
+    const ap = (await auspostOf([orderId])).get(orderId);
+    if (dryRun) {
+      return res.json({ success: true, outcome: "dry-run", netoStatus: before, payload: before === "Cancelled" ? null : payload,
+        pickDay: entry ? entry.day : null, auspost: ap ? ap.articleId : null, warnings: [] });
+    }
+
+    const warnings = [];
+    if (before !== "Cancelled") {
+      const r = await netoCall("UpdateOrder", payload);
+      if (r.Ack === "Warning" && r.Messages) warnings.push(`Neto: ${JSON.stringify(r.Messages).slice(0, 300)}`);
+      const after = await netoStatusOf(orderId);
+      if (after !== "Cancelled") return bad(`Neto still has ${orderId} as ${after || "unknown"} — it was not cancelled`, 502);
+    }
+    const now = new Date();
+    const by = actor(req);
+    await rememberNetoStatus(orderId, "Cancelled");
+    if (entry) {
+      const col = await pickLists();
+      await col.updateOne(
+        { day: entry.day, ...LIVE_LIST, "orders.orderId": orderId },
+        { $pull: { orders: { orderId } }, $set: { updatedAt: now, updatedBy: by }, $push: { history: { at: now, by, action: "cancelled in Neto", orderId, reason, ...(entry.tracking ? { tracking: entry.tracking } : {}) } } },
+      );
+    }
+    let auspostDone = null;
+    if (ap) {
+      try {
+        await auspost.deleteShipment(ap.shipmentId);
+        await (await auspostCol()).updateOne({ _id: ap._id }, { $set: { live: false, status: "deleted", deletedAt: now, deletedBy: by, deletedWhy: "order cancelled" } });
+        auspostDone = { articleId: ap.articleId, deleted: true };
+      } catch (e) {
+        auspostDone = { articleId: ap.articleId, deleted: false, error: String(e.message || e).slice(0, 300) };
+        warnings.push(`AusPost label ${ap.articleId} was not deleted (${auspostDone.error}) — delete it in AusPost before the next manifest`);
+      }
+    }
+    const db = await connectToDatabase();
+    await db.collection(ORDER_CANCELS).updateOne(
+      { _id: orderId },
+      { $set: { reason, note, netoStatusBefore: before, neto: before === "Cancelled" ? "already" : "cancelled",
+        pickDay: entry ? entry.day : null, tracking: (entry && entry.tracking) || null, auspost: auspostDone, at: now, by } },
+      { upsert: true },
+    );
+    return res.json({ success: true, outcome: before === "Cancelled" ? "already" : "cancelled", pickDay: entry ? entry.day : null, auspost: auspostDone, warnings });
+  } catch (error) {
+    console.error("Exyon order cancel error:", error.message);
+    return res.status(502).json({ success: false, message: error.message || "Failed to cancel the order" });
+  } finally {
+    if (!dryRun) cancelling.delete(orderId);
   }
 });
 
