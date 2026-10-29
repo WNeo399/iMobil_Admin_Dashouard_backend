@@ -346,8 +346,21 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const col = db.collection(ORDERS);
     await fillSeaCategories(db);
     const counts = { total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } } };
+    // Open urgent lines first (user ask 2026-10-29), then by date; the
+    // received list stays newest-received first.
+    const byDate = String(q.sort) === "received" ? { receivedAt: -1, _id: -1 } : { createdAt: dir, _id: dir };
+    const pageRows = String(q.sort) === "received"
+      ? col.find(match, { projection: { history: 0 } }).sort(byDate).skip((page - 1) * pageSize).limit(pageSize).toArray()
+      : col.aggregate([
+          { $match: match },
+          { $addFields: { _urgentTop: { $cond: [{ $and: [{ $eq: ["$urgent", true] }, { $in: ["$status", OPEN] }] }, 1, 0] } } },
+          { $sort: { _urgentTop: -1, ...byDate } },
+          { $skip: (page - 1) * pageSize },
+          { $limit: pageSize },
+          { $project: { history: 0, _urgentTop: 0 } },
+        ]).toArray();
     const [rows, total, statusAgg, catAgg, seaAgg, suppliers] = await Promise.all([
-      col.find(match, { projection: { history: 0 } }).sort(String(q.sort) === "received" ? { receivedAt: -1, _id: -1 } : { createdAt: dir, _id: dir }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      pageRows,
       col.countDocuments(match),
       col.aggregate([{ $match: base }, { $group: { _id: "$status", n: { $sum: 1 } } }]).toArray(),
       col.aggregate([{ $group: { _id: "$category", ...counts } }]).toArray(),
@@ -843,6 +856,8 @@ router.post("/orders", ADD, async (req, res, next) => {
     const db = await connectToDatabase();
     const now = new Date();
     const by = actor(req);
+    // urgent is iMobile's call (as on PUT); a parts supplier's lines start plain
+    const mayUrgent = hasPermission((req.user && req.user.permissions) || [], "spp:order:create");
     const docs = [];
     const skipped = [];
     for (const l of lines) {
@@ -888,6 +903,8 @@ router.post("/orders", ADD, async (req, res, next) => {
         category,
         orderQty,
         note: str(l.note),
+        // urgent from the start — any line (Create PO / Add Item, 2026-10-29)
+        ...(l.urgent && mayUrgent ? { urgent: true, urgentAt: now, urgentBy: by } : {}),
         ...(category === SPECIAL_ORDER ? { requestedFor: forOf(l.requestedFor), urgent: !!l.urgent, needsQuote: l.needsQuote === undefined ? true : !!l.needsQuote } : {}),
         ...(category === WARRANTY ? { warranty: true } : {}),
         status: "pending",
@@ -942,14 +959,21 @@ router.put("/orders/:id", CREATE, async (req, res, next) => {
         changes.orderQty = { from: rec.orderQty, to: set.orderQty };
       }
     }
+    // Urgent (any line since 2026-10-29, was Special Orders only): marked
+    // while the line is still open, cleared any time. Open urgent lines lead
+    // the Purchase Order list.
+    const unset = {};
+    if (b.urgent !== undefined && !!b.urgent !== !!rec.urgent) {
+      if (b.urgent && !OPEN.includes(rec.status)) return bad(res, "Only an open line can be marked urgent");
+      set.urgent = !!b.urgent;
+      changes.urgent = set.urgent;
+      if (set.urgent) { set.urgentAt = new Date(); set.urgentBy = by; }
+      else { unset.urgentAt = ""; unset.urgentBy = ""; }
+    }
     if (rec.category === SPECIAL_ORDER || str(b.category) === SPECIAL_ORDER) {
       if (b.requestedFor !== undefined && forOf(b.requestedFor) !== (rec.requestedFor || "")) {
         set.requestedFor = forOf(b.requestedFor);
         changes.requestedFor = { from: rec.requestedFor || "", to: set.requestedFor };
-      }
-      if (b.urgent !== undefined && !!b.urgent !== !!rec.urgent) {
-        set.urgent = !!b.urgent;
-        changes.urgent = set.urgent;
       }
       // the name can be corrected after creation (user ask 2026-10-14) while the line is still open
       if (b.productName !== undefined && !["received", "cancelled"].includes(rec.status)) {
@@ -972,6 +996,7 @@ router.put("/orders/:id", CREATE, async (req, res, next) => {
       changes.category = { from: rec.category, to: set.category };
     }
     const update = { $set: set };
+    if (Object.keys(unset).length) update.$unset = unset;
     if (Object.keys(changes).length) update.$push = { history: hist("edited", by, changes) };
     await col.updateOne({ _id }, update);
     return res.json({ success: true, changed: Object.keys(changes) });
