@@ -329,6 +329,61 @@ router.get("/items/:id/image", requirePermission("zoho:stock:view"), async (req,
   }
 });
 
+// ── GET /zoho/items/:id/images/:docId ───────────────────────────────
+// One of the item's photos out of Zoho Inventory (user 2026-10-30, SKU
+// 22527): the store's public image URL only serves products the store
+// SHOWS, so a new product's photos (hidden until New Products → Approve)
+// come back empty there. Pages ask here only when the store sends nothing
+// (the v-zoho-img directive). Zoho looks the document up under the item,
+// so only that item's own photos come out — open to any signed-in user
+// (product photos). Kept in memory a while: each miss is a Zoho call.
+const ITEM_PHOTO_CACHE = new Map(); // "<item>:<doc>" → { type, data }
+const ITEM_PHOTO_CACHE_MAX = 300;
+router.get("/items/:id/images/:docId", async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    const docId = String(req.params.docId || "").trim();
+    if (!/^\d{5,25}$/.test(id) || !/^\d{5,25}$/.test(docId)) {
+      return res.status(400).json({ success: false, message: "Bad item or image id" });
+    }
+    const key = `${id}:${docId}`;
+    let hit = ITEM_PHOTO_CACHE.get(key);
+    if (!hit) {
+      let token = await refreshToken();
+      const fetchOnce = () =>
+        axios.get(`https://www.zohoapis.com/inventory/v1/items/${id}/images/${docId}?organization_id=746138234`, {
+          headers: { Authorization: `Zoho-oauthtoken ${token}` },
+          responseType: "arraybuffer",
+          timeout: 30000,
+          validateStatus: null,
+        });
+      let resp = await fetchOnce();
+      if (resp.status === 401) {
+        token = await refreshToken(true);
+        if (token) resp = await fetchOnce();
+      }
+      const type = String((resp.headers && resp.headers["content-type"]) || "");
+      // a JSON body = no such photo on this item (or an error)
+      if (resp.status !== 200 || !resp.data || !resp.data.length || !/^image\//i.test(type)) {
+        return res.status(204).end();
+      }
+      hit = { type, data: Buffer.from(resp.data) };
+      ITEM_PHOTO_CACHE.set(key, hit);
+      if (ITEM_PHOTO_CACHE.size > ITEM_PHOTO_CACHE_MAX) ITEM_PHOTO_CACHE.delete(ITEM_PHOTO_CACHE.keys().next().value);
+    } else {
+      // most recently used last
+      ITEM_PHOTO_CACHE.delete(key);
+      ITEM_PHOTO_CACHE.set(key, hit);
+    }
+    res.set("Content-Type", hit.type);
+    res.set("Cache-Control", "private, max-age=86400");
+    return res.send(hit.data);
+  } catch (error) {
+    console.error("Item photo proxy error:", error.message);
+    return res.status(204).end();
+  }
+});
+
 router.post("/salesTotal", requirePermission("zoho:stock:view"), async function (req, res, next) {
   try {
     const { itemIds, duration = 30 } = req.body;
