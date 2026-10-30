@@ -8,6 +8,9 @@ const ROLES = {
   ADMIN: "admin",
   IMOBILE_ADMIN: "imobile-admin",
   IMOBILE_REPAIR_ADMIN: "imobile-repair-admin",
+  // iMobile Repair staff (2026-10-30, user: "they only have access to iMobile
+  // Repair") — the iMobile Repair menu and nothing else.
+  IMOBILE_REPAIR: "imobile-repair",
   TECHELITE_ADMIN: "techelite-admin",
   // SQT Call Center (2026-10-13): phones every new case's customer to
   // explain the repair process — the SQT → Call Center page and nothing else.
@@ -50,6 +53,7 @@ const ROLE_LABELS = {
   [ROLES.ADMIN]: "Admin",
   [ROLES.IMOBILE_ADMIN]: "iMobile Admin",
   [ROLES.IMOBILE_REPAIR_ADMIN]: "iMobile Repair Admin",
+  [ROLES.IMOBILE_REPAIR]: "iMobile Repair",
   [ROLES.TECHELITE_ADMIN]: "TechElite Admin",
   [ROLES.SQT_CALL_CENTER]: "SQT Call Center",
   [ROLES.SHOP_OWNER]: "Repair Shop Owner",
@@ -91,6 +95,7 @@ const ROLE_GROUP_OF = {
   [ROLES.ADMIN]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_ADMIN]: ROLE_GROUPS.IMOBILE,
   [ROLES.IMOBILE_REPAIR_ADMIN]: ROLE_GROUPS.IMOBILE,
+  [ROLES.IMOBILE_REPAIR]: ROLE_GROUPS.IMOBILE,
   [ROLES.TECHELITE_ADMIN]: ROLE_GROUPS.TECHELITE,
   [ROLES.SQT_CALL_CENTER]: ROLE_GROUPS.TECHELITE,
   [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
@@ -154,6 +159,17 @@ const ROLE_PERMISSIONS = {
   // iMobile Repair Admin: starts with full Repair access so the role is
   // usable from day one. Other permissions are pending the owner's input.
   [ROLES.IMOBILE_REPAIR_ADMIN]: ["repair:*:*"],
+  // iMobile Repair (2026-10-30): the iMobile Repair menu only — Tickets
+  // (list, detail, change a status, assign, add notes — all pushed to
+  // RepairDesk) and Shops to view. Managing the shop groups
+  // (repair:shop:manage) stays with iMobile Repair Admin and above.
+  [ROLES.IMOBILE_REPAIR]: [
+    "repair:ticket:list",
+    "repair:ticket:detail",
+    "repair:ticket:status",
+    "repair:ticket:note",
+    "repair:shop:view",
+  ],
   // TechElite Admin owns the SQT domain. User management (System tab) was
   // revoked 2026-08 — system:user:manage is Admin-only now.
   [ROLES.TECHELITE_ADMIN]: ["sqt:*:*"],
