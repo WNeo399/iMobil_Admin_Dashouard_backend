@@ -281,6 +281,47 @@ async function createZohoGroup({ name, attribute = "Option", variants, purchaseR
   return { groupId: String(g.group_id), groupName: g.group_name || name, items, fieldErrors };
 }
 
+// One more variant into a product that exists (Listing's Add variant, user
+// 2026-10-30): POST /items with the group_id and the option — tested on
+// VARTEST2, 2026-10-30, the item joins the group and the store product
+// gains it. Set up like the item it is copied from (`from`: rate,
+// purchase_rate, unit, accounts, category). The group create drops custom
+// fields, so they are checked on the reply and PUT when missing.
+// → { item, fieldsError? } or { error }.
+async function addZohoGroupItem({ groupId, attribute, variant, name, sku, from, customFields }) {
+  const body = {
+    group_id: String(groupId),
+    name,
+    sku,
+    unit: from.unit || "qty",
+    item_type: "inventory",
+    product_type: "goods",
+    rate: from.rate,
+    purchase_rate: from.purchase_rate || 0,
+    attribute_name1: attribute,
+    attribute_option_name1: variant,
+    account_id: from.account_id || SALES_ACCOUNT,
+    purchase_account_id: from.purchase_account_id || PURCHASE_ACCOUNT,
+    inventory_account_id: from.inventory_account_id || INVENTORY_ACCOUNT,
+    custom_fields: customFields,
+  };
+  if (from.category_id) body.category_id = String(from.category_id);
+  const z = await handleZohoInventoryPostRequest(`${ZOHO}/items?organization_id=${ORG}`, body);
+  if (!z || z.code !== 0 || !z.item) return { error: (z && (z.message || (z.error && z.error.message))) || "Zoho did not add the variant" };
+  if (String(z.item.group_id || "") !== String(groupId)) return { error: "Zoho made the item outside the product", item: z.item };
+  const kept = new Set((z.item.custom_fields || []).filter((c) => c.value).map((c) => c.api_name));
+  let fieldsError;
+  if (customFields.some((c) => !kept.has(c.api_name))) {
+    try {
+      const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(z.item.item_id)}?organization_id=${ORG}`, { custom_fields: customFields });
+      if (!r || r.code !== 0) fieldsError = (r && (r.message || (r.error && r.error.message))) || "Zoho did not save the fields";
+    } catch (e) {
+      fieldsError = (e && e.message) || "Zoho did not save the fields";
+    }
+  }
+  return { item: z.item, fieldsError };
+}
+
 // File a new item under a store category when the create call didn't keep
 // it — only ever the item just made. { categoryId, categoryName } or { error }.
 async function setItemCategory(itemId, categoryId) {
@@ -427,6 +468,7 @@ module.exports = {
   nextFreeSku,
   createZohoItem,
   createZohoGroup,
+  addZohoGroupItem,
   setItemCategory,
   setPriceLists,
   uploadItemPhotos,

@@ -33,6 +33,7 @@
 //   GET  /new-products/items/:itemId        an existing item as Zoho has it (the Edit item dialog)
 //   PUT  /new-products/items/:itemId        change it: name, quality, classification, category, Compatible Models, selling price (Zoho + register)
 //   POST /new-products/items/:itemId/photos its photos: new ones added, all put in order (the first = main image)
+//   POST /new-products/items/:itemId/variants more variants for its product (a single product becomes one with variants)
 //   POST /new-products/drafts               save the create dialog as a draft (not in Zoho)
 //   GET  /new-products/drafts/:id           one draft
 //   PUT  /new-products/drafts/:id           change a draft (fields, photos and their order)
@@ -60,7 +61,7 @@ const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
   ORG, ZOHO, PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, MAX_REQUEST_IMAGES, acceptPhotos, acceptManyPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
-  skuTaken, baseSkuTaken, nextFreeSku, createZohoItem, createZohoGroup, setItemCategory, setPriceLists, uploadItemPhotos, reorderItemPhotos, readImagesFromUrls, readCost,
+  skuTaken, baseSkuTaken, nextFreeSku, createZohoItem, createZohoGroup, addZohoGroupItem, setItemCategory, setPriceLists, uploadItemPhotos, reorderItemPhotos, readImagesFromUrls, readCost,
 } = require("../../utils/zohoNewItem");
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
@@ -864,9 +865,224 @@ router.get("/items/:itemId", CREATE, async (req, res, next) => {
       categoryId: item.category_id ? String(item.category_id) : "",
       categoryName: item.category_name || "",
       photos,
+      // its product's variants (Add variant, 2026-10-30) — null when Zoho can't say
+      variants: await variantsOf(item).catch(() => null),
     };
     if (canPrice(req)) out.rate = item.rate == null ? null : Number(item.rate);
     return res.json({ success: true, item: out, canPrice: canPrice(req) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── an existing product's variants (user 2026-10-30) ─────────────────
+// Every Zoho item sits in a group — its store product; a single item's
+// group has no attribute yet (tested on VARTEST2, 2026-10-30: the group then
+// takes the attribute, the item an option, and new items join it — the item
+// keeps its id, SKU, stock and store page). The attribute is "Option", as
+// for a product made with variants (createZohoGroup).
+const VARIANT_ATTRIBUTE = "Option";
+// the Zoho fields a new variant copies from the item it is added from
+const VARIANT_FIELDS = ["cf_tags", "cf_sub_classification", "cf_device_brand", "cf_device_series", "cf_compatible_model", "cf_quality"];
+// The SKU a product's variants build on: the item's own, less its "-<variant>".
+const variantBaseSku = (sku, variant) => (variant && str(sku).endsWith(`-${variant}`) ? str(sku).slice(0, -(variant.length + 1)) : str(sku));
+// The name they build on: the item's own, less its " [<variant>]".
+const variantBaseName = (name, variant) => (variant && str(name).endsWith(` [${variant}]`) ? str(name).slice(0, -(variant.length + 3)) : str(name));
+async function readGroup(groupId) {
+  const r = await handleZohoInventoryRequest(`${ZOHO}/itemgroups/${encodeURIComponent(groupId)}?organization_id=${ORG}`);
+  return (r && r.item_group) || null;
+}
+// → { groupId, productName, attribute ("" = a single product), baseSku, items: [{ itemId, sku, name, variant, status }] } or null
+async function variantsOf(item) {
+  if (!item || !item.group_id) return null;
+  const g = await readGroup(String(item.group_id));
+  if (!g) return null;
+  return {
+    groupId: String(item.group_id),
+    productName: g.group_name || item.name || "",
+    attribute: str(g.attribute_name1),
+    baseSku: variantBaseSku(item.sku, str(item.attribute_option_name1)),
+    items: (g.items || []).map((i) => ({ itemId: String(i.item_id), sku: i.sku || "", name: i.name || "", variant: str(i.attribute_option_name1), status: i.status || "" })),
+  };
+}
+
+// POST /new-products/items/:itemId/variants — more variants for the product
+// of this item. Body (multipart): variants (JSON [{ name }]), itemVariant (the
+// item's own title — needed while its product has no variants: the group
+// gets the attribute, the item that option and " [title]" on its name; its
+// SKU stays), photoVariants (one per file: the variant it is of — the item's
+// own title puts it on this item) + images.
+// Each new variant: the item's base name + [title], SKU <base>-<title>, the
+// item's selling / cost price, category, accounts and Zoho fields; then its
+// photos, the item's price lists (from the register), a register row and a
+// `created` entry on the models the item counts for (New Products lists it).
+router.post("/items/:itemId/variants", CREATE, acceptManyPhotos, async (req, res, next) => {
+  try {
+    const itemId = str(req.params.itemId);
+    if (!/^\d{6,25}$/.test(itemId)) return bad(res, "Bad item");
+    const b = req.body || {};
+    const { variants, error: variantError } = readVariants(b.variants);
+    if (variantError) return bad(res, variantError);
+    if (!variants.length) return bad(res, "Add a variant first");
+    const files = req.files || [];
+    const tags = photoTagsOf(b.photoVariants, files.length);
+    if (!tags) return bad(res, "Bad photo list");
+    // the item's own title (a single product's first row) — its photos go on the item
+    const ownName = (readVariants([{ name: b.itemVariant }], { loose: true }).variants || [{}])[0];
+    const ownTitle = ownName ? ownName.name : "";
+    const photos = photosByVariant(files.map((file, i) => ({ file, variant: tags[i] })), ownTitle ? [...variants, { name: ownTitle }] : variants);
+    if (photos.product.length) return bad(res, "A photo here belongs to a variant — name it first");
+    const tooMany = variants.find((v) => (photos.byVariant.get(v.name.toLowerCase()) || []).length > MAX_IMAGES);
+    if (tooMany) return bad(res, `Up to ${MAX_IMAGES} photos for ${tooMany.name}`);
+
+    await refreshToken();
+    let item;
+    try { item = await readZohoItem(itemId); } catch (e) { if (e.unreachable) return unreachable(res, e); throw e; }
+    if (!item) return res.status(404).json({ success: false, message: "Zoho has no such item" });
+    if (!item.group_id) return res.status(409).json({ success: false, message: "Zoho keeps this item outside a product — it can't take variants" });
+    const groupId = String(item.group_id);
+    const group = await readGroup(groupId);
+    if (!group) return res.status(502).json({ success: false, message: "Zoho did not return the item's product — try again" });
+    let attribute = str(group.attribute_name1);
+    const siblings = group.items || [];
+    if (!attribute && siblings.length > 1) return bad(res, "This product has several items but no variant names in Zoho — name them in Zoho first");
+    // the item's own title: its option, or the one typed for a single product
+    let itemVariant = str(item.attribute_option_name1);
+    if (!attribute) {
+      const own = readVariants([{ name: b.itemVariant }]);
+      if (own.error) return bad(res, own.error === "Every variant needs a name" ? "Fill in the first variant — it is this item (e.g. Black)" : own.error);
+      itemVariant = own.variants[0].name;
+    }
+    const taken = new Set([...siblings.map((i) => str(i.attribute_option_name1).toLowerCase()), itemVariant.toLowerCase()].filter(Boolean));
+    const clash = variants.find((v) => taken.has(v.name.toLowerCase()));
+    if (clash) return bad(res, `${clash.name} is already a variant of this product`);
+    const baseSku = variantBaseSku(item.sku, itemVariant);
+    const baseName = variantBaseName(item.name, itemVariant);
+    const long = variants.find((v) => `${baseName} [${v.name}]`.length > 200);
+    if (long) return bad(res, `"${baseName} [${long.name}]" is too long (200 characters at most)`);
+    for (const v of variants) {
+      if (await skuTaken(`${baseSku}-${v.name}`)) return bad(res, `SKU ${baseSku}-${v.name} is already used in Zoho`);
+    }
+
+    const db = await connectToDatabase();
+    const problems = [];
+    let renamedTo = null;
+    // a single product: the attribute and the item's own option first
+    if (!attribute) {
+      const u = await handleZohoInventoryPutRequest(`${ZOHO}/itemgroups/${encodeURIComponent(groupId)}?organization_id=${ORG}`, {
+        group_name: group.group_name || item.name,
+        unit: group.unit || item.unit || "qty",
+        attribute_name1: VARIANT_ATTRIBUTE,
+        attributes: [{ name: VARIANT_ATTRIBUTE, options: [{ name: itemVariant }] }],
+        items: [{ item_id: itemId, name: item.name, sku: item.sku, rate: item.rate, purchase_rate: item.purchase_rate, attribute_option_name1: itemVariant }],
+      });
+      const after = await readZohoItem(itemId).catch(() => null);
+      if (!u || u.code !== 0 || !after || str(after.attribute_option_name1) !== itemVariant) {
+        const why = (u && (u.message || (u.error && u.error.message))) || "the item did not take its variant";
+        return res.status(502).json({ success: false, message: `Zoho: ${why} — nothing was added` });
+      }
+      attribute = VARIANT_ATTRIBUTE;
+      // its name gets its title; its SKU, stock and store page stay
+      const want = `${item.name} [${itemVariant}]`;
+      if (want.length <= 200) {
+        const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`, { name: want });
+        if (r && r.code === 0) {
+          renamedTo = want;
+          await db.collection(ITEMS).updateOne({ itemId }, { $set: { name: want } });
+        } else {
+          problems.push(`${item.sku}: the name did not change (${(r && r.message) || "no answer"})`);
+        }
+      }
+    }
+
+    // the photos given for this item itself — the main image only when it has none
+    const ownFiles = ownTitle ? photos.byVariant.get(ownTitle.toLowerCase()) || [] : [];
+    if (ownFiles.length) {
+      const hadImage = !!item.image_document_id || (item.documents || []).some((d) => d && d.document_id);
+      const p = await uploadItemPhotos(itemId, ownFiles, { sku: item.sku, inventoryOnly: true, primary: !hadImage });
+      if (p.error) problems.push(`${item.sku} photos: ${p.error}`);
+      else if (!hadImage && p.imageId) await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId: p.imageId } });
+    }
+
+    // the new variants, set up like this item
+    const cf = cfOf(item);
+    const customFields = VARIANT_FIELDS.filter((k) => cf.get(k)).map((api_name) => ({ api_name, value: cf.get(api_name) }));
+    const row = await db.collection(ITEMS).findOne({ itemId });
+    const listRates = {};
+    if (row) {
+      for (const [list, field] of [["platinum", "pricePlatinum"], ["vip", "priceVip"], ["svip", "priceSvip"], ["wholesale", "priceWholesale"]]) {
+        if (row[field] != null && Number.isFinite(Number(row[field]))) listRates[list] = Number(row[field]);
+      }
+    }
+    // the models it counts for: the ones whose `created` has it, else by its Compatible Models
+    const compatibleModels = splitList(cf.get("cf_compatible_model"));
+    let models = await db.collection(MODELS).find({ "created.itemId": itemId }, { projection: { created: 1 } }).toArray();
+    if (!models.length && compatibleModels.length) {
+      const keys = compatibleModels.map(modelKey);
+      const all = await db.collection(MODELS).find({}, { projection: { compatibleModel: 1, model: 1, aliases: 1 } }).toArray();
+      models = all.filter((o) => [o.compatibleModel, o.model, ...(o.aliases || [])].map(modelKey).some((k) => k && keys.includes(k)));
+    }
+    const fromCreated = models.flatMap((m) => m.created || []).find((c) => String(c.itemId) === itemId) || {};
+
+    const added = [];
+    const now = new Date();
+    for (const v of variants) {
+      const sku = `${baseSku}-${v.name}`;
+      const name = `${baseName} [${v.name}]`;
+      const z = await addZohoGroupItem({ groupId, attribute, variant: v.name, name, sku, from: item, customFields });
+      if (z.error) {
+        problems.push(`${v.name}: ${z.error}`);
+        continue;
+      }
+      const newId = String(z.item.item_id);
+      if (z.fieldsError) problems.push(`${sku}: Zoho fields — ${z.fieldsError}`);
+      const f = photos.byVariant.get(v.name.toLowerCase()) || [];
+      let imageId = null;
+      if (f.length) {
+        const p = await uploadItemPhotos(newId, f, { sku, inventoryOnly: true });
+        if (p.error) problems.push(`${v.name} photos: ${p.error}`);
+        else imageId = p.imageId || null;
+      }
+      let prices = {};
+      if (Object.keys(listRates).length) {
+        const p = await setPriceLists(newId, listRates);
+        prices = p.set || {};
+        for (const [k, e] of Object.entries(p.errors || {})) problems.push(`${sku} ${PRICE_LISTS[k] ? PRICE_LISTS[k].label : k}: ${e}`);
+      }
+      added.push({ itemId: newId, sku, name, variant: v.name, imageId, prices });
+    }
+
+    // the register and New Products, for the ones Zoho made
+    const base = row || {};
+    for (const a of added) {
+      await addCreatedItem(db, {
+        itemId: a.itemId, sku: a.sku, name: a.name, quality: base.quality || cf.get("cf_quality") || "", purchasePrice: Number(item.purchase_rate) || 0,
+        classification: base.classification || cf.get("cf_tags") || "", subClassification: base.subClassification || cf.get("cf_sub_classification") || "",
+        deviceBrand: base.deviceBrand || cf.get("cf_device_brand") || "", deviceSeries: base.deviceSeries || cf.get("cf_device_series") || "",
+        compatibleModels: base.compatibleModels || compatibleModels, imageId: a.imageId,
+        zohoCategoryId: String(item.category_id || ""), zohoCategory: item.category_name || "", prices: a.prices,
+      });
+    }
+    if (added.length && models.length) {
+      const entries = added.map((a) => ({
+        part: fromCreated.part || OTHER,
+        classification: fromCreated.classification || cf.get("cf_tags") || "",
+        subClassification: fromCreated.subClassification || cf.get("cf_sub_classification") || "",
+        itemId: a.itemId, imageId: a.imageId, prices: a.prices, sku: a.sku, name: a.name,
+        quality: cf.get("cf_quality") || "", rate: item.rate, cost: Number(item.purchase_rate) || null,
+        categoryId: String(item.category_id || "") || null, categoryName: item.category_name || null,
+        compatibleModel: compatibleModels.join("; "), compatibleModels,
+        groupId, groupName: group.group_name || "", variant: a.variant, addedTo: itemId,
+        at: now, by: actor(req),
+      }));
+      await db.collection(MODELS).updateMany({ _id: { $in: models.map((m) => m._id) } }, { $push: { created: { $each: entries } }, $set: { updatedAt: now } });
+    }
+    await db.collection(ITEM_EDITS).insertOne({
+      itemId, sku: item.sku, action: "variants", itemVariant, renamedTo,
+      added: added.map((a) => ({ itemId: a.itemId, sku: a.sku, variant: a.variant })), problems, at: now, by: actor(req),
+    });
+    if (!added.length) return res.status(502).json({ success: false, message: `Zoho added no variant: ${problems.join("; ")}`, itemVariant, renamedTo });
+    return res.json({ success: true, product: { groupId, name: group.group_name || "" }, itemVariant, renamedTo, added, problems });
   } catch (error) {
     next(error);
   }
