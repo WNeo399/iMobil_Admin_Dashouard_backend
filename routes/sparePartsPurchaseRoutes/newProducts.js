@@ -29,6 +29,7 @@
 //   GET  /new-products/next-sku             the next free parts SKU (22xxx) — asks Zoho
 //   GET  /new-products/categories           the store categories to file a new item under (Zoho Commerce)
 //   POST /new-products/items                create one Zoho item for a model + part (+ photos, price lists; or from a draft)
+//                                           — or, given `variants`, one product with variants (a Zoho item group)
 //   GET  /new-products/items/:itemId        an existing item as Zoho has it (the Edit item dialog)
 //   PUT  /new-products/items/:itemId        change it: name, quality, classification, category, Compatible Models, selling price (Zoho + register)
 //   POST /new-products/items/:itemId/photos its photos: new ones added, all put in order (the first = main image)
@@ -52,14 +53,14 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { TE_SCOPE } = require("../../utils/stockItems");
 const { addCreatedItem } = require("../../utils/stockItemsSync");
 const { refreshToken, handleZohoInventoryRequest, handleZohoInventoryPutRequest } = require("../../utils/zohoRequest");
-const { renameStoreProduct } = require("../../utils/zohoCommerce");
+const { renameStoreProduct, uploadProductImages } = require("../../utils/zohoCommerce");
 const { imageUrlFromId, imageIdOf } = require("../../utils/productImage");
 const { fetchItemDetails } = require("../../utils/zohoStock");
 const { storeImage, removeImage } = require("../../utils/sppImages");
 // creating the Zoho item (shared with the Purchase Order page's New Product lines)
 const {
-  ORG, ZOHO, PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, acceptPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
-  skuTaken, nextFreeSku, createZohoItem, setItemCategory, setPriceLists, uploadItemPhotos, reorderItemPhotos, readImagesFromUrls, readCost,
+  ORG, ZOHO, PLACEHOLDER_RATE, PRICE_LISTS, MAX_IMAGES, MAX_REQUEST_IMAGES, acceptPhotos, acceptManyPhotos, parsePriceLists, qualityOptions, classificationOptions, cleanQuality,
+  skuTaken, baseSkuTaken, nextFreeSku, createZohoItem, createZohoGroup, setItemCategory, setPriceLists, uploadItemPhotos, reorderItemPhotos, readImagesFromUrls, readCost,
 } = require("../../utils/zohoNewItem");
 // the pricing formula (the dialog prices a typed cost with it) and the store categories
 const { PRICE_FORMULAS, priceRuleFamily } = require("../../utils/priceRules");
@@ -1121,13 +1122,224 @@ router.post("/items/:itemId/photos", CREATE, acceptPhotos, async (req, res, next
 // a model without a link creates nothing until it is linked). Sent as
 // multipart/form-data it may carry photos under "images" (compatibleModels
 // then as a JSON array string).
-router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
+// ── a product with variants (user 2026-10-30) ──────────────────────────
+// The create dialog's Variants: [{ name }] (JSON in a multipart form) — one
+// Zoho item each under one item group, the store's picker. A variant is its
+// title and its photos only (user 2026-10-30: "no need price") — every one
+// takes the product's prices. Names trimmed, told apart without case, no [ ]
+// (each goes into its item's name as a [tag]). `loose` (a draft): unnamed
+// rows are dropped instead of refused. { variants } or { error }.
+const MAX_VARIANTS = 20;
+function readVariants(v, { loose = false } = {}) {
+  let x = v;
+  if (x === undefined || x === null || x === "") return { variants: [] };
+  if (typeof x === "string") {
+    try { x = JSON.parse(x); } catch (e) { return { error: "Bad variants" }; }
+  }
+  if (!Array.isArray(x)) return { error: "Bad variants" };
+  if (x.length > MAX_VARIANTS) return { error: `Up to ${MAX_VARIANTS} variants` };
+  const variants = [];
+  const seen = new Set();
+  for (const c of x) {
+    const name = str(c && c.name).replace(/\s+/g, " ");
+    if (!name) {
+      if (loose) continue;
+      return { error: "Every variant needs a name" };
+    }
+    if (name.length > 30) return { error: `${name}: a variant takes 30 characters at most` };
+    if (/[[\]]/.test(name)) return { error: `${name}: a variant can't contain [ or ]` };
+    if (seen.has(name.toLowerCase())) return { error: `${name} is in the list twice` };
+    seen.add(name.toLowerCase());
+    variants.push({ name });
+  }
+  return { variants };
+}
+// Whose each photo sent is: `photoVariants` (JSON) has one entry per file —
+// "" the product's own, else a variant's name. → [tag per file] or null (bad).
+function photoTagsOf(v, n) {
+  if (v === undefined || v === null || v === "") return new Array(n).fill("");
+  let x = v;
+  if (typeof x === "string") {
+    try { x = JSON.parse(x); } catch (e) { return null; }
+  }
+  if (!Array.isArray(x) || x.length !== n) return null;
+  return x.map((t) => str(t).replace(/\s+/g, " "));
+}
+// The photos by whose they are: { product: [files], byVariant: Map(lower name → [files]) };
+// a tag naming no variant (renamed / removed meanwhile) is the product's.
+function photosByVariant(entries, variants) {
+  const names = new Map(variants.map((c) => [c.name.toLowerCase(), c.name]));
+  const out = { product: [], byVariant: new Map() };
+  for (const { file, variant } of entries) {
+    const k = String(variant || "").toLowerCase();
+    if (k && names.has(k)) {
+      if (!out.byVariant.has(k)) out.byVariant.set(k, []);
+      out.byVariant.get(k).push(file);
+    } else {
+      out.product.push(file);
+    }
+  }
+  return out;
+}
+
+// POST /items given `variants`, once the checks every item has are done: the
+// Zoho group (SKU = the base number, each variant "<base>-<variant>"), then as
+// for one item — the category, the photos, the price lists, the model's
+// `created` (one entry per variant, with groupId / variant) and the register
+// rows. Photos: the product's own go on the store product (what listings and
+// search show — the first variant's first photo when none were given), each
+// variant's on its own item. The store product starts hidden, like every new
+// item (New Items → Approve shows it, every variant with it).
+async function createInVariants(req, res, ctx) {
+  const { db, model, _id, cfg, part, name, quality, rate, listRates, cost, category, compatibleModels, compatibleModel, draft, files, tags, variants } = ctx;
+  const b = req.body || {};
+  // a draft's saved photos (each knows its variant), then the ones sent now
+  const entries = [];
+  const unread = [];
+  for (const im of (draft && draft.images) || []) {
+    const r = await readImagesFromUrls([im]);
+    if (r.files[0]) entries.push({ file: r.files[0], variant: im.variant || "" });
+    else unread.push(im.id);
+  }
+  files.forEach((file, i) => entries.push({ file, variant: tags[i] }));
+  const photos = photosByVariant(entries, variants);
+  if (photos.product.length > MAX_IMAGES) return bad(res, `Up to ${MAX_IMAGES} photos for the product`);
+  const tooMany = variants.find((c) => (photos.byVariant.get(c.name.toLowerCase()) || []).length > MAX_IMAGES);
+  if (tooMany) return bad(res, `Up to ${MAX_IMAGES} photos for ${tooMany.name}`);
+
+  await refreshToken();
+  let base = str(b.sku);
+  if (base) {
+    if (!/^\d{4,6}$/.test(base)) return bad(res, "SKU must be a number");
+    if (await baseSkuTaken(base)) return bad(res, `SKU ${base} is already used in Zoho`);
+  } else {
+    base = await nextFreeSku(db);
+  }
+  const deviceSeries = await deviceSeriesFor(db, model, compatibleModels);
+  const z = await createZohoGroup({
+    name, quality,
+    purchaseRate: cost,
+    categoryId: category.id,
+    classification: part.classification,
+    subClassification: part.subClassification,
+    deviceBrand: cfg.deviceBrand,
+    deviceSeries,
+    compatibleModel,
+    variants: variants.map((c) => ({ name: c.name, sku: `${base}-${c.name}`, rate })),
+  });
+  if (z.error) return res.status(502).json({ success: false, message: `Zoho: ${z.error}` });
+  const made = z.items.filter((it) => it.itemId);
+  // what didn't make it (the product exists either way)
+  const problems = Object.entries(z.fieldErrors).map(([sku, e]) => `${sku}: ${e}`);
+  // the category, on any variant that didn't keep it
+  const filed = { id: category.id, name: category.name };
+  for (const it of made) {
+    if (it.categoryId === category.id) continue;
+    const c = await setItemCategory(it.itemId, category.id);
+    if (c.error) filed.error = c.error;
+  }
+  const photoErrors = [];
+  const firstVariantPhoto = () => {
+    for (const c of variants) {
+      const f = photos.byVariant.get(c.name.toLowerCase());
+      if (f && f.length) return [f[0]];
+    }
+    return [];
+  };
+  const productFiles = photos.product.length ? photos.product : firstVariantPhoto();
+  if (productFiles.length) {
+    const r = await uploadProductImages(z.groupId, productFiles).catch((e) => ({ message: e.message }));
+    if (!r || r.code !== 0) photoErrors.push(`the product: ${(r && r.message) || "not taken"}`);
+  }
+  const imageIds = {};
+  for (const it of made) {
+    const f = photos.byVariant.get(it.variant.toLowerCase()) || [];
+    if (!f.length) continue;
+    const r = await uploadItemPhotos(it.itemId, f, { sku: it.sku, inventoryOnly: true });
+    if (r.error) photoErrors.push(`${it.variant}: ${r.error}`);
+    else imageIds[it.itemId] = r.imageId || null;
+  }
+  if (unread.length) photoErrors.push(`${unread.length} saved photo(s) could not be read`);
+  // the price lists, the same on every variant
+  const prices = { set: {}, errors: {} };
+  if (Object.keys(listRates).length) {
+    for (const it of made) {
+      const p = await setPriceLists(it.itemId, listRates);
+      Object.assign(prices.set, p.set || {});
+      for (const [k, e] of Object.entries(p.errors || {})) if (!prices.errors[k]) prices.errors[k] = `${it.variant}: ${e}`;
+    }
+  }
+
+  const now = new Date();
+  const created = made.map((it) => ({
+    part: part.key,
+    classification: part.classification,
+    subClassification: part.subClassification || "",
+    itemId: it.itemId,
+    imageId: imageIds[it.itemId] || null,
+    prices: prices.set,
+    sku: it.sku,
+    name: it.name,
+    quality,
+    rate: it.rate,
+    cost,
+    categoryId: filed.error ? null : filed.id,
+    categoryName: filed.error ? null : filed.name,
+    compatibleModel,
+    compatibleModels,
+    groupId: z.groupId,
+    groupName: z.groupName,
+    variant: it.variant,
+    at: now,
+    by: actor(req),
+  }));
+  // every variant counts for this model and every other model it was given
+  const keys = compatibleModels.map(modelKey);
+  const others = await db.collection(MODELS).find({ brand: model.brand, _id: { $ne: _id } }, { projection: { compatibleModel: 1, model: 1, aliases: 1 } }).toArray();
+  const alsoIds = others.filter((o) => [o.compatibleModel, o.model, ...(o.aliases || [])].map(modelKey).some((k) => k && keys.includes(k))).map((o) => o._id);
+  if (created.length) {
+    await db.collection(MODELS).updateMany({ _id: { $in: [_id, ...alsoIds] } }, { $push: { created: { $each: created } }, $set: { updatedAt: now } });
+  }
+  for (const c of created) {
+    await addCreatedItem(db, {
+      itemId: c.itemId, sku: c.sku, name: c.name, quality, purchasePrice: cost,
+      classification: part.classification, subClassification: part.subClassification || "",
+      deviceBrand: cfg.deviceBrand, deviceSeries, compatibleModels, imageId: c.imageId,
+      zohoCategoryId: c.categoryId || "", zohoCategory: c.categoryName || "", prices: c.prices,
+    });
+  }
+  if (draft) {
+    await db.collection(DRAFTS).updateOne(
+      { _id: draft._id },
+      { $set: { status: "submitted", submittedAt: now, submittedBy: actor(req), itemId: made[0] ? made[0].itemId : null, submittedSku: base, groupId: z.groupId } },
+    );
+  }
+  return res.json({
+    success: true,
+    item: { sku: base, name: z.groupName, itemId: made[0] ? made[0].itemId : null, variants: made.length },
+    group: { groupId: z.groupId, name: z.groupName, items: made.map((it) => ({ itemId: it.itemId, sku: it.sku, variant: it.variant, rate: it.rate })) },
+    countedFor: 1 + alsoIds.length,
+    photos: photoErrors.length ? { error: photoErrors.join("; ") } : { uploaded: entries.length },
+    prices,
+    category: filed,
+    problems,
+    draftId: draft ? String(draft._id) : null,
+  });
+}
+
+router.post("/items", CREATE, acceptManyPhotos, async (req, res, next) => {
   try {
     const b = req.body || {};
     if (typeof b.compatibleModels === "string" && b.compatibleModels.trim().startsWith("[")) {
       try { b.compatibleModels = JSON.parse(b.compatibleModels); } catch (e) { return bad(res, "Bad compatible models"); }
     }
     const files = req.files || [];
+    const { variants, error: variantError } = readVariants(b.variants);
+    if (variantError) return bad(res, variantError);
+    if (variants.length === 1) return bad(res, "A product with variants needs two at least — or turn Variants off");
+    const tags = photoTagsOf(b.photoVariants, files.length);
+    if (!tags) return bad(res, "Bad photo list");
+    if (!variants.length && files.length > MAX_IMAGES) return bad(res, `Up to ${MAX_IMAGES} photos`);
     const _id = oid(b.modelId);
     if (!_id) return bad(res, "invalid model id");
     const db = await connectToDatabase();
@@ -1174,6 +1386,11 @@ router.post("/items", CREATE, acceptPhotos, async (req, res, next) => {
     const compatibleModels = [...new Set(list(b.compatibleModels !== undefined ? b.compatibleModels : b.compatibleModel))];
     if (!compatibleModels.length) compatibleModels.push(model.compatibleModel || cfg.compatibleModel(model));
     const compatibleModel = compatibleModels.join("; ");
+    if (variants.length) {
+      const long = variants.find((c) => `${name} [${c.name}]`.length > 200);
+      if (long) return bad(res, `"${name} [${long.name}]" is too long (200 characters at most)`);
+      return await createInVariants(req, res, { db, model, _id, cfg, part, name, quality, rate, listRates, cost, category, compatibleModels, compatibleModel, draft, files, tags, variants });
+    }
 
     await refreshToken();
     let sku = str(b.sku);
@@ -1292,7 +1509,10 @@ function draftFields(b, cfg) {
   if (costError) return { error: costError };
   const models = jsonField(b.compatibleModels, []);
   if (models === Symbol.for("bad")) return { error: "Bad compatible models" };
-  const fields = { part: part.key, name, sku, quality, rate, cost, prices, compatibleModels: [...new Set(list(models))] };
+  // a product with variants: the variants so far (unnamed rows dropped)
+  const { variants, error: variantError } = readVariants(b.variants, { loose: true });
+  if (variantError) return { error: variantError };
+  const fields = { part: part.key, name, sku, quality, rate, cost, prices, compatibleModels: [...new Set(list(models))], variants };
   if (other) Object.assign(fields, { classification: part.classification, subClassification: part.subClassification || "" });
   return { fields };
 }
@@ -1310,7 +1530,9 @@ function draftFull(d) {
     ...draftBrief(d),
     quality: d.quality || "", rate: d.rate, cost: d.cost == null ? null : d.cost,
     prices: d.prices || {}, compatibleModels: d.compatibleModels || [],
-    images: (d.images || []).map((im) => ({ id: im.id, url: im.url, name: im.name || "", width: im.width || null, height: im.height || null })),
+    variants: d.variants || [],
+    // variant = the variant the photo is of ("" = the product's own)
+    images: (d.images || []).map((im) => ({ id: im.id, url: im.url, name: im.name || "", width: im.width || null, height: im.height || null, variant: im.variant || "" })),
     createdAt: d.createdAt, createdBy: d.createdBy || null,
   };
 }
@@ -1322,7 +1544,44 @@ async function draftModel(db, modelId) {
   return model && BRANDS[model.brand] ? model : null;
 }
 
-router.post("/drafts", CREATE, acceptPhotos, async (req, res, next) => {
+// A draft's photos from the dialog's `order` (JSON): [{ id }] for a photo
+// saved already, [{ new: n }] for the n-th file sent now; each may carry
+// `variant` — whose photo it is in a product with variants ("" = the product's
+// own). 10 for the product and for each variant. { images } or { error };
+// the caller removes the saved ones left out.
+async function draftImagesFrom(b, old, files, draftId) {
+  let order = jsonField(b.order, null);
+  if (order === Symbol.for("bad")) return { error: "Bad photo order" };
+  if (!Array.isArray(order)) order = [...old.map((im) => ({ id: im.id, variant: im.variant || "" })), ...files.map((x, i) => ({ new: i }))];
+  if (order.length > MAX_REQUEST_IMAGES) return { error: `Up to ${MAX_REQUEST_IMAGES} photos` };
+  const variantOf = (o) => str(o && o.variant).replace(/\s+/g, " ");
+  const counts = new Map();
+  for (const o of order) {
+    const k = variantOf(o).toLowerCase();
+    const n = (counts.get(k) || 0) + 1;
+    counts.set(k, n);
+    if (n > MAX_IMAGES) return { error: k ? `Up to ${MAX_IMAGES} photos for ${variantOf(o)}` : `Up to ${MAX_IMAGES} photos` };
+  }
+  const images = [];
+  const used = new Set();
+  for (const o of order) {
+    const tag = variantOf(o) ? { variant: variantOf(o) } : {};
+    if (o && o.id) {
+      const im = old.find((x) => x.id === o.id);
+      if (im && !images.some((x) => x.id === im.id)) {
+        const kept = { ...im };
+        delete kept.variant;
+        images.push({ ...kept, ...tag });
+      }
+    } else if (o && Number.isInteger(o.new) && files[o.new] && !used.has(o.new)) {
+      used.add(o.new);
+      images.push({ ...(await storeImage(files[o.new], `np-draft-${draftId}`)), ...tag });
+    }
+  }
+  return { images };
+}
+
+router.post("/drafts", CREATE, acceptManyPhotos, async (req, res, next) => {
   try {
     const b = req.body || {};
     const db = await connectToDatabase();
@@ -1331,8 +1590,8 @@ router.post("/drafts", CREATE, acceptPhotos, async (req, res, next) => {
     const { fields, error } = draftFields(b, BRANDS[model.brand]);
     if (error) return bad(res, error);
     const _id = new ObjectId();
-    const images = [];
-    for (const file of req.files || []) images.push(await storeImage(file, `np-draft-${_id}`));
+    const { images, error: photoError } = await draftImagesFrom(b, [], req.files || [], _id);
+    if (photoError) return bad(res, photoError);
     const now = new Date();
     const doc = { _id, modelId: model._id, brand: model.brand, ...fields, images, status: "draft", createdAt: now, createdBy: actor(req), updatedAt: now, updatedBy: actor(req) };
     await db.collection(DRAFTS).insertOne(doc);
@@ -1357,8 +1616,9 @@ router.get("/drafts/:id", CREATE, async (req, res, next) => {
 
 // Change a draft. `order` (JSON) is the photo list as the dialog has it:
 // [{ id }] for a photo already saved, [{ new: n }] for the n-th file sent
-// now. A saved photo left out is removed (from S3 too).
-router.put("/drafts/:id", CREATE, acceptPhotos, async (req, res, next) => {
+// now (each may name its variant — draftImagesFrom). A saved photo left out
+// is removed (from S3 too).
+router.put("/drafts/:id", CREATE, acceptManyPhotos, async (req, res, next) => {
   try {
     const _id = oid(req.params.id);
     const db = await connectToDatabase();
@@ -1370,24 +1630,10 @@ router.put("/drafts/:id", CREATE, acceptPhotos, async (req, res, next) => {
     const { fields, error } = draftFields(b, BRANDS[model.brand]);
     if (error) return bad(res, error);
 
-    const files = req.files || [];
     const old = d.images || [];
-    let order = jsonField(b.order, null);
-    if (order === Symbol.for("bad")) return bad(res, "Bad photo order");
-    if (!Array.isArray(order)) order = [...old.map((im) => ({ id: im.id })), ...files.map((x, i) => ({ new: i }))];
-    if (order.length > MAX_IMAGES) return bad(res, `Up to ${MAX_IMAGES} photos`);
-    const images = [];
-    const used = new Set();
-    for (const o of order) {
-      if (o && o.id) {
-        const im = old.find((x) => x.id === o.id);
-        if (im && !images.includes(im)) images.push(im);
-      } else if (o && Number.isInteger(o.new) && files[o.new] && !used.has(o.new)) {
-        used.add(o.new);
-        images.push(await storeImage(files[o.new], `np-draft-${_id}`));
-      }
-    }
-    for (const im of old) if (!images.includes(im)) await removeImage(im.key);
+    const { images, error: photoError } = await draftImagesFrom(b, old, req.files || [], _id);
+    if (photoError) return bad(res, photoError);
+    for (const im of old) if (!images.some((x) => x.id === im.id)) await removeImage(im.key);
 
     const now = new Date();
     const set = { ...fields, images, updatedAt: now, updatedBy: actor(req) };

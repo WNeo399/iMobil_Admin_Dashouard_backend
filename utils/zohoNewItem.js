@@ -55,16 +55,30 @@ const photoUpload = multer({
       ? cb(null, true)
       : cb(Object.assign(new Error(`${file.originalname}: only gif, png, jpeg, bmp or webp images`), { badType: true })),
 }).array("images", MAX_IMAGES);
-function acceptPhotos(req, res, next) {
-  photoUpload(req, res, (err) => {
+// A product with variants (Listing's Create, 2026-10-30) sends its own photos
+// and each variant's in one request: up to 10 each, 40 in all — the route
+// checks the 10s.
+const MAX_REQUEST_IMAGES = 40;
+const manyPhotoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 7 * 1024 * 1024, files: MAX_REQUEST_IMAGES },
+  fileFilter: (req, file, cb) =>
+    IMAGE_MIME.test(file.mimetype)
+      ? cb(null, true)
+      : cb(Object.assign(new Error(`${file.originalname}: only gif, png, jpeg, bmp or webp images`), { badType: true })),
+}).array("images", MAX_REQUEST_IMAGES);
+const photoUploadHandler = (upload, max) => function (req, res, next) {
+  upload(req, res, (err) => {
     if (!err) return next();
     const message = err.badType ? err.message
       : err.code === "LIMIT_FILE_SIZE" ? "Each photo must be 7 MB or smaller"
-        : err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE" ? `Up to ${MAX_IMAGES} photos`
+        : err.code === "LIMIT_FILE_COUNT" || err.code === "LIMIT_UNEXPECTED_FILE" ? `Up to ${max} photos`
           : "Could not read the photos";
     return res.status(400).json({ success: false, message });
   });
-}
+};
+const acceptPhotos = photoUploadHandler(photoUpload, MAX_IMAGES);
+const acceptManyPhotos = photoUploadHandler(manyPhotoUpload, MAX_REQUEST_IMAGES);
 
 // The four price lists from a request (an object, or its JSON in a
 // multipart form): blank ones are left out. { rates } or { error }.
@@ -143,17 +157,27 @@ async function skuTaken(sku) {
   return ((r && r.items) || []).some((it) => String(it.sku).trim() === String(sku));
 }
 
+// Is this number taken — as a SKU, or as the base of a product with variants
+// ("22450-Black")? The plain SKU, then a search for the variant ones.
+async function baseSkuTaken(base) {
+  if (await skuTaken(base)) return true;
+  const r = await handleZohoInventoryRequest(`${ZOHO}/items?organization_id=${ORG}&search_text=${encodeURIComponent(`${base}-`)}`);
+  return ((r && r.items) || []).some((it) => String(it.sku).trim().startsWith(`${base}-`));
+}
+
 // The next free parts SKU: the highest 22xxx in the register (and in the
 // New Products page's own `created` records — the register lags Zoho by a
-// day) + 1, each candidate checked in Zoho.
+// day) + 1, each candidate checked in Zoho. A variant's SKU (22450-Black)
+// uses its number too.
 async function nextFreeSku(db) {
-  const inRegister = await db.collection("imb_stock_items").find({ sku: /^22\d{3}$/ }, { projection: { _id: 0, sku: 1 } }).toArray();
+  const inRegister = await db.collection("imb_stock_items").find({ sku: /^22\d{3}(-|$)/ }, { projection: { _id: 0, sku: 1 } }).toArray();
   const inCreated = await db.collection("imb_spp_new_products").aggregate([{ $unwind: "$created" }, { $project: { _id: 0, sku: "$created.sku" } }]).toArray();
-  let n = Math.max(SKU_MIN - 1, ...[...inRegister, ...inCreated].map((x) => Number(x.sku)).filter((x) => Number.isFinite(x) && x >= SKU_MIN && x <= SKU_MAX));
+  const numberOf = (sku) => { const m = /^(\d+)(-|$)/.exec(String(sku || "")); return m ? Number(m[1]) : NaN; };
+  let n = Math.max(SKU_MIN - 1, ...[...inRegister, ...inCreated].map((x) => numberOf(x.sku)).filter((x) => Number.isFinite(x) && x >= SKU_MIN && x <= SKU_MAX));
   for (let tries = 0; tries < 20; tries++) {
     n += 1;
     if (n > SKU_MAX) throw new Error("The 22xxx parts SKU range is used up");
-    if (!(await skuTaken(n))) return String(n);
+    if (!(await baseSkuTaken(n))) return String(n);
   }
   throw new Error("Could not find a free SKU");
 }
@@ -190,6 +214,71 @@ async function createZohoItem({ name, sku, rate, purchaseRate, categoryId, quali
     return { error: (z && (z.message || (z.error && z.error.message))) || "Zoho did not create the item" };
   }
   return { item: z.item };
+}
+
+// A product with variants (Listing's Create, user 2026-10-30, after the TEST
+// group 2591985000371483763): a Zoho item GROUP with one attribute — one
+// item per variant, named "<name> [<variant>]", SKU "<base>-<variant>",
+// which the store shows as ONE product with a picker (Commerce product_id =
+// group_id). The attribute is "Option" — a variant can be anything (user
+// 2026-10-30), and the store's older groups use that name too. Set up like
+// createZohoItem's item. Zoho's group create drops the items' custom fields
+// (seen on the test), so each item gets them in a PUT after.
+// variants: [{ name, sku, rate }].
+// → { groupId, groupName, items: [{ itemId, sku, name, variant, rate, categoryId }], fieldErrors: { sku: message } } or { error }.
+async function createZohoGroup({ name, attribute = "Option", variants, purchaseRate, categoryId, quality, classification, subClassification, deviceBrand, deviceSeries, compatibleModel }) {
+  const customFields = [];
+  const cf = (api_name, value) => { if (value) customFields.push({ api_name, value }); };
+  cf("cf_tags", classification);
+  cf("cf_sub_classification", subClassification);
+  cf("cf_device_brand", deviceBrand);
+  cf("cf_device_series", deviceSeries);
+  cf("cf_compatible_model", compatibleModel);
+  cf("cf_quality", quality);
+  const body = {
+    group_name: name,
+    unit: "qty",
+    product_type: "goods",
+    item_type: "inventory",
+    attribute_name1: attribute,
+    attributes: [{ name: attribute, options: variants.map((c) => ({ name: c.name })) }],
+    items: variants.map((c) => ({
+      name: `${name} [${c.name}]`,
+      sku: c.sku,
+      attribute_option_name1: c.name,
+      rate: c.rate,
+      purchase_rate: purchaseRate || 0,
+      item_type: "inventory",
+      account_id: SALES_ACCOUNT,
+      purchase_account_id: PURCHASE_ACCOUNT,
+      inventory_account_id: INVENTORY_ACCOUNT,
+      custom_fields: customFields,
+    })),
+  };
+  if (categoryId) body.category_id = String(categoryId);
+  const z = await handleZohoInventoryPostRequest(`${ZOHO}/itemgroups?organization_id=${ORG}`, body);
+  const g = z && (z.item_group || z);
+  if (!z || z.code !== 0 || !g || !g.group_id) {
+    return { error: (z && (z.message || (z.error && z.error.message))) || "Zoho did not create the product" };
+  }
+  const made = Array.isArray(g.items) ? g.items : g.items ? [g.items] : [];
+  const items = variants.map((c) => {
+    const it = made.find((x) => String(x.sku) === c.sku) || {};
+    return { itemId: it.item_id ? String(it.item_id) : "", sku: c.sku, name: it.name || `${name} [${c.name}]`, variant: c.name, rate: c.rate, categoryId: String(it.category_id || g.category_id || "") };
+  });
+  const fieldErrors = {};
+  if (customFields.length) {
+    for (const it of items) {
+      if (!it.itemId) { fieldErrors[it.sku] = "Zoho did not return this variant"; continue; }
+      try {
+        const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(it.itemId)}?organization_id=${ORG}`, { custom_fields: customFields });
+        if (!r || r.code !== 0) fieldErrors[it.sku] = (r && (r.message || (r.error && r.error.message))) || "Zoho did not save the fields";
+      } catch (e) {
+        fieldErrors[it.sku] = (e && e.message) || "Zoho did not save the fields";
+      }
+    }
+  }
+  return { groupId: String(g.group_id), groupName: g.group_name || name, items, fieldErrors };
 }
 
 // File a new item under a store category when the create call didn't keep
@@ -239,14 +328,17 @@ async function setPriceLists(itemId, rates) {
 // doesn't have, or a store that refuses.
 // → { uploaded, imageId, zohoImageId, via: "store" | "inventory" } or { uploaded: 0, error }
 //   imageId: the main image; zohoImageId: what Zoho's bulk record says (it can lag)
-async function uploadItemPhotos(itemId, files, { primary = true, sku = "" } = {}) {
+async function uploadItemPhotos(itemId, files, { primary = true, sku = "", inventoryOnly = false } = {}) {
   try {
     let via = "inventory";
     let product = null;
-    try {
-      product = await storeProductOf(itemId, sku);
-    } catch (e) {
-      console.warn(`[photos] no store product for ${itemId}: ${e.message}`);
+    // a variant of a product with variants: its photos are its own (the variant's)
+    if (!inventoryOnly) {
+      try {
+        product = await storeProductOf(itemId, sku);
+      } catch (e) {
+        console.warn(`[photos] no store product for ${itemId}: ${e.message}`);
+      }
     }
     if (product && product.variants === 1) {
       const r = await uploadProductImages(product.productId, files);
@@ -326,11 +418,15 @@ module.exports = {
   cleanQuality,
   readCost,
   MAX_IMAGES,
+  MAX_REQUEST_IMAGES,
   acceptPhotos,
+  acceptManyPhotos,
   parsePriceLists,
   skuTaken,
+  baseSkuTaken,
   nextFreeSku,
   createZohoItem,
+  createZohoGroup,
   setItemCategory,
   setPriceLists,
   uploadItemPhotos,
