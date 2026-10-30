@@ -608,4 +608,205 @@ router.post("/tickets/:id/notes", GATE_NOTE, async function (req, res) {
   }
 });
 
+// ── Assigning a ticket to an employee (user 2026-10-30) ──────────────
+// RepairDesk keeps an assignee per device line (devices[].assigned_to =
+// an employee id) and has no assign call: the only way is the general
+// PUT /ticket/updateticket, which takes the ticket back — summary.id and
+// each line's id / name / device — and documents `assigned_to` for new
+// tickets only. So the update carries just those required fields and the
+// new assignee for the lines being changed, then the ticket is read again
+// and compared: the assignee has to be there and nothing else may have
+// moved (prices, totals, status, problems, parts, due date). Anything else
+// that changed is reported back and logged, never hidden.
+const ASSIGN_LOG = "imb_repair_assign_log";
+const EMPLOYEE_TTL_MS = 10 * 60 * 1000;
+let employeeCache = { at: 0, list: null };
+async function fetchEmployees(apiKey) {
+  if (employeeCache.list && Date.now() - employeeCache.at < EMPLOYEE_TTL_MS) return employeeCache.list;
+  const resp = await axios.get(
+    `${REPAIRDESK_API_BASE}/employees?api_key=${encodeURIComponent(apiKey)}`,
+    { timeout: 30000 },
+  );
+  // who they are only — /employees also answers each one's access PIN,
+  // which never leaves here
+  const list = ((resp.data && resp.data.data) || [])
+    .filter((e) => e && e.id && String(e.fullname || "").trim())
+    .map((e) => ({ id: String(e.id), name: String(e.fullname).trim(), role: String(e.role || ""), image: String(e.image || "") }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (list.length) employeeCache = { at: Date.now(), list };
+  return list;
+}
+
+const assigneeOf = (d) => ({
+  id: String((d && d.assigned_to && d.assigned_to.id) || ""),
+  name: String((d && d.assigned_to && d.assigned_to.fullname) || ""),
+});
+
+// What must stay the same when only the assignee changes — per line and
+// for the ticket's totals.
+function ticketFacts(t) {
+  const s = t.summary || {};
+  const facts = {
+    subtotal: String(s.subtotal), discount: String(s.discount), tax: String(s.total_tax), total: String(s.total),
+    lines: String((t.devices || []).map((d) => d.id).join(",")),
+  };
+  const many = (t.devices || []).length > 1;
+  for (const d of t.devices || []) {
+    // two lines can be the same model
+    const k = many ? `${deviceNameOf(d)} [${d.id}]` : deviceNameOf(d);
+    Object.assign(facts, {
+      [`${k}: service`]: String(d.name || ""),
+      [`${k}: model`]: String((d.device && d.device.id) || ""),
+      [`${k}: status`]: statusNameOf(d),
+      [`${k}: price`]: String(d.price),
+      [`${k}: GST`]: String(d.gst),
+      [`${k}: discount`]: String(d.line_discount),
+      [`${k}: line total`]: String(d.total),
+      [`${k}: quantity`]: String(d.quantity),
+      [`${k}: due date`]: String(d.due_on || ""),
+      [`${k}: IMEI`]: String(d.imei || ""),
+      [`${k}: serial`]: String(d.serial || ""),
+      [`${k}: tax class`]: String((d.taxclass && d.taxclass.id) || ""),
+      [`${k}: task type`]: String((d.task_type && d.task_type.id) || ""),
+      [`${k}: problems`]: (d.repairProdItems || []).map((p) => `${p.id}:${p.name}`).join(" | "),
+      [`${k}: parts`]: JSON.stringify(d.parts || []),
+    });
+  }
+  return facts;
+}
+function sideEffectsOf(before, after) {
+  const a = ticketFacts(before);
+  const b = ticketFacts(after);
+  return Object.keys({ ...a, ...b })
+    .filter((k) => a[k] !== b[k])
+    .map((k) => ({ field: k, from: a[k] === undefined ? "" : a[k], to: b[k] === undefined ? "" : b[k] }));
+}
+
+// ── GET /repair/employees ────────────────────────────────────────────
+// The people a ticket can be assigned to — [{ id, name, role, image }].
+router.get("/employees", GATE_STATUS, async function (req, res) {
+  try {
+    return res.json({ success: true, data: await fetchEmployees(getApiKey()) });
+  } catch (error) {
+    console.error("Repair /employees error:", error.message || error);
+    return res.status(error.status || 500).json({
+      success: false,
+      message: `Failed to fetch RepairDesk employees: ${error.message || error}`,
+    });
+  }
+});
+
+// ── POST /repair/tickets/:id/assign { employeeId, deviceIds? } ───────
+// Every device line of the ticket, or only `deviceIds`; lines already with
+// that employee are left alone. Same gate as status changes. Answers the
+// ticket re-read from RepairDesk in the list's shape, with `sideEffects`
+// ([{ field, from, to }]) when RepairDesk changed more than the assignee.
+router.post("/tickets/:id/assign", GATE_STATUS, async function (req, res) {
+  try {
+    const apiKey = getApiKey();
+    const id = String(req.params.id || "").trim();
+    const employeeId = String((req.body && req.body.employeeId) || "").trim();
+    const only = Array.isArray(req.body && req.body.deviceIds) ? req.body.deviceIds.map(String) : null;
+    if (!/^\d+$/.test(id)) return res.status(400).json({ success: false, message: "Bad ticket id" });
+    // only someone RepairDesk lists
+    const employee = (await fetchEmployees(apiKey)).find((e) => e.id === employeeId);
+    if (!employee) return res.status(400).json({ success: false, message: "Pick someone from RepairDesk's employee list" });
+    const ticket = await fetchTicket(apiKey, id);
+    if (!ticket) return res.status(404).json({ success: false, message: "Ticket not found" });
+    const devices = Array.isArray(ticket.devices) ? ticket.devices : [];
+    const picked = only ? devices.filter((d) => only.includes(String(d.id))) : devices;
+    if (only && picked.length !== only.length) {
+      return res.status(400).json({ success: false, message: "A device line isn't on this ticket" });
+    }
+    if (!picked.length) return res.status(400).json({ success: false, message: "This ticket has no device lines" });
+    const todo = picked.filter((d) => assigneeOf(d).id !== employee.id);
+    if (!todo.length) {
+      return res.json({ success: true, data: { unchanged: true, changed: [], sideEffects: [], noteAdded: false, ...listShapeOf(ticket) } });
+    }
+    const unready = todo.filter((d) => !d.name || !(d.device && d.device.id));
+    if (unready.length) {
+      return res.status(400).json({ success: false, message: `${deviceNameOf(unready[0])} has no service name or model in RepairDesk — assign it there` });
+    }
+
+    const customerId = ticket.summary.customer && (ticket.summary.customer.id || ticket.summary.customer.cid);
+    const payload = {
+      summary: { id: Number(ticket.summary.id), ...(customerId ? { customer_id: Number(customerId) } : {}) },
+      devices: todo.map((d) => ({ id: Number(d.id), name: d.name, device: Number(d.device.id), assigned_to: Number(employee.id) })),
+    };
+    const by = (req.user && req.user.username) || "unknown";
+    const lines = todo.map((d) => ({ id: String(d.id), name: deviceNameOf(d), from: assigneeOf(d).name }));
+    const log = async (extra) => {
+      try {
+        const db = await connectToDatabase();
+        await db.collection(ASSIGN_LOG).insertOne({
+          ticketId: id, ticketNumber: ticket.summary.order_id || "", employee: { id: employee.id, name: employee.name },
+          lines, payload, by, at: new Date(), ...extra,
+        });
+      } catch (e) {
+        console.warn("[Repair] assign log failed:", e.message || e);
+      }
+    };
+
+    let resp;
+    try {
+      resp = await axios.put(
+        `${REPAIRDESK_API_BASE}/ticket/updateticket?api_key=${encodeURIComponent(apiKey)}`,
+        payload,
+        { timeout: 30000 },
+      );
+    } catch (e) {
+      const message = e.response ? refusalOf(e.response.data) : e.message;
+      await log({ ok: false, message });
+      return res.status(502).json({ success: false, message: `RepairDesk refused: ${message}` });
+    }
+    if (!(resp.data && resp.data.success)) {
+      await log({ ok: false, message: refusalOf(resp.data) });
+      return res.status(502).json({ success: false, message: `RepairDesk refused: ${refusalOf(resp.data)}` });
+    }
+
+    // read back: the assignee taken, and nothing else moved
+    const fresh = await fetchTicket(apiKey, id).catch(() => null);
+    if (!fresh) {
+      await log({ ok: null, message: "could not read the ticket back" });
+      return res.status(502).json({ success: false, message: "RepairDesk took the change but the ticket couldn't be read back — check it in RepairDesk" });
+    }
+    const sideEffects = sideEffectsOf(ticket, fresh);
+    const after = new Map((fresh.devices || []).map((d) => [String(d.id), assigneeOf(d)]));
+    const changed = lines.filter((l) => (after.get(l.id) || {}).id === employee.id);
+    if (!changed.length) {
+      await log({ ok: false, message: "RepairDesk answered OK but kept the assignee", sideEffects });
+      return res.status(502).json({
+        success: false,
+        message: "RepairDesk answered OK but didn't take the assignment" +
+          (sideEffects.length ? ` — and it changed: ${sideEffects.map((s) => s.field).join(", ")}. Check the ticket in RepairDesk` : ""),
+      });
+    }
+
+    let noteAdded = false;
+    const note = changed.length === 1 && devices.length === 1
+      ? `Assigned to ${employee.name} (was ${changed[0].from || "no one"}) by ${by} (iMobile dashboard)`
+      : `Assigned to ${employee.name} by ${by} (iMobile dashboard): ` +
+        changed.map((c) => `${c.name} (was ${c.from || "no one"})`).join("; ");
+    try {
+      const n = await axios.post(
+        `${REPAIRDESK_API_BASE}/ticket/addnote?api_key=${encodeURIComponent(apiKey)}`,
+        { id: Number(id), type: 0, note, is_flag: 0 },
+        { timeout: 30000 },
+      );
+      noteAdded = !!(n.data && n.data.success);
+    } catch (e) {
+      console.warn(`[Repair] assign note on ticket ${id} failed:`, e.response ? refusalOf(e.response.data) : e.message);
+    }
+    const failed = lines.filter((l) => !changed.includes(l));
+    await log({ ok: true, changed, failed, sideEffects, noteAdded });
+    return res.json({ success: true, data: { changed, failed, sideEffects, noteAdded, ...listShapeOf(fresh) } });
+  } catch (error) {
+    console.error("Repair /tickets/:id/assign error:", error.message || error);
+    return res.status(error.status || 500).json({
+      success: false,
+      message: `Failed to assign the ticket: ${error.message || error}`,
+    });
+  }
+});
+
 module.exports = router;
