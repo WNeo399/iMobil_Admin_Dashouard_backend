@@ -16,6 +16,7 @@ var router = express.Router();
 const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
+const { hasPermission } = require("../../constants/roles");
 const { hashPassword } = require("../../utils/authToken");
 const {
   getViewData,
@@ -2282,6 +2283,32 @@ router.get("/dispatch/:id/po-lines", VIEW_ORDERS, async (req, res) => {
   } catch (e) {
     console.error("InFlow dispatch po-lines error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the purchase order lines" });
+  }
+});
+
+// One of those lines in full, for the popup on the dispatch dialog (user ask
+// 2026-11-02). An InFlow viewer may not have the Purchase Order page, so the
+// supplier, prices and history details only go to those who do.
+router.get("/dispatch/:id/po-lines/:orderNo", VIEW_ORDERS, async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    const orderNo = String(req.params.orderNo || "").trim();
+    if (!id || !orderNo) return res.status(400).json({ success: false, message: "invalid id" });
+    const canSeePrice = hasPermission(req.user.permissions, "spp:order:view");
+    const projection = {
+      _id: 0, orderNo: 1, status: 1, productName: 1, sku: 1, category: 1, forCustomer: 1, orderQty: 1, images: 1, history: 1,
+      note: 1, shortageNote: 1, cancelNote: 1, splitFrom: 1, splitTo: 1, completed: 1, createdAt: 1, createdBy: 1, orderedAt: 1, orderedBy: 1,
+      shippedQty: 1, shippedAt: 1, batchNo: 1, tracking: 1, receivedQty: 1, receivedAt: 1, receivedBy: 1,
+      ...(canSeePrice ? { supplier: 1, unitPrice: 1, quotedPrice: 1, lineTotal: 1 } : {}),
+    };
+    const db = await connectToDatabase();
+    const line = await db.collection("imb_spp_orders").findOne({ orderNo, "dispatchRef.recordId": id }, { projection });
+    if (!line) return res.status(404).json({ success: false, message: "Purchase order line not found" });
+    if (!canSeePrice) line.history = (line.history || []).map(({ at, by, action }) => ({ at, by, action }));
+    return res.json({ success: true, line: { ...line, canSeePrice } });
+  } catch (e) {
+    console.error("InFlow dispatch po-line error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load the purchase order line" });
   }
 });
 
