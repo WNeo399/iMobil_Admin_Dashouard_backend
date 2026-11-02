@@ -315,6 +315,32 @@ function coverage(model, index) {
   return out;
 }
 
+// A product with variants is one row on the page (user 2026-11-02): one of its
+// items stands for it, with the base SKU and the product's name — the row's
+// Edit lists the variants. Only variants made or added from this page are
+// known: the register doesn't record an item's group, so the ones made in Zoho
+// stay separate rows. `seen`: itemId → row.
+function oneRowPerProduct(created, seen) {
+  const groups = new Map();
+  for (const c of created) {
+    if (!c.groupId || !seen.has(String(c.itemId))) continue;
+    if (!groups.has(c.groupId)) groups.set(c.groupId, []);
+    groups.get(c.groupId).push(c);
+  }
+  const suffixed = (c) => str(c.sku).endsWith(`-${c.variant}`);
+  for (const entries of groups.values()) {
+    const plain = entries.find((c) => !suffixed(c));
+    // the item given variants from Edit has no entry of its own
+    const addedTo = entries.map((c) => String(c.addedTo || "")).find((id) => seen.has(id) && !entries.some((c) => String(c.itemId) === id));
+    const keep = plain ? String(plain.itemId) : addedTo || String(entries[0].itemId);
+    for (const c of entries) if (String(c.itemId) !== keep) seen.delete(String(c.itemId));
+    const row = seen.get(keep);
+    row.name = str(row.name).replace(/ \[[^\]]*\]$/, "");
+    const named = entries.find(suffixed);
+    if (named) row.sku = variantBaseSku(named.sku, named.variant);
+  }
+}
+
 // ── GET /new-products ────────────────────────────────────────────────
 // Every configured brand's models (the page's Brand › Series › Model tree),
 // or one brand with ?brand=. Each row: the items found per needed part
@@ -514,6 +540,8 @@ router.get("/models/:id/items", VIEW, async (req, res, next) => {
         part: part ? part.key : null, createdHere: true,
       });
     }
+    const withVariants = await db.collection(MODELS).find({ brand: model.brand, "created.groupId": { $exists: true } }, { projection: { created: 1 } }).toArray();
+    oneRowPerProduct(withVariants.flatMap((m) => m.created || []), seen);
     const items = [...seen.values()];
     const missing = cfg.parts.filter((p) => !items.some((i) => i.part === p.key)).map((p) => p.key);
     return res.json({ success: true, model: { ...model, _id: String(model._id) }, items, missing });
@@ -892,17 +920,24 @@ async function readGroup(groupId) {
   const r = await handleZohoInventoryRequest(`${ZOHO}/itemgroups/${encodeURIComponent(groupId)}?organization_id=${ORG}`);
   return (r && r.item_group) || null;
 }
-// → { groupId, productName, attribute ("" = a single product), baseSku, items: [{ itemId, sku, name, variant, status }] } or null
+// → { groupId, productName, attribute ("" = a single product), baseSku, items: [{ itemId, sku, name, variant, status, imageUrl }] } or null
 async function variantsOf(item) {
   if (!item || !item.group_id) return null;
   const g = await readGroup(String(item.group_id));
   if (!g) return null;
+  // the variant's own photo: without one, Zoho answers the product's first
+  // (read 2026-11-02 on 22598, 8597, VARTEST2) — that one is no variant image
+  const productDocs = new Set((g.documents || []).map((d) => String(d.document_id)));
+  const ownImage = (i) => {
+    const id = str(i.image_document_id);
+    return id && !productDocs.has(id) ? imageUrlFromId(id) : "";
+  };
   return {
     groupId: String(item.group_id),
     productName: g.group_name || item.name || "",
     attribute: str(g.attribute_name1),
     baseSku: variantBaseSku(item.sku, str(item.attribute_option_name1)),
-    items: (g.items || []).map((i) => ({ itemId: String(i.item_id), sku: i.sku || "", name: i.name || "", variant: str(i.attribute_option_name1), status: i.status || "" })),
+    items: (g.items || []).map((i) => ({ itemId: String(i.item_id), sku: i.sku || "", name: i.name || "", variant: str(i.attribute_option_name1), status: i.status || "", imageUrl: ownImage(i) })),
   };
 }
 
