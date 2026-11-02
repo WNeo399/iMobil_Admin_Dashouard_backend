@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Notification Widget — Embed Demo</title>
+    <!--
+      Mimics the website: a page and one script tag. Hand-written vanilla JS
+      (no build step) — edit public/widgets/notification/v1.js directly.
+
+        http://localhost:3000/widget-assets/notification/demo/index.html
+
+      Shows what the website shows now: the notifications inside their time
+      period. data-no-cache makes it forget what was seen, so a reload shows
+      them again.
+
+      ?bare=1 drops the explanation. ?preview=<JSON of one notification> shows
+      that one instead, with no request — the dashboard's Preview, which also
+      works for one that is not saved or not in its time period yet.
+    -->
+    <style>
+      body { margin: 0; background: #f3f4f6; font: 14px/1.5 system-ui, sans-serif; color: #1f2937; }
+      .site-head { display: flex; align-items: center; gap: 24px; height: 64px; padding: 0 32px; background: #fff; border-bottom: 1px solid #e5e7eb; font-weight: 700; font-size: 18px; }
+      .site-head span { height: 10px; width: 64px; border-radius: 5px; background: #e5e7eb; }
+      .site-head span:first-of-type { margin-left: auto; }
+      .hero { height: 240px; margin: 24px 32px; border-radius: 12px; background: linear-gradient(120deg, #dbe7f7, #eef2f8); }
+      .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin: 0 32px 32px; }
+      .cards div { height: 160px; border-radius: 12px; background: #fff; border: 1px solid #e5e7eb; }
+      .note { max-width: 720px; margin: 24px 32px 0; color: #6b7280; }
+      .note h1 { margin: 0 0 4px; font-size: 22px; color: #1f2937; }
+      body.bare .note { display: none; }
+      @media (max-width: 560px) { .site-head { padding: 0 16px; } .site-head span { display: none; } .hero { height: 150px; margin: 16px; } .cards { margin: 0 16px 16px; grid-template-columns: repeat(2, 1fr); } }
+    </style>
+  </head>
+  <body>
+    <header class="site-head">iMobile<span></span><span></span><span></span></header>
+    <div class="note">
+      <h1>Notification — Embed Demo</h1>
+      <p>The popup is loaded exactly as the website embeds it. Nothing pops up when no notification is inside its time period. Reload to see it again.</p>
+    </div>
+    <div class="hero"></div>
+    <div class="cards"><div></div><div></div><div></div><div></div></div>
+    <script>
+      if (/[?&]bare=1/.test(location.search)) document.body.className = 'bare';
+      try {
+        var preview = new URLSearchParams(location.search).get('preview');
+        if (preview) window.__imobileNotificationPreview = JSON.parse(preview);
+      } catch (e) { /* no preview */ }
+    </script>
+    <!-- Served by the backend itself, so the widget's default API base (the
+         server the script came from) is the right one here. -->
+    <script src="/widget-assets/notification/v1.js" data-no-cache="true" defer></script>
+  </body>
+</html>

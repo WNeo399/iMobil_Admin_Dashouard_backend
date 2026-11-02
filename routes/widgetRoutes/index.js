@@ -38,15 +38,17 @@ const svpEnquiryRouter = require("./svpEnquiry");
 const explodedDiagramRouter = require("./explodedDiagram");
 const bannerCarouselRouter = require("./bannerCarousel");
 const sparePartsRouter = require("./spareParts");
+const notificationRouter = require("./notification");
 
 // Read-only widget data (exploded-diagram browsing, the website banner
-// carousel, the spare parts browser). Mounted BEFORE the shared
+// carousel, the spare parts browser, the website popup). Mounted BEFORE the shared
 // submission limiter below — 10 requests/hour would break a picker that
 // fires a GET per click, or a banner on every page view; these
 // sub-routers carry their own gentler limits instead.
 router.use("/explodedDiagram", explodedDiagramRouter);
 router.use("/bannerCarousel", bannerCarouselRouter);
 router.use("/spareParts", sparePartsRouter);
+router.use("/notification", notificationRouter);
 
 // ── Rate limit ─────────────────────────────────────────────────────
 // 10 submissions per IP per hour. Generous enough for a real user

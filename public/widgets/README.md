@@ -9,9 +9,10 @@ public/widgets/
 ```
 
 Exceptions — hand-written vanilla JS, no build step, edited right here:
-`exploded-diagram/v1.js` and `banner-carousel/v1.js` (the iMobile website
+`exploded-diagram/v1.js`, `banner-carousel/v1.js` (the iMobile website
 banner carousel; banners are managed on the dashboard's iMobile Website →
-Banner page). Each has a `demo/` page.
+Banner page) and `notification/v1.js` (the website popup; iMobile Website →
+Notification). Each has a `demo/` page.
 
 The other bundles are produced by the `iMobile_Widget` repo, NOT edited by
 hand in this repo. The flow:

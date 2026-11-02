@@ -18,6 +18,7 @@
 //   GET    /website/spare-parts         what the Spare Parts widget shows
 //                                       (utils/sparePartsCatalog; listing:widget:view — iMobile Listing since 2026-10-16)
 //   /website/campaigns/…                 email campaigns via Zoho Campaigns (./campaigns.js)
+//   /website/notifications/…             the website popup (./notifications.js)
 //
 // web:banner:view reads, web:banner:manage writes (admin + iMobile Admin).
 //
@@ -34,6 +35,7 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { getCarouselSettings, saveCarouselSettings } = require("../../utils/webBannerSettings");
 const { getCatalog } = require("../../utils/sparePartsCatalog");
+const { cleanLink } = require("../../utils/webLink");
 
 const VIEW = requirePermission("web:banner:view");
 const MANAGE = requirePermission("web:banner:manage");
@@ -93,21 +95,6 @@ function str(v, cap) {
 function bool(v, dflt) {
   if (v === undefined || v === null || v === "") return dflt;
   return v === true || v === "true" || v === "1" || v === 1;
-}
-
-// The link lands in an <a href> on the storefront, so only web links and
-// site-relative paths pass — never javascript:/data: URLs.
-function cleanLink(v) {
-  const s = str(v, 1000);
-  if (!s) return "";
-  if (/^\/(?!\/)/.test(s)) return s;
-  try {
-    const u = new URL(s);
-    if (u.protocol === "https:" || u.protocol === "http:") return u.href;
-  } catch (e) { /* falls through */ }
-  const err = new Error("The link must start with https://, http:// or / (a page on the same site)");
-  err.status = 400;
-  throw err;
 }
 
 // Re-encode one upload for its device and store it; returns the image
@@ -357,6 +344,8 @@ router.get("/spare-parts", requirePermission("listing:widget:view"), async (req,
 });
 
 router.use("/campaigns", require("./campaigns"));
+// The popup on the website (2026-11-02)
+router.use("/notifications", require("./notifications"));
 // The online store's category tree, through Zoho Commerce (2026-10-16)
 router.use("/categories", require("./categories"));
 // The qualities each classification of part comes in (iMobile Listing → Qualities, 2026-10-16)
