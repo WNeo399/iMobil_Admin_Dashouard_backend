@@ -343,6 +343,8 @@ router.get("/:id", VIEW, async (req, res) => {
             color: d.color || "",
             storage: d.storage || "",
             grade: d.grade || "",
+            batteryHealth: d.batteryHealth == null ? null : d.batteryHealth,
+            batteryCycleCount: d.batteryCycleCount == null ? null : d.batteryCycleCount,
             // Always the supplier's price — never our landed cost.
             ...supplierFigure(d),
             supplier: d.supplier ? { id: d.supplier.id, name: d.supplier.name } : null,

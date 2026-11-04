@@ -11,8 +11,11 @@
 // edit and remove only theirs. Nothing here touches the stock register; a
 // row says whether it went into their Stock (`addedToStock` {at, by,
 // deviceId} — set by Stock's own add, or found there when the list loads).
+// Each record has a repair status (2026-11-04): 待处理 pending (also when it
+// has none yet) → 已分配 assigned (on a repair batch) → 已处理 done; the
+// batches, repairers and status changes are in ./precheckRepair.js.
 //
-//   GET    /refurbished/precheck           list (search, supplierId, added=yes|no, page)
+//   GET    /refurbished/precheck           list (search, supplierId, added=yes|no, status, page)
 //   POST   /refurbished/precheck           add { imei, device?, supplierId?, assign?, note? }
 //   PUT    /refurbished/precheck/:id       edit (same fields)
 //   DELETE /refurbished/precheck/:id       remove one
@@ -134,20 +137,27 @@ router.get("/", VIEW, async (req, res) => {
     if (search) {
       const re = new RegExp(escapeRegex(search.replace(/\s+/g, " ")), "i");
       const imeiRe = new RegExp(escapeRegex(cleanImei(search)), "i");
-      match.$or = [{ imei: imeiRe }, { device: re }, { note: re }, { assign: re }, { "supplier.name": re }];
+      match.$or = [{ imei: imeiRe }, { device: re }, { note: re }, { assign: re }, { "supplier.name": re }, { "repairer.name": re }, { "repairBatch.batchNo": re }];
     }
     const supplierId = str(req.query.supplierId, 40);
     if (supplierId && ObjectId.isValid(supplierId)) match["supplier.id"] = new ObjectId(supplierId);
     // added=yes / no: in Stock already, or still to go
     if (req.query.added === "yes") match.addedToStock = { $exists: true };
     if (req.query.added === "no") match.addedToStock = { $exists: false };
+    // the repair status; a record with none yet is waiting (待处理)
+    if (req.query.status === "pending") match.status = { $in: ["pending", null] };
+    if (req.query.status === "assigned" || req.query.status === "done") match.status = req.query.status;
     const pageSize = Math.min(500, Math.max(1, parseInt(req.query.pageSize, 10) || 50));
     const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const [total, rows] = await Promise.all([
+    const [total, rows, statuses] = await Promise.all([
       col.countDocuments(match),
       col.find(match).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      // how many of each status the source holds, for the filter
+      col.find({ stockSource: src }, { projection: { status: 1 } }).toArray(),
     ]);
-    return res.json({ success: true, total, page, pageSize, rows });
+    const counts = { all: statuses.length, pending: 0, assigned: 0, done: 0 };
+    for (const r of statuses) counts[r.status === "assigned" || r.status === "done" ? r.status : "pending"] += 1;
+    return res.json({ success: true, total, page, pageSize, rows, counts });
   } catch (e) {
     console.error("Pre-check list error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the list" });
@@ -165,7 +175,7 @@ router.post("/", MANAGE, async (req, res) => {
     const dup = await col.findOne({ stockSource: src, imei: doc.imei }, { projection: { _id: 1 } });
     if (dup) return res.status(400).json({ success: false, message: `${doc.imei} is on the list already` });
     const now = new Date();
-    const row = { ...doc, stockSource: src, createdAt: now, createdBy: actor(req), updatedAt: now, updatedBy: actor(req) };
+    const row = { ...doc, status: "pending", stockSource: src, createdAt: now, createdBy: actor(req), updatedAt: now, updatedBy: actor(req) };
     const r = await col.insertOne(row);
     // already in their Stock? marked at once
     await markFoundInStock(db, col, src);
