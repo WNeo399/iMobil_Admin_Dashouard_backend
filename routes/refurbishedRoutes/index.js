@@ -24,6 +24,8 @@ router.use("/customers", require("./customers"));
 router.use("/repairers", require("./repairers"));
 // A phone supplier's own upstream suppliers (scoped to their stock source).
 router.use("/suppliers", require("./suppliers"));
+// …and its usual price per Model + Storage + Grade, filled in when adding a device (2026-11-05).
+router.use("/default-prices", require("./defaultPrices"));
 router.use("/precheck", require("./precheck"));     // a phone supplier's devices before Blackbelt / Stock (2026-10-20)
 router.use("/precheck-repair", require("./precheckRepair")); // its repair batches + repairers (2026-11-04)
 // Supplier shipments to iMobile — creates the matching incoming record.

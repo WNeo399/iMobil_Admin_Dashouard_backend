@@ -151,6 +151,24 @@ router.get("/:id", VIEW, async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: "Sales order not found" });
     }
+    // Each line's CURRENT Blackbelt standing from the register (2026-11-05:
+    // shown on the order, and the reports printed from it). Read-only — the
+    // stored line snapshot is left alone.
+    const ids = (order.lines || []).map((l) => l.deviceId).filter((x) => x && ObjectId.isValid(String(x)));
+    if (ids.length) {
+      const devs = await db
+        .collection("refurb_devices")
+        .find({ _id: { $in: ids.map((x) => new ObjectId(String(x))) } })
+        .project({ blackbeltChecked: 1, blackbeltStatus: 1, blackbeltReportId: 1 })
+        .toArray();
+      const byId = new Map(devs.map((d) => [String(d._id), d]));
+      for (const l of order.lines) {
+        const d = byId.get(String(l.deviceId));
+        l.blackbelt = d
+          ? { checked: d.blackbeltChecked === true, status: d.blackbeltStatus || "", hasReport: !!d.blackbeltReportId }
+          : { checked: false, status: "", hasReport: false, missing: true };
+      }
+    }
     return res.json({ success: true, order });
   } catch (e) {
     console.error("Get refurb sales order error:", e);
