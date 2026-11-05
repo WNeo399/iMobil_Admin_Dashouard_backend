@@ -378,8 +378,12 @@ const SHOP_SCOPED_ROLES = [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP];
 // groups (TechElite, InFlow, Consignment) stay an account's ONLY role: the
 // shop / customer ones narrow the account to its own shops or customer, and
 // code checks them with `req.user.role === …`.
+// SQT Call Center combines too (user 2026-11-05: "allow a user to have both
+// SQT Call Center and Exyon roles"): it is the one TechElite role that is not
+// shop-scoped, and nothing checks it by name — only its sqt:callcenter:*
+// permissions, which simply add up with the other roles'.
 const COMBINABLE_ROLES = Object.values(ROLES).filter(
-  (r) => ROLE_GROUP_OF[r] === ROLE_GROUPS.IMOBILE || ROLE_GROUP_OF[r] === ROLE_GROUPS.EXYON,
+  (r) => ROLE_GROUP_OF[r] === ROLE_GROUPS.IMOBILE || ROLE_GROUP_OF[r] === ROLE_GROUPS.EXYON || r === ROLES.SQT_CALL_CENTER,
 );
 
 function isValidRole(role) {
@@ -397,7 +401,7 @@ function roleSetError(roles) {
   if (roles.length > 1) {
     const single = roles.filter((r) => !isCombinableRole(r));
     if (single.length) {
-      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile and Exyon can`;
+      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile and Exyon, and SQT Call Center, can`;
     }
   }
   return null;
