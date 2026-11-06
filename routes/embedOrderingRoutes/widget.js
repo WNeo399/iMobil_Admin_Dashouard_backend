@@ -13,6 +13,11 @@
 //   GET  /widget/embed-ordering/catalog                 brands → series → models        (signed in)
 //   GET  /widget/embed-ordering/parts?brand=&model=     one model's parts (| ?tools=1)  (signed in)
 //   GET  /widget/embed-ordering/search?q=&stock=in|out  matching models and parts      (signed in)
+//   GET  /widget/embed-ordering/diagram3d?brand=&model= a model's 3D view: parts + linked items (signed in)
+//   GET  /widget/embed-ordering/diagram3d/:id/model.glb the 3D file, gzipped           (signed in)
+//
+// The 3D diagrams are managed on the dashboard (Embed Ordering → 3D Diagrams,
+// ./diagrams3d.js); only Published ones are served here.
 //
 // The parts are shown to signed-in customers only (user, 2026-11-06: "need
 // login to see the products") — the catalogue routes refuse without a session.
@@ -39,6 +44,7 @@ const { ROLES } = require("../../constants/roles");
 const { str, address } = require("./common");
 const { createSession, findSession, deleteSession } = require("./session");
 const { ORDERS, ensureOrderIndexes, nextOrderNo, customerView } = require("./orderStore");
+const D3 = require("./diagram3dStore");
 
 const DISTRIBUTORS = "embed_ordering_distributors";
 const CUSTOMERS = "embed_ordering_customers";
@@ -77,8 +83,32 @@ async function distributors() {
   }
   return distCache;
 }
-// Tests reset the cache between cases.
-router._resetCache = () => { distCache = null; };
+// ── published 3D diagrams (Embed Ordering → 3D Diagrams), cached a minute ──
+let d3Cache = null; // { at, byModel: Map("brand|model" lower-case → diagram) }
+let d3Loading = null;
+async function diagrams3d() {
+  if (d3Cache && Date.now() - d3Cache.at < DIST_CACHE_MS) return d3Cache;
+  if (!d3Loading) {
+    d3Loading = (async () => {
+      const db = await connectToDatabase();
+      const rows = await db
+        .collection(D3.DIAGRAMS)
+        .find({ status: "published", "file.key": { $exists: true } }, { projection: { brand: 1, model: 1, title: 1, parts: 1, file: 1 } })
+        .toArray();
+      const byModel = new Map(rows.map((d) => [`${d.brand}|${d.model}`.toLowerCase(), d]));
+      d3Cache = { at: Date.now(), byModel };
+    })().finally(() => { d3Loading = null; });
+  }
+  try {
+    await d3Loading;
+  } catch (e) {
+    if (!d3Cache) throw e;
+  }
+  return d3Cache;
+}
+
+// Tests reset the caches between cases.
+router._resetCache = () => { distCache = null; d3Cache = null; };
 
 // The backend's own pages (the dashboard Preview iframe, the demo page) —
 // their requests carry this server's own origin, or none at all.
@@ -200,7 +230,7 @@ const cacheFor = (res, secs) => res.set("Cache-Control", `private, max-age=${sec
 
 router.get("/catalog", requireCustomer, async (req, res) => {
   try {
-    const cat = await getCatalog();
+    const [cat, d3] = await Promise.all([getCatalog(), diagrams3d()]);
     cacheFor(res, 120);
     return res.json({
       success: true,
@@ -210,6 +240,8 @@ router.get("/catalog", requireCustomer, async (req, res) => {
       parts: cat.counts.parts,
       tools: cat.counts.tools,
       brands: cat.brands,
+      // the models with a 3D view
+      diagrams: [...d3.byModel.values()].map((d) => ({ brand: d.brand, model: d.model })),
     });
   } catch (e) {
     return fail(res, e, "catalog");
@@ -231,6 +263,55 @@ router.get("/parts", requireCustomer, async (req, res) => {
     return res.json({ success: true, items });
   } catch (e) {
     return fail(res, e, "parts");
+  }
+});
+
+// ── a model's 3D view ──
+// The parts in the file, each with its linked items (in stock / out of
+// stock, as everywhere in the widget). Items gone from the store drop out.
+const itemIndex = new WeakMap(); // catalogue → Map(id → item)
+function itemsById(cat) {
+  if (!itemIndex.has(cat)) itemIndex.set(cat, new Map(cat.items.map((i) => [i.id, i])));
+  return itemIndex.get(cat);
+}
+
+router.get("/diagram3d", requireCustomer, async (req, res) => {
+  try {
+    const brand = text(req.query.brand, 60);
+    const model = text(req.query.model);
+    const [cat, d3] = await Promise.all([getCatalog(), diagrams3d()]);
+    const d = d3.byModel.get(`${brand}|${model}`.toLowerCase());
+    if (!d) return res.status(404).json({ success: false, reason: "none", message: "No 3D view for this model" });
+    const byId = itemsById(cat);
+    cacheFor(res, 120);
+    return res.json({
+      success: true,
+      diagram: {
+        id: String(d._id),
+        title: d.title || "",
+        v: d.file.version,
+        bytes: d.file.bytes,
+        parts: (d.parts || []).map((p) => ({
+          code: p.code,
+          label: p.label,
+          face: p.face || "",
+          items: (p.items || []).map((id) => byId.get(id)).filter(Boolean).map(orderItem),
+        })),
+      },
+    });
+  } catch (e) {
+    return fail(res, e, "3D diagram");
+  }
+});
+
+router.get("/diagram3d/:id/model.glb", requireCustomer, async (req, res) => {
+  try {
+    const d3 = await diagrams3d();
+    const d = [...d3.byModel.values()].find((x) => String(x._id) === req.params.id);
+    if (!d) return res.status(404).json({ success: false, message: "No 3D view for this model" });
+    return await D3.sendFile(req, res, d);
+  } catch (e) {
+    return fail(res, e, "3D file");
   }
 });
 

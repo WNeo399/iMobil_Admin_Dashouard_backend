@@ -21,7 +21,12 @@
  * The cart and sign-in are kept in this website's localStorage, per key.
  * Hand-written vanilla JS, no build step, in a Shadow DOM so the host page's
  * CSS can't leak in. Layout follows the CONTAINER's width.
- * Data: /widget/embed-ordering/catalog | /parts | /search | /login | /logout | /me | /orders
+ * Models with a published 3D diagram (dashboard: Embed Ordering → 3D Diagrams)
+ * open on the parts list as usual, with a switch to a "3D view" (user,
+ * 2026-11-06): turn and separate the model, click a part to see its
+ * items and add them to the cart. Its code (./viewer3d.js + three.js from
+ * ../vendor/) is loaded only then.
+ * Data: /widget/embed-ordering/catalog | /parts | /search | /diagram3d | /login | /logout | /me | /orders
  */
 (function () {
   "use strict";
@@ -197,6 +202,61 @@
     ".gate{max-width:400px;margin:20px auto;padding:22px 20px;border:1px solid var(--line);border-radius:14px;background:#fff}",
     ".gate h3{margin:0 0 4px;font-size:18px}",
     ".gate .lead{margin:0 0 14px;color:var(--muted);font-size:13px}",
+    // 3D view of a model (models with a published 3D diagram)
+    ".d3tag{display:inline-block;font-size:10px;font-weight:700;line-height:14px;color:var(--accent);border:1px solid currentColor;border-radius:4px;padding:0 4px;margin-left:6px;vertical-align:1px}",
+    ".chip[aria-pressed='true'] .d3tag{color:#fff}",
+    ".seg.modes button{display:inline-flex;align-items:center;gap:6px}",
+    ".seg.modes svg{width:15px;height:15px}",
+    ".d3{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:12px;align-items:start}",
+    ".d3main{min-width:0;display:flex;flex-direction:column;gap:8px}",
+    ".d3stage{position:relative;height:520px;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:radial-gradient(circle at 50% 40%,#fbfcfe,#e9eef4)}",
+    ".d3host{position:absolute;inset:0}",
+    ".d3over{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;text-align:center;padding:16px;color:var(--muted);background:rgba(248,250,252,.75)}",
+    ".d3over[hidden]{display:none}",
+    ".d3over .bar3{width:180px;height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:6px}",
+    ".d3over .bar3 i{display:block;height:100%;background:var(--accent);transition:width .2s}",
+    ".d3over button{margin-top:8px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 14px;cursor:pointer}",
+    ".d3tip{position:absolute;pointer-events:none;background:#111827;color:#fff;font-size:12px;padding:3px 8px;border-radius:6px;white-space:nowrap;transform:translate(-50%,calc(-100% - 12px));z-index:2}",
+    ".d3tip[hidden]{display:none}",
+    ".d3sel{position:absolute;left:10px;top:10px;max-width:calc(100% - 20px);background:rgba(255,255,255,.92);border:1px solid var(--line);border-radius:999px;padding:4px 6px 4px 12px;font-size:12px;display:flex;align-items:center;gap:6px;box-shadow:0 2px 8px rgba(0,0,0,.06)}",
+    ".d3sel[hidden]{display:none}",
+    ".d3sel b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+    ".d3sel button{border:0;background:var(--soft);border-radius:999px;width:22px;height:22px;cursor:pointer;line-height:1;flex:none}",
+    ".d3hint{position:absolute;right:10px;bottom:8px;font-size:11px;color:var(--muted);pointer-events:none}",
+    ".d3ctl{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+    ".d3ctl label{font-size:12px;color:var(--muted);font-weight:600}",
+    ".d3ctl input[type=range]{flex:1 1 140px;min-width:120px;accent-color:var(--accent)}",
+    ".d3ctl button{height:30px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:0 10px;cursor:pointer;font-size:12px}",
+    ".d3ctl button:hover{border-color:var(--accent)}",
+    ".d3note{font-size:11px;color:var(--muted)}",
+    ".d3side{border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;max-height:600px;overflow:hidden;background:#fff}",
+    ".d3side .sh{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:2px}",
+    ".d3side .sh .t{font-weight:700;font-size:15px;display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}",
+    ".d3side .sh .code{font-size:11px;font-weight:600;color:var(--muted)}",
+    ".d3side .sb{overflow:auto;padding:6px;flex:1}",
+    ".d3list button{width:100%;display:flex;align-items:center;gap:8px;border:0;background:none;padding:7px 8px;border-radius:8px;text-align:left;cursor:pointer}",
+    ".d3list button:hover{background:var(--soft)}",
+    ".d3list .no{font-size:11px;color:var(--muted);width:22px;flex:none}",
+    ".d3list .pl{flex:1;min-width:0;display:flex;flex-direction:column}",
+    ".d3list .pl small{font-size:11px;color:var(--muted)}",
+    ".d3list .pc{font-size:11px;font-weight:700;border-radius:999px;padding:1px 8px;background:var(--soft);color:var(--muted);flex:none}",
+    ".d3list .pc.has{background:#dbeafe;color:#1d4ed8}",
+    ".d3list button.none .pl{opacity:.6}",
+    ".d3items{display:flex;flex-direction:column;gap:6px}",
+    ".d3items .card{flex-direction:row;border-radius:10px}",
+    ".d3items .pic{width:76px;flex:none;aspect-ratio:auto;min-height:76px}",
+    ".d3items .info{padding:8px 10px;gap:4px;min-width:0}",
+    ".d3items .add,.d3items .step{height:30px}",
+    ".d3items .step button{width:30px}",
+    ".d3empty{padding:18px 10px;text-align:center;color:var(--muted);font-size:13px}",
+    ".root.narrow3d .d3{grid-template-columns:minmax(0,1fr)}",
+    ".root.narrow3d .d3stage{height:380px}",
+    ".root.narrow3d .d3side{max-height:none}",
+    ".root.narrow3d .d3side .sb{overflow:visible}",
+    ".root.narrow3d .d3hint{display:none}",
+    ".d3sel .go{display:none;width:auto;padding:0 8px;font-size:12px;color:var(--accent);background:none}",
+    ".root.narrow3d .d3sel .go{display:block}",
+    ".root.sm .d3stage{height:320px}",
     "@media (prefers-reduced-motion:reduce){.spin{animation:none}.panel{transition:none}}",
   ].join("\n");
 
@@ -204,6 +264,29 @@
   var ICON_BOX = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3 7.5L12 3l9 4.5v9L12 21l-9-4.5z"/><path d="M3 7.5l9 4.5 9-4.5M12 12v9"/></svg>';
   var ICON_CART = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/><path d="M2.5 3.5h2.6l2.3 11.2a1.5 1.5 0 0 0 1.5 1.2h8.7a1.5 1.5 0 0 0 1.5-1.1L21 8H6"/></svg>';
   var ICON_USER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg>';
+  var ICON_LIST = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>';
+  var ICON_CUBE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.5l8.5 4.75v9.5L12 21.5l-8.5-4.75v-9.5z"/><path d="M3.5 7.25L12 12l8.5-4.75M12 12v9.5"/></svg>';
+
+  // The 3D view's code (an ES module + three.js) loads only when a 3D view is
+  // opened. Bump the ?v= when viewer3d.js changes — browsers cache it.
+  var VIEWER_FILE = "viewer3d.js?v=2";
+  function viewerUrl() {
+    try {
+      return new URL(VIEWER_FILE, SCRIPT && SCRIPT.src ? SCRIPT.src : location.href).href;
+    } catch (e) {
+      return VIEWER_FILE;
+    }
+  }
+  var viewerModule = null;
+  function loadViewer() {
+    if (!viewerModule) {
+      viewerModule = import(viewerUrl()).catch(function (e) {
+        viewerModule = null;
+        throw e;
+      });
+    }
+    return viewerModule;
+  }
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
@@ -320,6 +403,15 @@
     var distName = ""; // the distributor, named on the sign-in screen
     var gateMsg = "";
     var gateBusy = false;
+    // 3D view: which models have one (from the catalogue), each model's
+    // diagram (parts + linked items), the downloaded files, the open view
+    var diagrams = {}; // "brand|model" lower-case → true
+    var d3Info = {}; // "brand|model" → diagram from /diagram3d
+    var glbCache = []; // [{ k: id:v, buf }] newest last, 3 kept
+    var v3 = null; // { ck, el, viewer, d, selected, status: loading|ready|error, msg, progress, hover }
+    // Parts list first; "3D view" is a switch (user, 2026-11-06). The choice
+    // holds while browsing this visit, not the next one.
+    var viewMode = "list";
 
     function headers(json) {
       var h = { "X-Distributor-Key": key };
@@ -436,9 +528,11 @@
 
     // ── rendering ──
     function message(html, retry) {
+      drop3d();
       body.innerHTML = '<div class="msg">' + html + (retry ? '<br><button type="button" data-act="retry">Try again</button>' : "") + "</div>";
     }
     function loading() {
+      drop3d();
       body.innerHTML = '<div class="msg"><div class="spin"></div>Loading…</div>';
     }
 
@@ -489,7 +583,7 @@
       if (!list.length) return '<div class="msg">No model matches “' + esc(view.filter) + "”.</div>";
       return list.map(function (m) {
         return '<button type="button" class="model" data-act="open-model" data-model="' + esc(m.name) + '"><div class="n">' +
-          esc(m.name) + '</div><div class="c">' + plural(m.parts, "part") + "</div></button>";
+          esc(m.name) + d3Tag(view.brand.name, m.name) + '</div><div class="c">' + plural(m.parts, "part") + "</div></button>";
       }).join("");
     }
 
@@ -537,12 +631,249 @@
       return list;
     }
 
+    // ── 3D view ──
+    function hasDiagram(brand, model) {
+      return !!diagrams[(brand + "|" + model).toLowerCase()];
+    }
+    function d3Tag(brand, model) {
+      return hasDiagram(brand, model) ? '<span class="d3tag" title="3D view">3D</span>' : "";
+    }
+    function is3d() {
+      return view.kind === "model" && viewMode === "3d" && hasDiagram(view.brand.name, view.model.name);
+    }
+    // Parts list | 3D view, on models that have a 3D diagram
+    function modeSeg() {
+      if (view.kind !== "model" || !hasDiagram(view.brand.name, view.model.name)) return "";
+      var b = function (m, icon, label) {
+        return '<button type="button" data-act="view-mode" data-mode="' + m + '" aria-pressed="' + (viewMode === m) + '">' + icon + label + "</button>";
+      };
+      return '<div class="seg modes" role="group" aria-label="View">' + b("list", ICON_LIST, "Parts list") + b("3d", ICON_CUBE, "3D view") + "</div>";
+    }
+    function drop3d() {
+      if (!v3) return;
+      if (v3.viewer) {
+        try { v3.viewer.dispose(); } catch (e) { /* already gone */ }
+      }
+      v3 = null;
+    }
+    function d3Part(code) {
+      var ps = (v3 && v3.d && v3.d.parts) || [];
+      for (var i = 0; i < ps.length; i++) if (ps[i].code === code) return ps[i];
+      return null;
+    }
+    function render3d() {
+      var ck = view.brand.name + "|" + view.model.name;
+      if (v3 && v3.ck === ck && v3.el && body.contains(v3.el)) return paint3d();
+      drop3d();
+      body.innerHTML = modeSeg() +
+        '<div class="d3"><div class="d3main">' +
+        '<div class="d3stage"><div class="d3host"></div>' +
+        '<div class="d3sel" hidden><b></b><button type="button" class="go" data-act="d3-go">See parts ↓</button><button type="button" data-act="d3-all" aria-label="Show all parts">&times;</button></div>' +
+        '<div class="d3tip" hidden></div><div class="d3over"></div>' +
+        '<div class="d3hint">Drag to turn · scroll to zoom · click a part</div></div>' +
+        '<div class="d3ctl"><label for="d3-sep">Separate</label>' +
+        '<input id="d3-sep" class="d3range" type="range" min="0" max="100" step="1" value="80" aria-label="Separate the parts">' +
+        '<button type="button" data-act="d3-exp" data-t="0">Assembled</button>' +
+        '<button type="button" data-act="d3-exp" data-t="1">Exploded</button>' +
+        '<button type="button" data-act="d3-reset">Reset view</button></div>' +
+        '<div class="d3note">Illustrative 3D model — shapes and positions are approximate, not a repair guide.</div>' +
+        '</div><aside class="d3side" aria-label="Parts in the 3D view"></aside></div>';
+      v3 = { ck: ck, el: body.querySelector(".d3"), viewer: null, d: d3Info[ck] || null, selected: "", status: "loading", msg: "", progress: 0 };
+      paint3d();
+      load3d(v3, view.brand.name, view.model.name);
+    }
+    function paint3d() {
+      paint3dOver();
+      paint3dSide();
+    }
+    function paint3dOver() {
+      if (!v3) return;
+      var over = v3.el.querySelector(".d3over");
+      if (v3.status === "ready") {
+        over.hidden = true;
+        over.innerHTML = "";
+      } else if (v3.status === "error") {
+        over.hidden = false;
+        over.innerHTML = "<div>" + esc(v3.msg) + "</div>" + (v3.retry ? '<button type="button" data-act="d3-retry">Try again</button>' : "");
+      } else {
+        over.hidden = false;
+        var pct = Math.round(v3.progress * 100);
+        over.innerHTML = '<div class="spin"></div><div>Loading the 3D model…</div>' +
+          '<div class="bar3" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '"><i style="width:' + pct + '%"></i></div>';
+      }
+      var sel = v3.el.querySelector(".d3sel");
+      var p = v3.selected ? d3Part(v3.selected) : null;
+      sel.hidden = !p;
+      if (p) sel.querySelector("b").textContent = p.label + " · " + plural(p.items.length, "part");
+    }
+    function paint3dSide() {
+      if (!v3) return;
+      var side = v3.el.querySelector(".d3side");
+      var d = v3.d;
+      if (!d) {
+        side.innerHTML = '<div class="d3empty">Loading the parts…</div>';
+        return;
+      }
+      var p = v3.selected ? d3Part(v3.selected) : null;
+      if (p) {
+        remember(p.items);
+        var nIn = p.items.filter(function (x) { return x.inStock; }).length;
+        side.innerHTML = '<div class="sh"><button type="button" class="link" data-act="d3-all" style="align-self:flex-start;font-size:12px">← All parts</button>' +
+          '<div class="t">' + esc(p.label) + '<span class="code">' + esc(p.code) + "</span></div>" +
+          '<div class="sum">' + (p.items.length ? plural(p.items.length, "part") + " · " + nIn + " in stock" : "") + "</div></div>" +
+          '<div class="sb">' + (p.items.length
+            ? '<div class="d3items">' + p.items.map(card).join("") + "</div>"
+            : '<div class="d3empty">We don’t list a part for the ' + esc(p.label.toLowerCase()) + " yet.</div>") + "</div>";
+        return;
+      }
+      var linked = d.parts.filter(function (x) { return x.items.length; }).length;
+      side.innerHTML = '<div class="sh"><div class="t">Parts in this model</div><div class="sum">' + plural(d.parts.length, "part") +
+        " · " + linked + " with parts to order</div></div>" +
+        '<div class="sb d3list">' + d.parts.map(function (x, i) {
+          return '<button type="button" data-act="d3-part" data-code="' + esc(x.code) + '"' + (x.items.length ? "" : ' class="none"') + ">" +
+            '<span class="no">' + (i < 9 ? "0" : "") + (i + 1) + "</span>" +
+            '<span class="pl">' + esc(x.label) + "<small>" + esc(x.code) + "</small></span>" +
+            '<span class="pc' + (x.items.length ? " has" : "") + '">' + (x.items.length || "–") + "</span></button>";
+        }).join("") + "</div>";
+    }
+    function select3d(code) {
+      if (!v3) return;
+      v3.selected = code && d3Part(code) ? code : "";
+      if (v3.viewer) v3.viewer.select(v3.selected);
+      paint3d();
+      var sb = v3.el.querySelector(".d3side .sb");
+      if (sb) sb.scrollTop = 0;
+    }
+    // the file, downloaded once per visit (3 kept); progress from the real size
+    function fetchGlb(d, s) {
+      var k = d.id + ":" + d.v;
+      for (var i = 0; i < glbCache.length; i++) if (glbCache[i].k === k) return Promise.resolve(glbCache[i].buf);
+      return fetch(apiBase + "/widget/embed-ordering/diagram3d/" + encodeURIComponent(d.id) + "/model.glb?v=" + encodeURIComponent(d.v), {
+        credentials: "omit",
+        headers: headers(false),
+      }).then(function (r) {
+        if (!r.ok) {
+          var e = new Error("HTTP " + r.status);
+          e.status = r.status;
+          throw e;
+        }
+        if (!r.body || !r.body.getReader || !d.bytes) return r.arrayBuffer();
+        var reader = r.body.getReader();
+        var chunks = [];
+        var got = 0;
+        var last = 0;
+        return (function pump() {
+          return reader.read().then(function (x) {
+            if (x.done) {
+              var out = new Uint8Array(got);
+              var at = 0;
+              chunks.forEach(function (c) { out.set(c, at); at += c.length; });
+              return out.buffer;
+            }
+            chunks.push(x.value);
+            got += x.value.length;
+            if (v3 === s && Date.now() - last > 120) {
+              last = Date.now();
+              s.progress = Math.min(1, got / d.bytes);
+              paint3dOver();
+            }
+            return pump();
+          });
+        })();
+      }).then(function (buf) {
+        glbCache.push({ k: k, buf: buf });
+        if (glbCache.length > 3) glbCache.shift();
+        return buf;
+      });
+    }
+    function load3d(s, brandName, modelName) {
+      var gone = function () { return v3 !== s; };
+      var info = s.d ? Promise.resolve(s.d) : api("/widget/embed-ordering/diagram3d?brand=" + encodeURIComponent(brandName) + "&model=" + encodeURIComponent(modelName))
+        .then(function (j) { d3Info[s.ck] = j.diagram; return j.diagram; });
+      info
+        .then(function (d) {
+          if (gone()) return null;
+          s.d = d;
+          d.parts.forEach(function (p) { remember(p.items); });
+          paint3dSide();
+          return Promise.all([loadViewer(), fetchGlb(d, s)]);
+        })
+        .then(function (r) {
+          if (!r || gone()) return null;
+          var mod = r[0];
+          if (mod.webglAvailable && !mod.webglAvailable()) {
+            var e = new Error("webgl");
+            e.webgl = true;
+            throw e;
+          }
+          var host = s.el.querySelector(".d3host");
+          var tip = s.el.querySelector(".d3tip");
+          var range = s.el.querySelector(".d3range");
+          s.viewer = mod.createViewer(host, {
+            accent: getComputedStyle(root).getPropertyValue("--accent").trim() || "#0b7fd4",
+            label: view.model.name + " in 3D — drag to turn, scroll or pinch to zoom, click a part",
+            onSelect: function (code) {
+              if (gone()) return;
+              s.selected = code;
+              paint3d();
+            },
+            onHover: function (p, at) {
+              if (gone()) return;
+              if (!p || !at) { tip.hidden = true; return; }
+              var rect = s.el.querySelector(".d3stage").getBoundingClientRect();
+              var part = d3Part(p.code);
+              tip.textContent = p.label + (part ? " · " + plural(part.items.length, "part") : "");
+              tip.style.left = (at.x - rect.left) + "px";
+              tip.style.top = (at.y - rect.top) + "px";
+              tip.hidden = false;
+            },
+            onExploded: function (t) {
+              if (!gone() && range) range.value = String(Math.round(t * 100));
+            },
+          });
+          var faces = {};
+          s.d.parts.forEach(function (p) { if (p.face) faces[p.code] = { face: p.face }; });
+          s.viewer.setPartOptions(faces);
+          return s.viewer.load(r[1]);
+        })
+        .then(function (res) {
+          if (!res || gone()) return;
+          s.status = "ready";
+          if (s.selected) s.viewer.select(s.selected);
+          paint3dOver();
+        })
+        .catch(function (e) {
+          if (e && e.status === 401) return expired();
+          if (gone()) return;
+          s.status = "error";
+          s.retry = !(e && (e.webgl || e.status === 404));
+          s.msg = e && e.webgl
+            ? "This browser can’t show 3D. Use the parts list instead."
+            : e && e.status === 404 ? "There’s no 3D view for this model right now." : "The 3D view couldn’t be loaded.";
+          if (e && !e.status && !e.webgl && /webgl/i.test(String(e.message))) {
+            s.msg = "This browser can’t show 3D. Use the parts list instead.";
+            s.retry = false;
+          }
+          if (s.viewer) {
+            try { s.viewer.dispose(); } catch (x) { /* ignore */ }
+            s.viewer = null;
+          }
+          paint3dOver();
+        });
+    }
+
     function renderParts() {
+      if (is3d()) return render3d();
+      drop3d();
       var all = view.items || [];
-      if (!all.length) return message("No parts listed for this model yet.");
+      var seg = modeSeg();
+      if (!all.length) {
+        body.innerHTML = seg + '<div class="msg">No parts listed for this model yet.</div>';
+        return;
+      }
       var nIn = all.filter(function (p) { return p.inStock; }).length;
       var items = byStock(all);
-      var html = stockSeg({ all: all.length, "in": nIn, out: all.length - nIn });
+      var html = seg + stockSeg({ all: all.length, "in": nIn, out: all.length - nIn });
       if (!items.length) {
         body.innerHTML = html + '<div class="msg">No ' + (stockFilter === "in" ? "in-stock" : "out-of-stock") + " parts here. " +
           '<button type="button" data-act="pick-stock" data-stock="all">Show all</button></div>';
@@ -592,7 +923,7 @@
         html += '<div class="section">Models</div><div class="chips">';
         r.models.forEach(function (m) {
           html += '<button type="button" class="chip" data-act="search-model" data-brand="' + esc(m.brand) + '" data-model="' + esc(m.name) + '">' +
-            esc(m.name) + '<span class="k">' + m.parts + "</span></button>";
+            esc(m.name) + d3Tag(m.brand, m.name) + '<span class="k">' + m.parts + "</span></button>";
         });
         html += "</div>";
       }
@@ -608,9 +939,11 @@
     function render() {
       renderCrumbs();
       if (!catalog) return;
+      if (!is3d()) drop3d();
       if (view.kind === "brands") renderBrands();
       else if (view.kind === "brand") renderBrand();
       else if (view.kind === "search") renderSearch();
+      else if (is3d()) render3d(); // the 3D view doesn't wait for the parts list
       else if (view.items) renderParts();
       else loading();
     }
@@ -745,9 +1078,12 @@
     function showGate(msg) {
       closePanel();
       ++seq; // drop answers still on their way
+      drop3d();
       catalog = null;
       partsCache = {};
       searchCache = {};
+      d3Info = {};
+      diagrams = {};
       known = {};
       view = { kind: "brands" };
       input.value = "";
@@ -908,7 +1244,8 @@
         })
         .catch(function (e) {
           if (e && e.status === 401) return expired();
-          if (mine === seq) message("Couldn’t load the parts for this model.", true);
+          // the 3D view carries on without the list
+          if (mine === seq && !is3d()) message("Couldn’t load the parts for this model.", true);
         });
     }
     function openTools() {
@@ -977,6 +1314,22 @@
       }
       else if (act === "pick-sub") { view.sub = el.getAttribute("data-sub"); view.shown = PAGE; render(); }
       else if (act === "more") { view.shown = (view.shown || PAGE) + PAGE; render(); }
+      // 3D view
+      else if (act === "view-mode") {
+        viewMode = el.getAttribute("data-mode") === "3d" ? "3d" : "list";
+        render();
+      }
+      else if (act === "d3-part") select3d(el.getAttribute("data-code"));
+      else if (act === "d3-all") select3d("");
+      else if (act === "d3-exp") {
+        var t3 = Number(el.getAttribute("data-t")) || 0;
+        if (v3 && v3.viewer) v3.viewer.setExploded(t3);
+        var rg = body.querySelector(".d3range");
+        if (rg) rg.value = String(Math.round(t3 * 100));
+      }
+      else if (act === "d3-reset") { if (v3 && v3.viewer) v3.viewer.reset(); }
+      else if (act === "d3-go") { var sd = body.querySelector(".d3side"); if (sd) sd.scrollIntoView({ behavior: "smooth", block: "start" }); }
+      else if (act === "d3-retry") { drop3d(); render(); }
       else if (act === "retry") {
         if (!catalog) start();
         else if (view.kind === "model") openModel(view.brand, view.model.name);
@@ -1024,6 +1377,10 @@
     shadow.addEventListener("input", function (e) {
       var t = e.target;
       if (!t || !t.getAttribute) return;
+      if (t.classList && t.classList.contains("d3range")) {
+        if (v3 && v3.viewer) v3.viewer.setExploded(Number(t.value) / 100);
+        return;
+      }
       if (t.getAttribute("data-f")) { draft[t.getAttribute("data-f")] = t.value; return; }
       if (t.getAttribute("data-a")) {
         var a = addr();
@@ -1077,6 +1434,8 @@
 
     var sizeClass = function () {
       root.classList.toggle("sm", mount.clientWidth > 0 && mount.clientWidth < 560);
+      // the 3D view puts its parts list under the model below this width
+      root.classList.toggle("narrow3d", mount.clientWidth > 0 && mount.clientWidth < 820);
     };
     if (window.ResizeObserver) new ResizeObserver(sizeClass).observe(mount);
     else window.addEventListener("resize", sizeClass);
@@ -1093,6 +1452,8 @@
         .then(function (j) {
           if (mine !== seq) return;
           catalog = j;
+          diagrams = {};
+          (j.diagrams || []).forEach(function (d) { diagrams[(d.brand + "|" + d.model).toLowerCase()] = true; });
           var next = afterSignIn;
           afterSignIn = "";
           if (next) setTimeout(function () { openPanel(next); }, 0);

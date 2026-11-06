@@ -14,6 +14,30 @@ banner carousel; banners are managed on the dashboard's iMobile Website →
 Banner page) and `notification/v1.js` (the website popup; iMobile Website →
 Notification). Each has a `demo/` page.
 
+`embed-ordering/v1.js` (the ordering widget) and `embed-ordering/viewer3d.js`
+(its 3D view — an ES module, also used by the dashboard's Embed Ordering →
+3D Diagrams page) are hand-written too. When `viewer3d.js` changes, bump the
+`?v=` in `VIEWER_FILE` in both `v1.js` and the dashboard's
+`src/views/embedOrdering/diagrams3d.vue` — browsers cache it.
+
+`vendor/three-0.180.0.js` is a pre-built, trimmed three.js for the 3D viewer
+(MIT). It is served gzipped (`.js.gz` beside it, picked by app.js) and cached
+for a year, so a new build gets a new file name. To rebuild:
+
+```sh
+npm install three@0.180.0 esbuild      # in an empty folder, not here
+# entry.js — only what viewer3d.js imports:
+#   export { WebGLRenderer, Scene, PerspectiveCamera, HemisphereLight, DirectionalLight,
+#     PMREMGenerator, Box3, Sphere, Vector2, Vector3, Matrix4, Raycaster, MathUtils,
+#     Color, Mesh, ACESFilmicToneMapping, REVISION } from "three";
+#   export { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+#   export { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+#   export { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+#   export { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+npx esbuild entry.js --bundle --format=esm --minify --target=es2020 --legal-comments=inline --outfile=three-0.180.0.js
+gzip -9 -k three-0.180.0.js
+```
+
 The other bundles are produced by the `iMobile_Widget` repo, NOT edited by
 hand in this repo. The flow:
 

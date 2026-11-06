@@ -11,6 +11,7 @@
 //   /embed-ordering/customers      each distributor’s own customers
 //   /embed-ordering/orders         orders placed through the Embed Ordering widget
 //   /embed-ordering/widget-summary what the ordering widget holds (Ordering Widget page)
+//   /embed-ordering/diagrams-3d    3D exploded models per phone model, parts linked to items
 //
 // The widget's PUBLIC endpoints (catalogue, sign-in, cart orders) live in
 // ./widget.js and are mounted at /widget/embed-ordering by routes/widgetRoutes — outside
@@ -26,5 +27,6 @@ router.use("/distributors", require("./distributors"));
 router.use("/customers", require("./customers"));
 router.use("/orders", require("./orders"));
 router.use("/widget-summary", require("./widgetSummary"));
+router.use("/diagrams-3d", require("./diagrams3d"));
 
 module.exports = router;

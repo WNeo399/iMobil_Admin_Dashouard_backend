@@ -165,6 +165,30 @@ app.use('/svp', svpPublicRouter);
 // on-disk one because /widgets/ would collide with the API
 // router above. Cached briefly so customers see updates promptly;
 // once we move hosting to Cloudflare, this whole mount goes away.
+//
+// Pre-compressed files first: where "<name>.js.gz" sits next to "<name>.js"
+// (the 3D viewer's three.js bundle, public/widgets/vendor/) a browser that
+// takes gzip gets the .gz (583 KB → 151 KB). vendor/ files carry their
+// version in the name, so they are cached for a year.
+var WIDGETS_DIR = path.join(__dirname, 'public', 'widgets');
+app.use('/widget-assets', function (req, res, next) {
+  if ((req.method !== 'GET' && req.method !== 'HEAD') || !/\.js$/.test(req.path) || !req.acceptsEncodings('gzip')) return next();
+  var file = path.join(WIDGETS_DIR, req.path);
+  if (file.indexOf(WIDGETS_DIR + path.sep) !== 0) return next();
+  require('fs').stat(file + '.gz', function (err, st) {
+    if (err || !st.isFile()) return next();
+    var vendor = req.path.indexOf('/vendor/') === 0;
+    res.set({
+      'Content-Type': 'application/javascript; charset=UTF-8',
+      'Content-Encoding': 'gzip',
+      Vary: 'Accept-Encoding',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.sendFile(file + '.gz', { maxAge: vendor ? '365d' : '5m', immutable: vendor }, function (e) {
+      if (e && !res.headersSent) next();
+    });
+  });
+});
 app.use(
   '/widget-assets',
   express.static(path.join(__dirname, 'public', 'widgets'), {
