@@ -9,9 +9,13 @@
 // 2026-11-06): sign-in by email alone, no prices, orders stay in the
 // dashboard (Embed Ordering → Orders).
 //
-//   GET  /widget/embed-ordering/catalog                 brands → series → models
-//   GET  /widget/embed-ordering/parts?brand=&model=     one model's parts (| ?tools=1)
-//   GET  /widget/embed-ordering/search?q=&stock=in|out  matching models and parts (stock: only in / out of stock)
+//   GET  /widget/embed-ordering/info                    the distributor's name (for the sign-in screen)
+//   GET  /widget/embed-ordering/catalog                 brands → series → models        (signed in)
+//   GET  /widget/embed-ordering/parts?brand=&model=     one model's parts (| ?tools=1)  (signed in)
+//   GET  /widget/embed-ordering/search?q=&stock=in|out  matching models and parts      (signed in)
+//
+// The parts are shown to signed-in customers only (user, 2026-11-06: "need
+// login to see the products") — the catalogue routes refuse without a session.
 //   POST /widget/embed-ordering/login   {email}         → { token, customer }   (DEMO: no code)
 //   POST /widget/embed-ordering/logout
 //   GET  /widget/embed-ordering/me                      the signed-in customer
@@ -184,12 +188,17 @@ const meView = (c) => ({
   address: c.address || null,
 });
 
-// ── catalogue ─────────────────────────────────────────────────────────
+// ── who the widget belongs to (public: the sign-in screen names them) ──
+router.get("/info", (req, res) => {
+  return res.json({ success: true, distributor: req.eo.dist.name || "" });
+});
+
+// ── catalogue (signed-in customers only) ──────────────────────────────
 // Same data as the Listing Widget's feed; each part also says whether it is
 // in stock. Cached briefly by the browser (stock is synced hourly anyway).
 const cacheFor = (res, secs) => res.set("Cache-Control", `private, max-age=${secs}`);
 
-router.get("/catalog", async (req, res) => {
+router.get("/catalog", requireCustomer, async (req, res) => {
   try {
     const cat = await getCatalog();
     cacheFor(res, 120);
@@ -207,7 +216,7 @@ router.get("/catalog", async (req, res) => {
   }
 });
 
-router.get("/parts", async (req, res) => {
+router.get("/parts", requireCustomer, async (req, res) => {
   try {
     const cat = await getCatalog();
     let items;
@@ -225,7 +234,7 @@ router.get("/parts", async (req, res) => {
   }
 });
 
-router.get("/search", async (req, res) => {
+router.get("/search", requireCustomer, async (req, res) => {
   try {
     const q = text(req.query.q, 80);
     if (q.length < 2) return res.json({ success: true, models: [], items: [], total: 0 });

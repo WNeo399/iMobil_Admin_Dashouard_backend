@@ -13,8 +13,9 @@
  *   data-brand / data-series / data-model   open straight on a brand or model
  *
  * A copy of the Listing Widget (public/widgets/spare-parts/v1.js) turned into
- * an ordering interface: browse Brand → Series → Model → part type or search,
- * add in-stock parts to a cart, sign in, place the order, see My orders.
+ * an ordering interface: the customer signs in first (no parts are shown
+ * before that), then browses Brand → Series → Model → part type or searches,
+ * adds in-stock parts to a cart, places the order and sees My orders.
  * Demo build (2026-11-06): sign in by email only, no prices, payment on
  * account; orders land on the dashboard (Embed Ordering → Orders).
  * The cart and sign-in are kept in this website's localStorage, per key.
@@ -191,6 +192,11 @@
     ".root.sm .seg button{flex:1;padding:6px 8px}",
     "@media (max-width:480px){.panel{width:100%}}",
     ".sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}",
+    // signed out: only the sign-in screen
+    ".root.locked .search,.root.locked .acts,.root.locked .crumbs{display:none}",
+    ".gate{max-width:400px;margin:20px auto;padding:22px 20px;border:1px solid var(--line);border-radius:14px;background:#fff}",
+    ".gate h3{margin:0 0 4px;font-size:18px}",
+    ".gate .lead{margin:0 0 14px;color:var(--muted);font-size:13px}",
     "@media (prefers-reduced-motion:reduce){.spin{animation:none}.panel{transition:none}}",
   ].join("\n");
 
@@ -311,6 +317,9 @@
     var openOrder = "";
     var busy = false;
     var panelError = "";
+    var distName = ""; // the distributor, named on the sign-in screen
+    var gateMsg = "";
+    var gateBusy = false;
 
     function headers(json) {
       var h = { "X-Distributor-Key": key };
@@ -683,16 +692,9 @@
             f = '<button type="button" class="primary" data-act="place"' + (busy ? " disabled" : "") + ">" + (busy ? "Placing order…" : "Place order") + "</button>" +
               '<div class="sum">No payment now — the order goes to us to confirm.</div>';
           } else {
-            f = '<button type="button" class="primary" data-act="signin-cart">Sign in to place your order</button>';
+            f = '<button type="button" class="primary" data-act="signin-cart">Sign in again to place your order</button>';
           }
         }
-      } else if (mode === "signin") {
-        panelTitle.textContent = "Sign in";
-        h = errHtml() + '<div class="note">Demo sign-in: your email address is all you need for now.</div>' +
-          '<form data-form="signin"><label class="fl" for="si-email">Email</label>' +
-          '<input id="si-email" class="in" type="email" autocomplete="email" required maxlength="140" placeholder="you@business.com">' +
-          '<div style="height:12px"></div><button type="submit" class="primary"' + (busy ? " disabled" : "") + ">" + (busy ? "Signing in…" : "Continue") + "</button></form>" +
-          '<p class="sum" style="margin-top:12px">Your account is set up by ' + esc((catalog && catalog.distributor) || "the business") + ". No account yet? Please ask them.</p>";
       } else if (mode === "orders") {
         panelTitle.textContent = "My orders";
         h = errHtml() + '<div class="who">Signed in as <b>' + esc(me ? me.name || me.email : "") + "</b>" + (me && me.name ? " (" + esc(me.email) + ")" : "") + "</div>";
@@ -728,6 +730,33 @@
       panel.setAttribute("aria-label", panelTitle.textContent);
     }
 
+    // ── sign-in screen: nothing of the catalogue shows before signing in ──
+    function renderGate(email) {
+      body.innerHTML = '<div class="gate"><h3>Sign in to see parts and order</h3>' +
+        '<p class="lead">Enter the email address your account is registered with.</p>' +
+        (gateMsg ? '<div class="err" role="alert">' + esc(gateMsg) + "</div>" : "") +
+        '<div class="note">Demo sign-in: your email address is all you need for now.</div>' +
+        '<form data-form="signin"><label class="fl" for="si-email">Email</label>' +
+        '<input id="si-email" class="in" type="email" autocomplete="email" required maxlength="140" placeholder="you@business.com" value="' + esc(email || "") + '">' +
+        '<div style="height:12px"></div><button type="submit" class="primary"' + (gateBusy ? " disabled" : "") + ">" +
+        (gateBusy ? "Signing in…" : "Sign in") + "</button></form>" +
+        '<p class="sum" style="margin:12px 0 0">Your account is set up by ' + esc(distName || "the business") + ". No account yet? Please ask them.</p></div>";
+    }
+    function showGate(msg) {
+      closePanel();
+      ++seq; // drop answers still on their way
+      catalog = null;
+      partsCache = {};
+      searchCache = {};
+      known = {};
+      view = { kind: "brands" };
+      input.value = "";
+      searchBox.classList.remove("has");
+      root.classList.add("locked");
+      crumbsEl.innerHTML = "";
+      gateMsg = msg || "";
+      renderGate("");
+    }
     function signedOut(msg) {
       token = "";
       me = null;
@@ -735,22 +764,26 @@
       save(store + "me", null);
       myOrders = null;
       paintAccount();
-      if (msg) panelError = msg;
+      showGate(msg);
+    }
+    // a refused session on the way (expired, or the account was closed)
+    function expired() {
+      signedOut("Please sign in again.");
     }
 
     function signIn(email) {
-      if (busy) return;
-      busy = true;
-      panelError = "";
-      renderPanel();
+      if (gateBusy) return;
+      gateBusy = true;
+      gateMsg = "";
+      renderGate(email);
       call("POST", "/widget/embed-ordering/login", { email: email })
         .then(function (r) {
-          busy = false;
+          gateBusy = false;
           if (r.status !== 200 || !r.j.token) {
-            panelError = r.j.message || "Couldn’t sign in. Please try again.";
-            renderPanel();
-            var el = panel.querySelector("#si-email");
-            if (el) { el.value = email; el.focus(); }
+            gateMsg = r.j.message || "Couldn’t sign in. Please try again.";
+            renderGate(email);
+            var el = body.querySelector("#si-email");
+            if (el) el.focus();
             return;
           }
           token = r.j.token;
@@ -759,24 +792,27 @@
           save(store + "me", me);
           draft.address = null;
           addrOpen = false;
+          gateMsg = "";
           paintAccount();
-          var next = afterSignIn || "orders";
-          afterSignIn = "";
-          openPanel(next);
+          loadCatalog();
         })
         .catch(function () {
-          busy = false;
-          panelError = "Couldn’t reach the server. Please try again.";
-          renderPanel();
+          gateBusy = false;
+          gateMsg = "Couldn’t reach the server. Please try again.";
+          renderGate(email);
         });
     }
 
+    // Signing out also empties the cart, so the next person on this
+    // computer doesn't see it.
     function signOut() {
       var t = token;
-      signedOut();
+      cart = [];
+      flagged = {};
+      draft = { note: "", address: null };
+      saveCart();
       if (t) fetch(apiBase + "/widget/embed-ordering/logout", { method: "POST", credentials: "omit", headers: { "X-Distributor-Key": key, Authorization: "Bearer " + t } }).catch(function () {});
-      if (mode === "orders") closePanel();
-      else renderPanel();
+      signedOut();
     }
 
     function loadOrders() {
@@ -784,7 +820,7 @@
       renderPanel();
       call("GET", "/widget/embed-ordering/orders")
         .then(function (r) {
-          if (r.status === 401) { signedOut("Please sign in again."); afterSignIn = "orders"; return openPanel("signin"); }
+          if (r.status === 401) { afterSignIn = "orders"; return expired(); }
           if (r.status !== 200) { panelError = r.j.message || "Couldn’t load your orders."; myOrders = []; return renderPanel(); }
           myOrders = r.j.orders || [];
           if (mode === "orders") renderPanel();
@@ -826,9 +862,8 @@
             return openPanel("done");
           }
           if (r.status === 401) {
-            signedOut("Please sign in again to place your order.");
             afterSignIn = "cart";
-            return openPanel("signin");
+            return signedOut("Please sign in again to place your order — your cart is kept.");
           }
           if (r.status === 409 && r.j.outOfStock) {
             r.j.outOfStock.forEach(function (id) {
@@ -871,7 +906,10 @@
           remember(partsCache[ck]);
           if (mine === seq) { view.items = partsCache[ck]; render(); }
         })
-        .catch(function () { if (mine === seq) message("Couldn’t load the parts for this model.", true); });
+        .catch(function (e) {
+          if (e && e.status === 401) return expired();
+          if (mine === seq) message("Couldn’t load the parts for this model.", true);
+        });
     }
     function openTools() {
       var mine = ++seq;
@@ -883,7 +921,10 @@
           remember(partsCache.tools);
           if (mine === seq) { view.items = partsCache.tools; render(); }
         })
-        .catch(function () { if (mine === seq) message("Couldn’t load the tools.", true); });
+        .catch(function (e) {
+          if (e && e.status === 401) return expired();
+          if (mine === seq) message("Couldn’t load the tools.", true);
+        });
     }
     function runSearch(q) {
       if (view.kind !== "search") beforeSearch = view;
@@ -897,7 +938,10 @@
           remember(j.items);
           if (mine === seq) { view.result = j; render(); }
         })
-        .catch(function () { if (mine === seq) message("Search isn’t available right now.", true); });
+        .catch(function (e) {
+          if (e && e.status === 401) return expired();
+          if (mine === seq) message("Search isn’t available right now.", true);
+        });
     }
     function endSearch() {
       ++seq;
@@ -946,8 +990,8 @@
       else if (act === "dec") { var ld = lineOf(id); if (ld) setQty(id, ld.qty - 1); }
       else if (act === "remove") setQty(id, 0);
       else if (act === "cart") openPanel("cart");
-      else if (act === "account") { if (me) openPanel("orders"); else { afterSignIn = "orders"; openPanel("signin"); } }
-      else if (act === "signin-cart") { afterSignIn = "cart"; openPanel("signin"); }
+      else if (act === "account") { if (me) openPanel("orders"); else showGate(); }
+      else if (act === "signin-cart") { afterSignIn = "cart"; signedOut(); }
       else if (act === "signout") signOut();
       else if (act === "place") placeOrder();
       else if (act === "addr-edit") {
@@ -1039,13 +1083,19 @@
     sizeClass();
 
     // ── start ──
-    function start() {
+    // The parts, for a signed-in customer.
+    function loadCatalog() {
+      root.classList.remove("locked");
       loading();
       renderCrumbs();
-      if (!key) return message("This ordering widget has no distributor key (data-distributor-key).");
+      var mine = ++seq;
       api("/widget/embed-ordering/catalog")
         .then(function (j) {
+          if (mine !== seq) return;
           catalog = j;
+          var next = afterSignIn;
+          afterSignIn = "";
+          if (next) setTimeout(function () { openPanel(next); }, 0);
           var b = findBrand(mount.getAttribute("data-brand"));
           var model = mount.getAttribute("data-model");
           var seriesName = mount.getAttribute("data-series");
@@ -1058,15 +1108,36 @@
           go({ kind: "brands" }, true);
         })
         .catch(function (e) {
-          message(e && e.status === 403 ? esc(e.message) : "The parts list couldn’t be loaded.", !(e && e.status === 403));
+          if (e && e.status === 401) return expired();
+          if (mine === seq) message("The parts list couldn’t be loaded.", true);
         });
-      // still signed in? (the account may have been closed since)
-      if (token) {
-        call("GET", "/widget/embed-ordering/me").then(function (r) {
-          if (r.status === 200 && r.j.customer) { me = r.j.customer; save(store + "me", me); paintAccount(); }
-          else if (r.status === 401) signedOut();
-        }).catch(function () {});
-      }
+    }
+
+    function start() {
+      root.classList.add("locked");
+      loading();
+      crumbsEl.innerHTML = "";
+      if (!key) return message("This ordering widget has no distributor key (data-distributor-key).");
+      // whose widget this is (and whether this website may use it)
+      api("/widget/embed-ordering/info")
+        .then(function (j) {
+          distName = j.distributor || "";
+          if (!token) return showGate();
+          // still signed in? (the session may have expired or the account closed)
+          return call("GET", "/widget/embed-ordering/me").then(function (r) {
+            if (r.status === 200 && r.j.customer) {
+              me = r.j.customer;
+              save(store + "me", me);
+              paintAccount();
+              return loadCatalog();
+            }
+            if (r.status === 401) return signedOut();
+            message("The parts list couldn’t be loaded.", true);
+          });
+        })
+        .catch(function (e) {
+          message(e && e.status === 403 ? esc(e.message) : "The ordering page couldn’t be loaded.", !(e && e.status === 403));
+        });
     }
     paintBadge();
     paintAccount();
