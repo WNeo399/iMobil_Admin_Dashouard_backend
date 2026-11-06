@@ -1,4 +1,4 @@
-// POS — Customers (Mongo: pos_customers).
+// Embed Ordering — Customers (Mongo: embed_ordering_customers).
 //
 // A distributor's own customers. Deliberately keyed on (distributorId,
 // email) rather than email alone: the same repairer may hold an account
@@ -9,14 +9,14 @@
 // doesn't require one — a customer record can equally be the contact
 // captured at checkout — so nothing here assumes a login exists yet.
 //
-//   GET    /pos/customers            list (distributor / search / status)
-//   POST   /pos/customers            create
-//   GET    /pos/customers/:id        one
-//   PUT    /pos/customers/:id        edit
-//   DELETE /pos/customers/:id        remove
+//   GET    /embed-ordering/customers            list (distributor / search / status)
+//   POST   /embed-ordering/customers            create
+//   GET    /embed-ordering/customers/:id        one
+//   PUT    /embed-ordering/customers/:id        edit
+//   DELETE /embed-ordering/customers/:id        remove
 //
-// Reading needs pos:customer:view, writing pos:customer:manage — both
-// covered by pos:*:* and *:*:* (Admin).
+// Reading needs embedOrdering:customer:view, writing embedOrdering:customer:manage — both
+// covered by embedOrdering:*:* and *:*:* (Admin).
 
 var express = require("express");
 var router = express.Router();
@@ -25,10 +25,10 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { escapeRegex, str, status, address, exact } = require("./common");
 
-const VIEW = requirePermission("pos:customer:view");
-const MANAGE = requirePermission("pos:customer:manage");
-const CUSTOMERS = "pos_customers";
-const DISTRIBUTORS = "pos_distributors";
+const VIEW = requirePermission("embedOrdering:customer:view");
+const MANAGE = requirePermission("embedOrdering:customer:manage");
+const CUSTOMERS = "embed_ordering_customers";
+const DISTRIBUTORS = "embed_ordering_distributors";
 
 // One account per email per distributor, enforced at the database too so a
 // race between two admins can't slip a duplicate through.
@@ -43,7 +43,7 @@ async function ensureIndex(db) {
   } catch (e) {
     // A pre-existing duplicate would fail the build; log and carry on so the
     // page still works while it's cleaned up.
-    console.warn("POS customers index not created:", (e && e.message) || e);
+    console.warn("Embed Ordering customers index not created:", (e && e.message) || e);
   }
 }
 
@@ -63,7 +63,7 @@ function buildCustomer(body, { partial = false } = {}) {
   return doc;
 }
 
-// ── GET /pos/customers ──────────────────────────────────────────────
+// ── GET /embed-ordering/customers ──────────────────────────────────────────────
 router.get("/", VIEW, async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -104,12 +104,12 @@ router.get("/", VIEW, async (req, res) => {
       })),
     });
   } catch (e) {
-    console.error("List POS customers error:", e);
+    console.error("List Embed Ordering customers error:", e);
     return res.status(500).json({ success: false, message: "Failed to load customers" });
   }
 });
 
-// ── GET /pos/customers/:id ──────────────────────────────────────────
+// ── GET /embed-ordering/customers/:id ──────────────────────────────────────────
 router.get("/:id", VIEW, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -122,12 +122,12 @@ router.get("/:id", VIEW, async (req, res) => {
     }
     return res.json({ success: true, customer });
   } catch (e) {
-    console.error("Get POS customer error:", e);
+    console.error("Get Embed Ordering customer error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the customer" });
   }
 });
 
-// ── POST /pos/customers ─────────────────────────────────────────────
+// ── POST /embed-ordering/customers ─────────────────────────────────────────────
 router.post("/", MANAGE, async (req, res) => {
   try {
     const body = req.body || {};
@@ -174,12 +174,12 @@ router.post("/", MANAGE, async (req, res) => {
     if (e && e.code === 11000) {
       return res.status(409).json({ success: false, message: "That email is already used by this distributor" });
     }
-    console.error("Create POS customer error:", e);
+    console.error("Create Embed Ordering customer error:", e);
     return res.status(500).json({ success: false, message: "Failed to add the customer" });
   }
 });
 
-// ── PUT /pos/customers/:id ──────────────────────────────────────────
+// ── PUT /embed-ordering/customers/:id ──────────────────────────────────────────
 router.put("/:id", MANAGE, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -237,12 +237,12 @@ router.put("/:id", MANAGE, async (req, res) => {
     if (e && e.code === 11000) {
       return res.status(409).json({ success: false, message: "That email is already used by this distributor" });
     }
-    console.error("Update POS customer error:", e);
+    console.error("Update Embed Ordering customer error:", e);
     return res.status(500).json({ success: false, message: "Failed to update the customer" });
   }
 });
 
-// ── DELETE /pos/customers/:id ───────────────────────────────────────
+// ── DELETE /embed-ordering/customers/:id ───────────────────────────────────────
 router.delete("/:id", MANAGE, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -255,7 +255,7 @@ router.delete("/:id", MANAGE, async (req, res) => {
     }
     return res.json({ success: true, message: "Customer removed" });
   } catch (e) {
-    console.error("Delete POS customer error:", e);
+    console.error("Delete Embed Ordering customer error:", e);
     return res.status(500).json({ success: false, message: "Failed to remove the customer" });
   }
 });

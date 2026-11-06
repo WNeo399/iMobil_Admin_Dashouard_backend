@@ -39,6 +39,9 @@ const explodedDiagramRouter = require("./explodedDiagram");
 const bannerCarouselRouter = require("./bannerCarousel");
 const sparePartsRouter = require("./spareParts");
 const notificationRouter = require("./notification");
+// Embed Ordering (kept in routes/embedOrderingRoutes so the module stays
+// in one folder): catalogue, demo sign-in and cart orders.
+const embedOrderingWidgetRouter = require("../embedOrderingRoutes/widget");
 
 // Read-only widget data (exploded-diagram browsing, the website banner
 // carousel, the spare parts browser, the website popup). Mounted BEFORE the shared
@@ -49,6 +52,8 @@ router.use("/explodedDiagram", explodedDiagramRouter);
 router.use("/bannerCarousel", bannerCarouselRouter);
 router.use("/spareParts", sparePartsRouter);
 router.use("/notification", notificationRouter);
+// Its own limits (reads / sign-in / orders) and per-distributor websites.
+router.use("/embed-ordering", embedOrderingWidgetRouter);
 
 // ── Rate limit ─────────────────────────────────────────────────────
 // 10 submissions per IP per hour. Generous enough for a real user

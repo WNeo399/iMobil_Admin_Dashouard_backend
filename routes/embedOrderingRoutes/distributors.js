@@ -1,19 +1,19 @@
-// POS — Distributors (Mongo: pos_distributors).
+// Embed Ordering — Distributors (Mongo: embed_ordering_distributors).
 //
 // A distributor is a business that embeds our parts widget on their own
 // site and sells to their own customers. The record holds who they are,
 // which origins may load their widget, the public key that identifies
 // them to it, and the Zoho contact we raise sales orders against.
 //
-//   GET    /pos/distributors                list (search)
-//   POST   /pos/distributors                create
-//   GET    /pos/distributors/:id            one
-//   PUT    /pos/distributors/:id            edit
-//   POST   /pos/distributors/:id/rotate-key issue a fresh public key
-//   DELETE /pos/distributors/:id            remove
+//   GET    /embed-ordering/distributors                list (search)
+//   POST   /embed-ordering/distributors                create
+//   GET    /embed-ordering/distributors/:id            one
+//   PUT    /embed-ordering/distributors/:id            edit
+//   POST   /embed-ordering/distributors/:id/rotate-key issue a fresh public key
+//   DELETE /embed-ordering/distributors/:id            remove
 //
-// Reading needs pos:distributor:view, writing pos:distributor:manage —
-// both covered by pos:*:* and *:*:* (Admin).
+// Reading needs embedOrdering:distributor:view, writing embedOrdering:distributor:manage —
+// both covered by embedOrdering:*:* and *:*:* (Admin).
 
 var express = require("express");
 var router = express.Router();
@@ -23,16 +23,16 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { escapeRegex, str, status, address, exact } = require("./common");
 
-const VIEW = requirePermission("pos:distributor:view");
-const MANAGE = requirePermission("pos:distributor:manage");
-const DISTRIBUTORS = "pos_distributors";
+const VIEW = requirePermission("embedOrdering:distributor:view");
+const MANAGE = requirePermission("embedOrdering:distributor:manage");
+const DISTRIBUTORS = "embed_ordering_distributors";
 
 // The key the widget carries in its mount tag. It sits in the distributor's
 // page source, so it is an identifier and not a credential — it may only
 // read that distributor's catalogue and submit an order against them.
 // Random regardless, so one distributor can't guess another's.
 function newPublicKey() {
-  return "pos_" + crypto.randomBytes(16).toString("hex");
+  return "embed_" + crypto.randomBytes(16).toString("hex");
 }
 
 // Canonical origin: scheme + host (+ port), no path, no trailing slash —
@@ -59,7 +59,7 @@ function buildDistributor(body, { partial = false } = {}) {
   if (!partial || body.phone !== undefined) set("phone", str(body.phone, 60));
   if (!partial || body.address !== undefined) set("address", address(body.address));
   if (!partial || body.website !== undefined) set("website", str(body.website, 200));
-  // Who they are to us in Zoho — a confirmed POS order raises its sales
+  // Who they are to us in Zoho — a confirmed widget order raises its sales
   // order against this contact, not against their end customer.
   if (!partial || body.zohoContactId !== undefined) set("zohoContactId", str(body.zohoContactId, 60));
   if (!partial || body.note !== undefined) set("note", str(body.note, 500));
@@ -73,7 +73,7 @@ function buildDistributor(body, { partial = false } = {}) {
   return doc;
 }
 
-// ── GET /pos/distributors ───────────────────────────────────────────
+// ── GET /embed-ordering/distributors ───────────────────────────────────────────
 router.get("/", VIEW, async (req, res) => {
   try {
     const db = await connectToDatabase();
@@ -92,12 +92,12 @@ router.get("/", VIEW, async (req, res) => {
       .toArray();
     return res.json({ success: true, distributors });
   } catch (e) {
-    console.error("List POS distributors error:", e);
+    console.error("List Embed Ordering distributors error:", e);
     return res.status(500).json({ success: false, message: "Failed to load distributors" });
   }
 });
 
-// ── GET /pos/distributors/:id ───────────────────────────────────────
+// ── GET /embed-ordering/distributors/:id ───────────────────────────────────────
 router.get("/:id", VIEW, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -112,12 +112,12 @@ router.get("/:id", VIEW, async (req, res) => {
     }
     return res.json({ success: true, distributor });
   } catch (e) {
-    console.error("Get POS distributor error:", e);
+    console.error("Get Embed Ordering distributor error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the distributor" });
   }
 });
 
-// ── POST /pos/distributors ──────────────────────────────────────────
+// ── POST /embed-ordering/distributors ──────────────────────────────────────────
 router.post("/", MANAGE, async (req, res) => {
   try {
     const doc = buildDistributor(req.body || {});
@@ -143,12 +143,12 @@ router.post("/", MANAGE, async (req, res) => {
       distributor: { ...doc, _id: r.insertedId },
     });
   } catch (e) {
-    console.error("Create POS distributor error:", e);
+    console.error("Create Embed Ordering distributor error:", e);
     return res.status(500).json({ success: false, message: "Failed to add the distributor" });
   }
 });
 
-// ── PUT /pos/distributors/:id ───────────────────────────────────────
+// ── PUT /embed-ordering/distributors/:id ───────────────────────────────────────
 router.put("/:id", MANAGE, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -182,12 +182,12 @@ router.put("/:id", MANAGE, async (req, res) => {
     }
     return res.json({ success: true, message: "Distributor updated", distributor: updated });
   } catch (e) {
-    console.error("Update POS distributor error:", e);
+    console.error("Update Embed Ordering distributor error:", e);
     return res.status(500).json({ success: false, message: "Failed to update the distributor" });
   }
 });
 
-// ── POST /pos/distributors/:id/rotate-key ───────────────────────────
+// ── POST /embed-ordering/distributors/:id/rotate-key ───────────────────────────
 // Issues a new key and retires the old one immediately, so any widget
 // still embedded with the previous key stops resolving. For a key that
 // has been misused, not routine housekeeping.
@@ -214,12 +214,12 @@ router.post("/:id/rotate-key", MANAGE, async (req, res) => {
     }
     return res.json({ success: true, message: "New key issued", distributor: updated });
   } catch (e) {
-    console.error("Rotate POS distributor key error:", e);
+    console.error("Rotate Embed Ordering distributor key error:", e);
     return res.status(500).json({ success: false, message: "Failed to issue a new key" });
   }
 });
 
-// ── DELETE /pos/distributors/:id ────────────────────────────────────
+// ── DELETE /embed-ordering/distributors/:id ────────────────────────────────────
 router.delete("/:id", MANAGE, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
@@ -232,7 +232,7 @@ router.delete("/:id", MANAGE, async (req, res) => {
     }
     return res.json({ success: true, message: "Distributor removed" });
   } catch (e) {
-    console.error("Delete POS distributor error:", e);
+    console.error("Delete Embed Ordering distributor error:", e);
     return res.status(500).json({ success: false, message: "Failed to remove the distributor" });
   }
 });

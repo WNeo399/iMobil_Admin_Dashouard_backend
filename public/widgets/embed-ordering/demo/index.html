@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ordering Widget — Embed Demo</title>
+    <!--
+      Mimics a distributor's website: one div + one script tag. Hand-written
+      vanilla JS (no build step) — edit public/widgets/embed-ordering/v1.js directly.
+
+        http://localhost:3002/widget-assets/embed-ordering/demo/index.html?key=embed_…
+
+      ?key= is the distributor's public key (Embed Ordering → Ordering Widget).
+      ?bare=1 drops the page around the widget — the dashboard's Ordering
+      Widget page shows it that way in its Preview. ?brand=&model= open on a
+      model, like the data-brand / data-model attributes.
+      This page is served by the backend itself, so its requests count as the
+      preview (orders placed here are tagged "Preview" on the Orders page).
+    -->
+    <style>
+      body { margin: 0; padding: 32px 20px; background: #f3f4f6; font: 14px/1.5 system-ui, sans-serif; color: #1f2937; }
+      .demo { max-width: 1200px; margin: 0 auto; }
+      .demo > h1 { margin: 0 0 4px; font-size: 22px; }
+      .demo > p { margin: 0 0 20px; color: #6b7280; }
+      .frame { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+      body.bare { padding: 16px; background: #fff; }
+      body.bare .demo { max-width: none; }
+      body.bare .demo > h1, body.bare .demo > p { display: none; }
+      body.bare .frame { padding: 0; box-shadow: none; }
+    </style>
+  </head>
+  <body>
+    <div class="demo">
+      <h1>Ordering Widget — Embed Demo</h1>
+      <p>The widget below is loaded exactly as a distributor's website embeds it. Resize the window to see the phone layout.</p>
+      <div class="frame">
+        <div id="imobile-embed-ordering"></div>
+      </div>
+    </div>
+    <script>
+      if (/[?&]bare=1/.test(location.search)) document.body.className = 'bare';
+      var qs = new URLSearchParams(location.search);
+      var mount = document.getElementById('imobile-embed-ordering');
+      if (qs.has('key')) mount.setAttribute('data-distributor-key', qs.get('key'));
+      ['brand', 'series', 'model', 'title', 'accent'].forEach(function (k) {
+        if (qs.has(k)) mount.setAttribute('data-' + k, qs.get(k));
+      });
+    </script>
+    <script src="/widget-assets/embed-ordering/v1.js" defer></script>
+  </body>
+</html>

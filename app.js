@@ -65,7 +65,7 @@ var explodedRouter = require('./routes/explodedRoutes/index');
 var websiteRouter = require('./routes/websiteRoutes/index');
 // iMobile Accountant — money owed to iMobile (unpaid Zoho invoices).
 var accountantRouter = require('./routes/accountantRoutes/index');
-var posRouter = require('./routes/posRoutes/index');
+var embedOrderingRouter = require('./routes/embedOrderingRoutes/index');
 // Public daily-cron trigger for the Purchase Order UPDATE sync (Tencent → DB).
 var purchaseOrderSyncRouter = require('./routes/purchaseOrderSyncRoutes/index');
 // Public cron trigger for the stock register's Zoho syncs: the hourly
@@ -210,7 +210,7 @@ app.use('/blackbelt', authenticate, blackbeltRouter);
 app.use('/exploded', authenticate, explodedRouter);
 app.use('/website', authenticate, websiteRouter);
 app.use('/accountant', authenticate, accountantRouter);
-app.use('/pos', authenticate, posRouter);
+app.use('/embed-ordering', authenticate, embedOrderingRouter);
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

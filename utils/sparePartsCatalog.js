@@ -9,7 +9,9 @@
 //
 // Built in memory from Mongo and kept 10 minutes. Used by the public widget
 // feed (routes/widgetRoutes/spareParts.js) and the dashboard's Spare Parts
-// Widget page (routes/websiteRoutes).
+// Widget page (routes/websiteRoutes), and by the Embed Ordering widget
+// (routes/embedOrderingRoutes/widget.js), which also gets an in-stock flag per part
+// (orderItem). The Listing feed never carries stock (publicItem).
 
 const { connectToDatabase } = require("./mongodb");
 
@@ -80,6 +82,9 @@ function shapeItem(r) {
     sub: r.subClassification || "",
     quality: r.quality || "",
     imageId: r.imageId || null,
+    // Zoho's available-for-sale stock, synced hourly — only the ordering
+    // widget's in-stock flag reads it.
+    available: Number(r.metrics && r.metrics.available) || 0,
     brand: r.deviceBrand || "",
     models: Array.isArray(r.compatibleModels) ? r.compatibleModels.filter(Boolean) : [],
   };
@@ -90,7 +95,7 @@ async function build() {
   const rows = await db.collection(ITEMS)
     .find(
       { active: true, archived: false, scope: "parts", showInStore: true },
-      { projection: { _id: 0, itemId: 1, name: 1, sku: 1, classification: 1, subClassification: 1, quality: 1, imageId: 1, deviceBrand: 1, deviceSeries: 1, compatibleModels: 1 } },
+      { projection: { _id: 0, itemId: 1, name: 1, sku: 1, classification: 1, subClassification: 1, quality: 1, imageId: 1, deviceBrand: 1, deviceSeries: 1, compatibleModels: 1, "metrics.available": 1 } },
     )
     .toArray();
 
@@ -159,6 +164,7 @@ async function build() {
       brands: brands.length,
       tools: tools.length,
       withImage: items.filter((i) => i.imageId).length,
+      inStock: items.filter((i) => i.available > 0).length,
     },
   };
 }
@@ -184,14 +190,17 @@ const sortParts = (list) => [...list].sort((a, b) => typeRank(a.type) - typeRank
 
 // What the widget gets for a part — models dropped (the page already knows).
 const publicItem = (i) => ({ id: i.id, name: i.name, sku: i.sku, type: i.type, sub: i.sub, quality: i.quality, imageId: i.imageId });
+// The ordering widget's part: the same, plus whether it can be ordered now
+// (in stock / out of stock only — the quantity is never sent).
+const orderItem = (i) => ({ ...publicItem(i), inStock: i.available > 0 });
 
-function partsForModel(cat, brand, model) {
+function partsForModel(cat, brand, model, shape = publicItem) {
   const idxs = cat.modelItems.get(`${brand}|${model}`) || [];
-  return sortParts(idxs.map((i) => cat.items[i])).map(publicItem);
+  return sortParts(idxs.map((i) => cat.items[i])).map(shape);
 }
 
-function toolParts(cat) {
-  return sortParts(cat.tools).map(publicItem);
+function toolParts(cat, shape = publicItem) {
+  return sortParts(cat.tools).map(shape);
 }
 
 const wordsOf = (text) => String(text || "").toLowerCase().split(/[^a-z0-9+]+/).filter(Boolean);
@@ -204,18 +213,21 @@ function wordHit(w, list) {
 }
 
 // Every word must match the name or a compatible model; a lone word may also
-// be the start of a SKU.
-function search(cat, q) {
+// be the start of a SKU. `keep` (optional) narrows the parts before the first
+// 60 are taken — the ordering widget's In stock / Out of stock filter.
+function search(cat, q, shape = publicItem, keep = null) {
   const raw = String(q || "").trim().toLowerCase();
   const words = wordsOf(raw).slice(0, 8);
   if (!words.length) return { models: [], items: [], total: 0 };
-  const found = [];
+  let found = [];
   for (const i of cat.items) {
     const sku = i.sku.toLowerCase();
     if (sku && (sku === raw || (words.length === 1 && sku.startsWith(raw)))) { found.push(i); continue; }
     const list = wordsOf(`${i.name} ${i.models.join(" ")}`);
     if (words.every((w) => wordHit(w, list))) found.push(i);
   }
+
+  if (keep) found = found.filter(keep);
 
   // models: the words that name a model ("iphone 13 pro screen" → iPhone 13
   // Pro, iPhone 13 Pro Max), leaving out part words like "screen"
@@ -232,7 +244,7 @@ function search(cat, q) {
       .map(({ list, ...m }) => m)
     : [];
 
-  return { models, items: sortParts(found).slice(0, 60).map(publicItem), total: found.length };
+  return { models, items: sortParts(found).slice(0, 60).map(shape), total: found.length };
 }
 
-module.exports = { getCatalog, partsForModel, toolParts, search, TYPES, TYPE_LABELS, PRODUCT_BASE, generation };
+module.exports = { getCatalog, partsForModel, toolParts, search, publicItem, orderItem, TYPES, TYPE_LABELS, PRODUCT_BASE, generation };

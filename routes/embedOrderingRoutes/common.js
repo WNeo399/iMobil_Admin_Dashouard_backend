@@ -1,4 +1,4 @@
-// Shared helpers for the POS module. Distributors and their customers hold
+// Shared helpers for the Embed Ordering module. Distributors and their customers hold
 // the same shaped contact/address data, so the parsing lives in one place.
 
 const STATUSES = ["active", "inactive"];
