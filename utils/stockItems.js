@@ -187,6 +187,42 @@ async function refreshOnOrder(db, poBySku) {
   return ops.length;
 }
 
+// After a Spare Parts Purchase change (user 2026-11-09: "Nothing on order"
+// listed items that had a line raised after the last refresh): re-stamp the
+// on-order figures a moment later, in the background. Changes close together
+// share one pass (~1–2 s of reads, writes only the rows that changed) and
+// one pass runs at a time — a change during a pass queues one more.
+const ON_ORDER_DELAY_MS = 2000;
+const onOrderJob = { timer: null, running: false, again: false, runs: 0 };
+function scheduleOnOrderRefresh(delayMs = ON_ORDER_DELAY_MS) {
+  if (onOrderJob.running) {
+    onOrderJob.again = true;
+    return;
+  }
+  clearTimeout(onOrderJob.timer);
+  onOrderJob.timer = setTimeout(runOnOrderRefresh, delayMs);
+  if (onOrderJob.timer.unref) onOrderJob.timer.unref();
+}
+async function runOnOrderRefresh() {
+  onOrderJob.timer = null;
+  onOrderJob.running = true;
+  try {
+    const { connectToDatabase } = require("./mongodb");
+    const n = await refreshOnOrder(await connectToDatabase());
+    onOrderJob.runs++;
+    if (n) console.log(`on-order re-stamped on ${n} item${n === 1 ? "" : "s"}`);
+  } catch (e) {
+    // the next change (or the next stock refresh) catches up
+    console.error("on-order re-stamp failed:", e && e.message);
+  } finally {
+    onOrderJob.running = false;
+    if (onOrderJob.again) {
+      onOrderJob.again = false;
+      scheduleOnOrderRefresh();
+    }
+  }
+}
+
 // A flat job row → { catalogue, metrics }.
 function splitRow(row) {
   const catalogue = {};
@@ -272,6 +308,8 @@ module.exports = {
   ACCESSORY_BRANDS,
   openPurchasesBySku,
   refreshOnOrder,
+  scheduleOnOrderRefresh,
+  _onOrderJob: onOrderJob, // tests
   skuKey,
   num,
   stockFlags,

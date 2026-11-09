@@ -71,6 +71,9 @@ async function authenticate(req, res, next) {
       // InFlow customer-portal link — scopes the Statement page to one customer.
       inflowCustomerId: user.inflowCustomerId || null,
       inflowCustomerName: user.inflowCustomerName || null,
+      // Devices Customer link — the Refurbished customer whose device sales
+      // the My Devices page shows (2026-11-09).
+      refurbCustomerId: user.refurbCustomerId ? String(user.refurbCustomerId) : null,
       // Consignment-shop link — scopes the Consignment pages to one shop.
       consignShopId: user.consignShopId ? String(user.consignShopId) : null,
       // Phone-supplier stock source — stamped onto records they create.

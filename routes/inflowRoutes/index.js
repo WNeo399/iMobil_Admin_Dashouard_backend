@@ -37,6 +37,12 @@ const PAY = requirePermission("inflow:order:payment");
 const CREATE = requirePermission("inflow:order:create");
 const PORTAL = requirePermission("inflow:portal:manage");
 const STATEMENT = requirePermission("inflow:statement:view");
+// My Devices — the Devices Customer role (2026-11-09), linked per login to
+// a Refurbished customer (users.refurbCustomerId).
+const DEVICES_PORTAL = requirePermission("refurb:portal:view");
+// An InFlow Customer login, whether that is its only role or held with
+// Devices Customer.
+const INFLOW_LOGIN = { $or: [{ role: "inflow-customer" }, { roles: "inflow-customer" }] };
 
 const ORDERS = "inflow_salesorders";
 const CUSTOMERS = "inflow_customers";
@@ -862,7 +868,7 @@ router.get("/customers", VIEW_CUSTOMERS, async (req, res) => {
       const countDocs = await db
         .collection(USERS)
         .aggregate([
-          { $match: { role: "inflow-customer", inflowCustomerName: { $in: names } } },
+          { $match: { ...INFLOW_LOGIN, inflowCustomerName: { $in: names } } },
           { $group: { _id: "$inflowCustomerName", n: { $sum: 1 } } },
         ])
         .toArray();
@@ -917,6 +923,8 @@ router.get("/filters", VIEW_ORDERS, async (req, res) => {
 
 // ── Customer portal management (Admin — inflow:portal:manage) ───────
 // Portal logins live in `users` with role "inflow-customer" + inflowCustomerName.
+// Device purchases are NOT linked here any more: since 2026-11-09 they belong
+// to the Devices Customer role, linked per login on System → Users.
 function shapeUser(u) {
   if (!u) return u;
   const { passwordHash, ...rest } = u;
@@ -932,60 +940,18 @@ router.get("/customers/:name/portal", PORTAL, async (req, res) => {
     const cust = await db.collection(CUSTOMERS).findOne({ nameLower: name.toLowerCase() });
     const users = await db
       .collection(USERS)
-      .find({ role: "inflow-customer", inflowCustomerName: name }, { projection: { passwordHash: 0 } })
+      .find({ ...INFLOW_LOGIN, inflowCustomerName: name }, { projection: { passwordHash: 0 } })
       .sort({ createdAt: 1 })
       .toArray();
     return res.json({
       success: true,
       customerName: name,
       portalEnabled: !!(cust && cust.portalEnabled),
-      // Refurbished-customer link: when set, this customer's portal logins
-      // also see their refurbished-device purchases (Devices tab).
-      refurbCustomerId: cust && cust.refurbCustomerId ? String(cust.refurbCustomerId) : null,
-      refurbCustomerName: (cust && cust.refurbCustomerName) || null,
       users,
     });
   } catch (e) {
     console.error("InFlow portal get error:", e);
     return res.status(500).json({ success: false, message: "Failed to load portal" });
-  }
-});
-
-// ── PUT /inflow/customers/:name/portal — link a Refurbished customer ─
-// One link per customer (not per login): every portal login for this
-// customer inherits it. Pass refurbCustomerId to link, null/"" to unlink.
-router.put("/customers/:name/portal", PORTAL, async (req, res) => {
-  try {
-    const name = String(req.params.name || "").trim();
-    if (!name) return res.status(400).json({ success: false, message: "Customer required" });
-    const db = await connectToDatabase();
-    const cust = await db.collection(CUSTOMERS).findOne({ nameLower: name.toLowerCase() });
-    if (!cust) return res.status(404).json({ success: false, message: "Customer not found" });
-
-    const raw = req.body && req.body.refurbCustomerId;
-    const now = new Date();
-    if (!raw) {
-      await db.collection(CUSTOMERS).updateOne(
-        { _id: cust._id },
-        { $set: { refurbCustomerId: null, refurbCustomerName: null, updatedAt: now } },
-      );
-      return res.json({ success: true, refurbCustomerId: null, refurbCustomerName: null });
-    }
-    if (!ObjectId.isValid(raw)) {
-      return res.status(400).json({ success: false, message: "Bad refurb customer id" });
-    }
-    const rc = await db
-      .collection(REFURB_CUSTOMERS)
-      .findOne({ _id: new ObjectId(raw) }, { projection: { name: 1 } });
-    if (!rc) return res.status(404).json({ success: false, message: "Refurbished customer not found" });
-    await db.collection(CUSTOMERS).updateOne(
-      { _id: cust._id },
-      { $set: { refurbCustomerId: rc._id, refurbCustomerName: rc.name, updatedAt: now } },
-    );
-    return res.json({ success: true, refurbCustomerId: String(rc._id), refurbCustomerName: rc.name });
-  } catch (e) {
-    console.error("InFlow portal refurb link error:", e);
-    return res.status(500).json({ success: false, message: "Failed to save the link" });
   }
 });
 
@@ -1050,7 +1016,7 @@ router.put("/customers/:name/portal/users/:userId", PORTAL, async (req, res) => 
     }
     const db = await connectToDatabase();
     const r = await db.collection(USERS).findOneAndUpdate(
-      { _id: new ObjectId(req.params.userId), role: "inflow-customer", inflowCustomerName: name },
+      { _id: new ObjectId(req.params.userId), ...INFLOW_LOGIN, inflowCustomerName: name },
       { $set: set },
       { returnDocument: "after", projection: { passwordHash: 0 } },
     );
@@ -1071,7 +1037,7 @@ router.delete("/customers/:name/portal/users/:userId", PORTAL, async (req, res) 
     const db = await connectToDatabase();
     const r = await db.collection(USERS).deleteOne({
       _id: new ObjectId(req.params.userId),
-      role: "inflow-customer",
+      ...INFLOW_LOGIN,
       inflowCustomerName: name,
     });
     if (!r.deletedCount) return res.status(404).json({ success: false, message: "User not found" });
@@ -1125,23 +1091,24 @@ router.get("/statement", STATEMENT, async (req, res) => {
   }
 });
 
+// The Refurbished customer a Devices Customer login is linked to (on the
+// user record, System → Users), or null.
+async function devicesCustomerOf(db, req) {
+  const id = req.user && req.user.refurbCustomerId;
+  if (!id || !ObjectId.isValid(String(id))) return null;
+  return db.collection(REFURB_CUSTOMERS).findOne({ _id: new ObjectId(String(id)) }, { projection: { name: 1 } });
+}
+
 // ── GET /inflow/statement/devices ───────────────────────────────────
-// The portal's Devices tab: the linked Refurbished customer's sales
-// orders, devices, prices and totals. Pending orders are internal
+// My Devices (Devices Customer role): the linked Refurbished customer's
+// sales orders, devices, prices and totals. Pending orders are internal
 // drafts and stay hidden; Confirmed and Cancelled show with a status.
-router.get("/statement/devices", STATEMENT, async (req, res) => {
+router.get("/statement/devices", DEVICES_PORTAL, async (req, res) => {
   try {
-    const custId = req.user && req.user.inflowCustomerId;
-    if (!custId) return res.json({ success: true, linked: false, orders: [] });
     const db = await connectToDatabase();
-    const cust = await db
-      .collection(CUSTOMERS)
-      .findOne(
-        { _id: custId instanceof ObjectId ? custId : new ObjectId(custId) },
-        { projection: { refurbCustomerId: 1, refurbCustomerName: 1 } },
-      );
-    const rcId = cust && cust.refurbCustomerId;
-    if (!rcId) return res.json({ success: true, linked: false, orders: [] });
+    const rc = await devicesCustomerOf(db, req);
+    if (!rc) return res.json({ success: true, linked: false, orders: [] });
+    const rcId = rc._id;
 
     const raw = await db
       .collection(REFURB_SALES_ORDERS)
@@ -1225,7 +1192,7 @@ router.get("/statement/devices", STATEMENT, async (req, res) => {
     return res.json({
       success: true,
       linked: true,
-      refurbCustomerName: (cust && cust.refurbCustomerName) || null,
+      refurbCustomerName: rc.name || null,
       summary,
       orders,
     });
@@ -1241,23 +1208,16 @@ router.get("/statement/devices", STATEMENT, async (req, res) => {
 // tab. Scoped hard: the device must appear on one of the linked refurb
 // customer's (non-pending) sales orders, so a portal login can never
 // pull a report for a device that wasn't sold to them.
-router.get("/statement/devices/:deviceId/report", STATEMENT, async (req, res) => {
+router.get("/statement/devices/:deviceId/report", DEVICES_PORTAL, async (req, res) => {
   try {
     const deviceId = req.params.deviceId;
     if (!ObjectId.isValid(deviceId)) {
       return res.status(400).json({ success: false, message: "Bad id" });
     }
-    const custId = req.user && req.user.inflowCustomerId;
-    if (!custId) return res.status(404).json({ success: false, message: "Device not found" });
     const db = await connectToDatabase();
-    const cust = await db
-      .collection(CUSTOMERS)
-      .findOne(
-        { _id: custId instanceof ObjectId ? custId : new ObjectId(custId) },
-        { projection: { refurbCustomerId: 1 } },
-      );
-    const rcId = cust && cust.refurbCustomerId;
-    if (!rcId) return res.status(404).json({ success: false, message: "Device not found" });
+    const rc = await devicesCustomerOf(db, req);
+    if (!rc) return res.status(404).json({ success: false, message: "Device not found" });
+    const rcId = rc._id;
     const owns = await db.collection(REFURB_SALES_ORDERS).findOne(
       {
         customerId: { $in: [rcId, String(rcId)] },

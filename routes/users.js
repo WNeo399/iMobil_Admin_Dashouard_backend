@@ -13,6 +13,7 @@ const {
   ROLE_GROUP_OF,
   isShopScopedRole,
   isCombinableRole,
+  combineFamilyOf,
   roleSetError,
   rolesOfUser,
 } = require("../constants/roles");
@@ -58,13 +59,26 @@ function rolesFromBody(body) {
 // Roles available for assignment (for the role dropdown) plus UI grouping
 // metadata so the Users page can render its left-side role tree without
 // duplicating the group map.
+// The Devices Customer's link: the Refurbished customer whose device sales
+// the login sees (My Devices). Returns the fields to $set, or an error.
+async function devicesLink(db, raw) {
+  if (raw === undefined) return { set: null };
+  if (!raw) return { set: { refurbCustomerId: null, refurbCustomerName: null } };
+  if (!ObjectId.isValid(String(raw))) return { error: "Pick a Refurbished customer for the Devices Customer role" };
+  const rc = await db.collection("refurb_customers").findOne({ _id: new ObjectId(String(raw)) }, { projection: { name: 1 } });
+  if (!rc) return { error: "That Refurbished customer no longer exists" };
+  return { set: { refurbCustomerId: rc._id, refurbCustomerName: rc.name || null } };
+}
+
 router.get("/roles", requireUserAdmin, function (req, res) {
   const data = Object.values(ROLES).map((value) => ({
     value,
     label: ROLE_LABELS[value] || value,
     shopScoped: isShopScopedRole(value),
-    // A staff role an account can hold together with other staff roles.
+    // A role an account can hold together with others — of the same
+    // family: staff with staff, InFlow Customer with Devices Customer.
     combinable: isCombinableRole(value),
+    combineFamily: combineFamilyOf(value),
     group: ROLE_GROUP_OF[value] || null,
   }));
   const groups = Object.values(ROLE_GROUPS).map((value) => ({
@@ -215,13 +229,21 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
     };
 
     // InFlow customer link — an inflow-customer login is scoped to one customer.
-    if (role === "inflow-customer") {
+    if (roles.includes(ROLES.INFLOW_CUSTOMER)) {
       const cname = String(req.body.inflowCustomerName || "").trim();
       doc.inflowCustomerName = cname || null;
       const cust = cname
         ? await db.collection("inflow_customers").findOne({ nameLower: cname.toLowerCase() })
         : null;
       doc.inflowCustomerId = cust ? cust._id : null;
+    }
+
+    // Devices customer link — a devices-customer login sees one Refurbished
+    // customer's device purchases.
+    if (roles.includes(ROLES.DEVICES_CUSTOMER)) {
+      const link = await devicesLink(db, req.body.refurbCustomerId || null);
+      if (link.error) return res.status(400).json({ success: false, message: link.error });
+      Object.assign(doc, link.set);
     }
 
     // Stock source — a phone supplier's stock comes from somewhere, and
@@ -268,9 +290,10 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     }
     if (req.body.active !== undefined) update.active = !!req.body.active;
 
-    // The role list (main role first). Shops and the InFlow customer go by
-    // the main role — the roles that carry them are never combined. The
-    // stock source goes by HOLDING Phone Supplier, which can be.
+    // The role list (main role first). Shops go by the main role — the
+    // roles that carry them are never combined. The stock source, the InFlow
+    // customer and the Devices customer go by HOLDING their role (Phone
+    // Supplier combines with staff, the two customer roles with each other).
     let effectiveRoles = rolesOfUser(existing);
     const nextRoles = rolesFromBody(req.body);
     const rolesChanged = nextRoles !== null;
@@ -304,8 +327,19 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
       update.stockSource = null;
     }
 
+    // Devices customer link — kept while the account holds Devices Customer,
+    // cleared when that role is taken off.
+    if (effectiveRoles.includes(ROLES.DEVICES_CUSTOMER)) {
+      const link = await devicesLink(db, req.body.refurbCustomerId);
+      if (link.error) return res.status(400).json({ success: false, message: link.error });
+      if (link.set) Object.assign(update, link.set);
+    } else if (rolesChanged && existing.refurbCustomerId) {
+      update.refurbCustomerId = null;
+      update.refurbCustomerName = null;
+    }
+
     // InFlow customer link — only meaningful for the inflow-customer role.
-    if (effectiveRole === "inflow-customer" && req.body.inflowCustomerName !== undefined) {
+    if (effectiveRoles.includes(ROLES.INFLOW_CUSTOMER) && req.body.inflowCustomerName !== undefined) {
       const cname = String(req.body.inflowCustomerName || "").trim();
       update.inflowCustomerName = cname || null;
       const cust = cname

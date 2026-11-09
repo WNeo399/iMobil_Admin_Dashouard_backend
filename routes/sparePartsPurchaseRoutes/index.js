@@ -44,6 +44,22 @@
 
 const express = require("express");
 const router = express.Router();
+const { scheduleOnOrderRefresh } = require("../../utils/stockItems");
+
+// Every successful change to lines or batches re-stamps the stock register's
+// on-order figures in the background (user 2026-11-09), so the dashboard's
+// "Nothing on order" / "On order" tiles follow straight away instead of
+// waiting for the next stock refresh. Reads (GET, and the read-only POSTs
+// /byItemIds and /device-terms) don't.
+const LINE_WRITES = /^\/(orders|order-batches|batches)(\/|$)/;
+router.use((req, res, next) => {
+  if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS" && LINE_WRITES.test(req.path)) {
+    res.on("finish", () => {
+      if (res.statusCode < 400) scheduleOnOrderRefresh();
+    });
+  }
+  next();
+});
 const { ObjectId } = require("mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { hasPermission } = require("../../constants/roles");

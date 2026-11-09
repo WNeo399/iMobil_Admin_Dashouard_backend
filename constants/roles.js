@@ -19,6 +19,11 @@ const ROLES = {
   REPAIR_SHOP: "repair-shop",
   // Portal login for an InFlow customer — sees only their own statement.
   INFLOW_CUSTOMER: "inflow-customer",
+  // Portal login for a Refurbished Device customer (2026-11-09, user: "separate
+  // the devices customer into an individual role") — My Devices only: the
+  // devices sold to the refurb customer on their user record. Combinable
+  // with InFlow Customer, nothing else.
+  DEVICES_CUSTOMER: "devices-customer",
   // Supplier login — sees the Refurbished Phones market data + the AI Agent
   // (but not the Agent Skills knowledge base).
   PHONE_SUPPLIER: "phone-supplier",
@@ -59,6 +64,7 @@ const ROLE_LABELS = {
   [ROLES.SHOP_OWNER]: "Repair Shop Owner",
   [ROLES.REPAIR_SHOP]: "Repair Shop",
   [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
+  [ROLES.DEVICES_CUSTOMER]: "Devices Customer",
   [ROLES.PHONE_SUPPLIER]: "Phone Supplier",
   [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
   [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
@@ -101,6 +107,8 @@ const ROLE_GROUP_OF = {
   [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
   [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
   [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
+  // under InFlow in the Users role tree, beside InFlow Customer (user 2026-11-09)
+  [ROLES.DEVICES_CUSTOMER]: ROLE_GROUPS.INFLOW,
   [ROLES.PHONE_SUPPLIER]: ROLE_GROUPS.IMOBILE,
   [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
   [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
@@ -182,6 +190,9 @@ const ROLE_PERMISSIONS = {
   [ROLES.REPAIR_SHOP]: [...SHOP_CASE_PERMISSIONS],
   // InFlow Customer — a portal login for a customer; sees only their statement.
   [ROLES.INFLOW_CUSTOMER]: ["inflow:statement:view"],
+  // Devices Customer — My Devices: the refurb customer's confirmed sales
+  // orders, devices and Blackbelt reports (/inflow/statement/devices*).
+  [ROLES.DEVICES_CUSTOMER]: ["refurb:portal:view"],
   // Phone Supplier — Refurbished Phones market data + the AI Agent chat.
   // Deliberately NOT ai:skills:manage, so the Agent Skills knowledge base
   // stays hidden from suppliers.
@@ -385,13 +396,31 @@ const SHOP_SCOPED_ROLES = [ROLES.SHOP_OWNER, ROLES.REPAIR_SHOP];
 const COMBINABLE_ROLES = Object.values(ROLES).filter(
   (r) => ROLE_GROUP_OF[r] === ROLE_GROUPS.IMOBILE || ROLE_GROUP_OF[r] === ROLE_GROUPS.EXYON || r === ROLES.SQT_CALL_CENTER,
 );
+// The two customer portal roles combine with EACH OTHER only (user
+// 2026-11-09: "users can have both inflow customer and devices customer
+// role") — a customer account never mixes with a staff role.
+const CUSTOMER_COMBINABLE_ROLES = [ROLES.INFLOW_CUSTOMER, ROLES.DEVICES_CUSTOMER];
+
+// Which family a role combines within: "staff", "customer", or null (an
+// account's only role).
+function combineFamilyOf(role) {
+  if (COMBINABLE_ROLES.includes(role)) return "staff";
+  if (CUSTOMER_COMBINABLE_ROLES.includes(role)) return "customer";
+  return null;
+}
 
 function isValidRole(role) {
   return Object.values(ROLES).includes(role);
 }
 
 function isCombinableRole(role) {
-  return COMBINABLE_ROLES.includes(role);
+  return combineFamilyOf(role) !== null;
+}
+
+// Every role of the list from one family (staff with staff, customer with customer).
+function rolesCombine(roles) {
+  const families = new Set(roles.map(combineFamilyOf));
+  return !families.has(null) && families.size === 1;
 }
 
 // Why this list of roles can't be saved on one account, or null when it can.
@@ -401,20 +430,23 @@ function roleSetError(roles) {
   if (roles.length > 1) {
     const single = roles.filter((r) => !isCombinableRole(r));
     if (single.length) {
-      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile and Exyon, and SQT Call Center, can`;
+      return `${single.map((r) => ROLE_LABELS[r] || r).join(", ")} can't be combined with other roles — only the roles under iMobile and Exyon, and SQT Call Center, can (and InFlow Customer with Devices Customer)`;
+    }
+    if (!rolesCombine(roles)) {
+      return "InFlow Customer and Devices Customer combine only with each other, not with staff roles";
     }
   }
   return null;
 }
 
 // The roles a user record holds, main role first. A stored list that breaks
-// the iMobile-only rule (it can only get there by hand) falls back to the
-// main role alone, so a shop / customer role is never widened.
+// the rules (it can only get there by hand) falls back to the main role
+// alone, so a shop / customer role is never widened.
 function rolesOfUser(user) {
   if (!user) return [];
   const extra = Array.isArray(user.roles) ? user.roles : [];
   const all = [...new Set([user.role, ...extra].filter(Boolean))];
-  if (all.length > 1 && !all.every(isCombinableRole)) return [all[0]];
+  if (all.length > 1 && !rolesCombine(all)) return [all[0]];
   return all;
 }
 
@@ -478,6 +510,8 @@ module.exports = {
   ROLE_PERMISSIONS,
   SHOP_SCOPED_ROLES,
   COMBINABLE_ROLES,
+  CUSTOMER_COMBINABLE_ROLES,
+  combineFamilyOf,
   isValidRole,
   isCombinableRole,
   roleSetError,

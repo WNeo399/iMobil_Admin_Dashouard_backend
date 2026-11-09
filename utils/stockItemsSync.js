@@ -130,6 +130,11 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
     // The watermark: where the last run got to; failing that, the newest
     // time the register was confirmed against Zoho; failing that, an hour.
     let since = doc.since ? new Date(doc.since) : null;
+    // A full refresh (Update Now) after that read every item afresh: start
+    // from it (2026-11-09 — the watermark had sat at 21 Sep while only full
+    // refreshes ran, so a first hourly pass would re-read seven weeks).
+    const full = doc.fullRefreshAt ? new Date(doc.fullRefreshAt) : null;
+    if (full && (!since || full > since)) since = full;
     if (!since) {
       const newest = await items.find({}, { projection: { lastSeenAt: 1 } }).sort({ lastSeenAt: -1 }).limit(1).next();
       since = (newest && newest.lastSeenAt) || new Date(startedAt.getTime() - 60 * 60 * 1000);
@@ -320,7 +325,7 @@ async function runStockItemsSync({ log = () => {}, trigger = "schedule" } = {}) 
 // trigger) reads live stock for every active item, so it counts as a sync
 // for the dashboard's "synced N ago" too (user ask 2026-10-06: Update Now
 // resets it). It has a field of its own: the hourly pass's watermark and
-// lock are left alone.
+// lock are left alone (the hourly pass starts from whichever is later).
 async function markFullRefresh(db, at) {
   await db.collection(STATE).updateOne({ _id: STATE_ID }, { $max: { fullRefreshAt: at } }, { upsert: true });
 }
