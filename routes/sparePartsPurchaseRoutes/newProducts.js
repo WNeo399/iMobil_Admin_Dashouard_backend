@@ -941,12 +941,26 @@ async function variantsOf(item) {
   };
 }
 
+// The item's SKU changed in Zoho: our own copies follow — the register row, its
+// `created` entries (Listing / New Products), its Spare Parts Purchase lines and
+// the InFlow SKU map rows pointing to it. → { register, models, purchaseLines, skuMap }
+async function followSkuRename(db, itemId, from, to) {
+  const n = (r) => (r && r.modifiedCount) || 0;
+  return {
+    register: n(await db.collection(ITEMS).updateOne({ itemId }, { $set: { sku: to } })),
+    models: n(await db.collection(MODELS).updateMany({ "created.itemId": itemId }, { $set: { "created.$[e].sku": to } }, { arrayFilters: [{ "e.itemId": itemId }] })),
+    purchaseLines: n(await db.collection("imb_spp_orders").updateMany({ itemId, sku: from }, { $set: { sku: to } })),
+    skuMap: n(await db.collection("inflow_sku_map").updateMany({ imbSku: from }, { $set: { imbSku: to } })),
+  };
+}
+
 // POST /new-products/items/:itemId/variants — more variants for the product
 // of this item. Body (multipart): variants (JSON [{ name }]), itemVariant (the
 // item's own title — needed while its product has no variants: the group
-// gets the attribute, the item that option and " [title]" on its name; its
-// SKU stays), photoVariants (one per file: the variant it is of — the item's
-// own title puts it on this item) + images.
+// gets the attribute, the item that option, " [title]" on its name and
+// "-<title>" on its SKU — every variant is suffixed, the first too: user
+// 2026-11-09, as Create since 2026-11-02), photoVariants (one per file: the
+// variant it is of — the item's own title puts it on this item) + images.
 // Each new variant: the item's base name + [title], SKU <base>-<title>, the
 // item's selling / cost price, category, accounts and Zoho fields; then its
 // photos, the item's price lists (from the register), a register row and a
@@ -993,6 +1007,10 @@ router.post("/items/:itemId/variants", CREATE, acceptManyPhotos, async (req, res
     if (clash) return bad(res, `${clash.name} is already a variant of this product`);
     const baseSku = variantBaseSku(item.sku, itemVariant);
     const baseName = variantBaseName(item.name, itemVariant);
+    // a single product's own item takes its suffix too: 22460 → 22460-Black
+    const wasSingle = !attribute;
+    const ownSku = wasSingle ? `${baseSku}-${itemVariant}` : str(item.sku);
+    if (wasSingle && ownSku !== str(item.sku) && (await skuTaken(ownSku))) return bad(res, `SKU ${ownSku} is already used in Zoho`);
     const long = variants.find((v) => `${baseName} [${v.name}]`.length > 200);
     if (long) return bad(res, `"${baseName} [${long.name}]" is too long (200 characters at most)`);
     for (const v of variants) {
@@ -1002,6 +1020,7 @@ router.post("/items/:itemId/variants", CREATE, acceptManyPhotos, async (req, res
     const db = await connectToDatabase();
     const problems = [];
     let renamedTo = null;
+    let skuRenamed = null; // { from, to, followed } when this item's SKU took its suffix
     // a single product: the attribute and the item's own option first
     if (!attribute) {
       const u = await handleZohoInventoryPutRequest(`${ZOHO}/itemgroups/${encodeURIComponent(groupId)}?organization_id=${ORG}`, {
@@ -1017,15 +1036,23 @@ router.post("/items/:itemId/variants", CREATE, acceptManyPhotos, async (req, res
         return res.status(502).json({ success: false, message: `Zoho: ${why} — nothing was added` });
       }
       attribute = VARIANT_ATTRIBUTE;
-      // its name gets its title; its SKU, stock and store page stay
+      // its name gets its title and its SKU the suffix; its stock and store page stay
       const want = `${item.name} [${itemVariant}]`;
-      if (want.length <= 200) {
-        const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`, { name: want });
+      const body = {};
+      if (want.length <= 200) body.name = want;
+      if (ownSku !== str(item.sku)) body.sku = ownSku;
+      if (Object.keys(body).length) {
+        const r = await handleZohoInventoryPutRequest(`${ZOHO}/items/${encodeURIComponent(itemId)}?organization_id=${ORG}`, body);
         if (r && r.code === 0) {
-          renamedTo = want;
-          await db.collection(ITEMS).updateOne({ itemId }, { $set: { name: want } });
+          if (body.name) {
+            renamedTo = want;
+            await db.collection(ITEMS).updateOne({ itemId }, { $set: { name: want } });
+          }
+          if (body.sku) {
+            skuRenamed = { from: str(item.sku), to: ownSku, followed: await followSkuRename(db, itemId, str(item.sku), ownSku) };
+          }
         } else {
-          problems.push(`${item.sku}: the name did not change (${(r && r.message) || "no answer"})`);
+          problems.push(`${item.sku}: the name and SKU did not change (${(r && r.message) || "no answer"})`);
         }
       }
     }
@@ -1034,7 +1061,7 @@ router.post("/items/:itemId/variants", CREATE, acceptManyPhotos, async (req, res
     const ownFiles = ownTitle ? photos.byVariant.get(ownTitle.toLowerCase()) || [] : [];
     if (ownFiles.length) {
       const hadImage = !!item.image_document_id || (item.documents || []).some((d) => d && d.document_id);
-      const p = await uploadItemPhotos(itemId, ownFiles, { sku: item.sku, inventoryOnly: true, primary: !hadImage });
+      const p = await uploadItemPhotos(itemId, ownFiles, { sku: skuRenamed ? skuRenamed.to : item.sku, inventoryOnly: true, primary: !hadImage });
       if (p.error) problems.push(`${item.sku} photos: ${p.error}`);
       else if (!hadImage && p.imageId) await db.collection(ITEMS).updateOne({ itemId }, { $set: { imageId: p.imageId } });
     }
@@ -1113,11 +1140,11 @@ router.post("/items/:itemId/variants", CREATE, acceptManyPhotos, async (req, res
       await db.collection(MODELS).updateMany({ _id: { $in: models.map((m) => m._id) } }, { $push: { created: { $each: entries } }, $set: { updatedAt: now } });
     }
     await db.collection(ITEM_EDITS).insertOne({
-      itemId, sku: item.sku, action: "variants", itemVariant, renamedTo,
+      itemId, sku: item.sku, action: "variants", itemVariant, renamedTo, skuRenamed,
       added: added.map((a) => ({ itemId: a.itemId, sku: a.sku, variant: a.variant })), problems, at: now, by: actor(req),
     });
-    if (!added.length) return res.status(502).json({ success: false, message: `Zoho added no variant: ${problems.join("; ")}`, itemVariant, renamedTo });
-    return res.json({ success: true, product: { groupId, name: group.group_name || "" }, itemVariant, renamedTo, added, problems });
+    if (!added.length) return res.status(502).json({ success: false, message: `Zoho added no variant: ${problems.join("; ")}`, itemVariant, renamedTo, skuRenamed });
+    return res.json({ success: true, product: { groupId, name: group.group_name || "" }, itemVariant, renamedTo, skuRenamed, added, problems });
   } catch (error) {
     next(error);
   }
