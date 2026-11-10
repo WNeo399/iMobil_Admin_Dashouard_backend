@@ -120,6 +120,8 @@ async function askBlackbelt(code) {
           batteryCapacity: d.batteryCapacity || "",
           aNumber: d.aNumber || "",
           reportStatus: d.reportStatus || "",
+          // FAIL tests in the report — any one = Blackbelt status "Warning"
+          failedTests: d.failedTests || [],
         },
       };
     }
@@ -177,19 +179,26 @@ async function applyBlackbeltToRegister(db, code, result, by) {
     const changes = Object.entries(answered).filter(([f, v]) => d[f] !== v);
     const newlyChecked = d.blackbeltChecked !== true;
     const reportChanged = !!result.bbReportId && d.blackbeltReportId !== result.bbReportId;
-    if (!changes.length && !newlyChecked && !reportChanged) continue;
+    // Line snapshots from before the FAIL check carry no list — leave the
+    // device's as it is then.
+    const failedKnown = Array.isArray(bb.failedTests);
+    const failsChanged = failedKnown && (d.blackbeltFailedTests || []).join("|") !== bb.failedTests.join("|");
+    const failsNew = failedKnown && !Array.isArray(d.blackbeltFailedTests);
+    if (!changes.length && !newlyChecked && !reportChanged && !failsChanged && !failsNew) continue;
 
     const $set = { ...answered, blackbeltChecked: true, updatedAt: now };
     if (result.bbReportId) $set.blackbeltReportId = result.bbReportId;
     if (bb.reportStatus) $set.blackbeltStatus = bb.reportStatus;
+    if (failedKnown) $set.blackbeltFailedTests = bb.failedTests;
 
     const described = changes
       .filter(([f]) => ["model", "color", "storage", "brand"].includes(f))
       .map(([f, v]) => `${f} → ${v}`)
       .join(", ");
-    const action = described
+    const warned = failedKnown && bb.failedTests.length && failsChanged ? ` · Warning: FAIL ${bb.failedTests.join(", ")}` : "";
+    const action = (described
       ? `Blackbelt check updated ${described}`
-      : "Blackbelt check confirmed the device details";
+      : "Blackbelt check confirmed the device details") + warned;
 
     await db.collection(DEVICES).updateOne(
       { _id: d._id },
@@ -774,6 +783,7 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       blackbeltChecked: l.bbStatus === "found",
       blackbeltReportId: l.bbReportId || "",
       blackbeltStatus: bb.reportStatus || "",
+      ...(Array.isArray(bb.failedTests) ? { blackbeltFailedTests: bb.failedTests } : {}),
       note: "",
       incomingBatchId: batch._id,
       history,
@@ -819,6 +829,11 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
           blackbeltChecked: held.blackbeltChecked === true || doc.blackbeltChecked,
           blackbeltReportId: doc.blackbeltReportId || held.blackbeltReportId || "",
           blackbeltStatus: doc.blackbeltStatus || held.blackbeltStatus || "",
+          ...(Array.isArray(doc.blackbeltFailedTests)
+            ? { blackbeltFailedTests: doc.blackbeltFailedTests }
+            : Array.isArray(held.blackbeltFailedTests)
+              ? { blackbeltFailedTests: held.blackbeltFailedTests }
+              : {}),
           location,
           status: doc.status,
           salesOrder: doc.salesOrder,

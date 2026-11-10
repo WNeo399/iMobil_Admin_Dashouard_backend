@@ -162,6 +162,10 @@ function parseReport(xml) {
     // The analyst verdict ("All Tests Passed", or the operator profile's
     // failure text) — worth keeping on the register.
     reportStatus: str(findField(tree, "Status")),
+    // Tests in the report's Device Testing Information that came back FAIL
+    // (user 2026-11-10): any one makes the device's Blackbelt status
+    // "Warning". NOT TESTED / NOT SUPPORTED don't count.
+    failedTests: failedTestsOf(collectTests(tree)),
   };
   // A report with nothing identifying in it is no use to the caller.
   if (!data.modelName && !data.brandName && !data.imei && !data.serialNumber) return null;
@@ -276,6 +280,29 @@ function findNode(node, name, depth = 0) {
   return undefined;
 }
 
+// The report's Device Testing Information: anything in the tree whose value
+// reads like a verdict is a test row — the field set varies by device type,
+// so collect rather than enumerate. [{ name, result }], first value wins.
+function collectTests(tree) {
+  const tests = new Map();
+  (function walk(node, depth) {
+    if (node == null || typeof node !== "object" || depth > 12) return;
+    for (const [key, value] of Object.entries(node)) {
+      if (typeof value === "string" && TEST_VALUES.has(value.trim().toUpperCase())) {
+        if (!tests.has(key)) tests.set(key, value.trim());
+      } else if (value && typeof value === "object") {
+        walk(value, depth + 1);
+      }
+    }
+  })(tree, 0);
+  return [...tests].map(([name, result]) => ({ name, result }));
+}
+
+// Names of the tests that came back FAIL ([] when none did).
+function failedTestsOf(tests) {
+  return (tests || []).filter((t) => String(t.result).trim().toUpperCase() === "FAIL").map((t) => t.name);
+}
+
 function parseReportDetail(xml) {
   const tree = parser.parse(xml);
   const f = (name) => str(findField(tree, name));
@@ -331,19 +358,7 @@ function parseReportDetail(xml) {
     profileName: f("ProfileName"),
   };
 
-  // Anything in the tree whose value reads like a verdict is a test row —
-  // the field set varies by device type, so collect rather than enumerate.
-  const tests = new Map();
-  (function walk(node, depth) {
-    if (node == null || typeof node !== "object" || depth > 12) return;
-    for (const [key, value] of Object.entries(node)) {
-      if (typeof value === "string" && TEST_VALUES.has(value.trim().toUpperCase())) {
-        if (!tests.has(key)) tests.set(key, value.trim());
-      } else if (value && typeof value === "object") {
-        walk(value, depth + 1);
-      }
-    }
-  })(tree, 0);
+  const tests = collectTests(tree);
 
   // Genuine-parts check: PartsReplaced.<platform>.<Part>
   const parts = [];
@@ -368,7 +383,7 @@ function parseReportDetail(xml) {
     testCaseFails: toInt(findField(tree, "TestCaseFails")),
     device,
     battery,
-    tests: [...tests].map(([name, result]) => ({ name, result })),
+    tests,
     parts,
     analyst,
   };
@@ -442,4 +457,4 @@ async function lookupDevice(code) {
   }
 }
 
-module.exports = { lookupDevice, fetchReportDetail, isImei, isConfigured };
+module.exports = { lookupDevice, fetchReportDetail, isImei, isConfigured, failedTestsOf };

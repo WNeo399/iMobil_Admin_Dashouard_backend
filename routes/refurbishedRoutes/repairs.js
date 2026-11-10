@@ -121,6 +121,8 @@ async function askBlackbelt(code) {
           batteryCapacity: d.batteryCapacity || "",
           aNumber: d.aNumber || "",
           reportStatus: d.reportStatus || "",
+          // FAIL tests in the report — any one = Blackbelt status "Warning"
+          failedTests: d.failedTests || [],
         },
       };
     }
@@ -156,6 +158,7 @@ function repairingGhost(line, { batchId, stockSource, currency, title, who, now 
     blackbeltChecked: line.bbStatus === "found",
     blackbeltReportId: line.bbReportId || "",
     blackbeltStatus: bb.reportStatus || "",
+    ...(Array.isArray(bb.failedTests) ? { blackbeltFailedTests: bb.failedTests } : {}),
     note: "",
     repairBatchId: batchId,
     history: [{ at: now, by: who, action: "created", note: `Uploaded on repair batch ${title}` }],
@@ -292,6 +295,9 @@ router.post("/", MANAGE, async (req, res) => {
                 batteryCapacity: str(r.bbDevice.batteryCapacity, 40),
                 aNumber: str(r.bbDevice.aNumber, 40),
                 reportStatus: str(r.bbDevice.reportStatus, 200),
+                ...(Array.isArray(r.bbDevice.failedTests)
+                  ? { failedTests: r.bbDevice.failedTests.map((t) => str(t, 60)).filter(Boolean).slice(0, 50) }
+                  : {}),
               }
             : null,
         // Filled when the batch is matched against the register.
@@ -934,6 +940,7 @@ router.post("/:id/return", MANAGE, async (req, res, next) => {
             blackbeltChecked: l.bbStatus === "found",
             blackbeltReportId: l.bbReportId || "",
             blackbeltStatus: bb.reportStatus || "",
+            ...(Array.isArray(bb.failedTests) ? { blackbeltFailedTests: bb.failedTests } : {}),
             note: l.issues ? `Repaired: ${l.issues}` : "",
             repairBatchId: batch._id,
             history: [

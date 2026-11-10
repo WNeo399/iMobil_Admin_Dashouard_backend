@@ -125,6 +125,7 @@ function diffDevice(existing, set) {
     const empty = (v) => v === null || v === undefined || v === "";
     let same;
     if (k === "blackbeltChecked") same = !!before === !!after;
+    else if (Array.isArray(before) || Array.isArray(after)) same = (before || []).join("|") === (after || []).join("|");
     else if (empty(before) && empty(after)) same = true;
     else same = before === after;
     if (!same) changes.push({ field: k, from: empty(before) ? null : before, to: empty(after) ? null : after });
@@ -160,7 +161,18 @@ function buildDevice(body, { partial = false } = {}) {
   if (!partial || body.aNumber !== undefined) set("aNumber", str(body.aNumber, 40));
   if (!partial || body.blackbeltReportId !== undefined) set("blackbeltReportId", str(body.blackbeltReportId, 120));
   if (!partial || body.blackbeltStatus !== undefined) set("blackbeltStatus", str(body.blackbeltStatus, 200));
+  // The report's FAIL tests, as the lookup answered them (any = "Warning").
+  // Left off when not sent: a missing field means "not evaluated yet".
+  const failed = failedTestsList(body.blackbeltFailedTests);
+  if (failed) doc.blackbeltFailedTests = failed;
   return doc;
+}
+
+// A list of test names (the lookup's blackbeltFailedTests), tidied; null
+// when the value isn't a list at all.
+function failedTestsList(v) {
+  if (!Array.isArray(v)) return null;
+  return v.map((t) => String(t == null ? "" : t).trim().slice(0, 60)).filter(Boolean).slice(0, 50);
 }
 
 // ── GET /refurbished/devices ────────────────────────────────────────
@@ -477,6 +489,8 @@ router.get("/lookup", VIEW, async (req, res) => {
       blackbeltChecked: true,
       blackbeltReportId: r.reportID || "",
       blackbeltStatus: d.reportStatus || "",
+      // FAIL tests in the report — any one = Blackbelt status "Warning"
+      blackbeltFailedTests: d.failedTests || [],
       device: {
         // Keep the scanned code as the register's key — the report's own
         // IMEI field is blank for serial-number lookups.
@@ -583,6 +597,7 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
       blackbeltChecked: true,
       blackbeltReportId: r.reportID || "",
       blackbeltStatus: d.reportStatus || "",
+      blackbeltFailedTests: d.failedTests || [],
       updatedAt: new Date(),
       updatedBy: (req.user && req.user.username) || null,
     };
@@ -641,6 +656,7 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
       corrected.length ? `corrected ${corrected.map((c) => c.label).join(", ")}` : "",
       blank.length ? `this report has no ${blank.join(" or ")}` : "",
     ].filter(Boolean);
+    if (set.blackbeltFailedTests.length) parts.push(`Warning: FAIL ${set.blackbeltFailedTests.join(", ")}`);
     const message = `Report found — ${parts.join(" · ") || "everything already matches"}`;
 
     const changes = diffDevice(existing, set);

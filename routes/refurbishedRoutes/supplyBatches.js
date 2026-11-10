@@ -649,6 +649,7 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
               batteryCapacity: d.batteryCapacity || "",
               aNumber: d.aNumber || "",
               reportStatus: d.blackbeltStatus || "",
+              ...(Array.isArray(d.blackbeltFailedTests) ? { failedTests: d.blackbeltFailedTests } : {}),
             }
           : null,
         received: false,
