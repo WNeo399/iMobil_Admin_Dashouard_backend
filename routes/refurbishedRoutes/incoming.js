@@ -500,7 +500,7 @@ router.get("/:id", MANAGE, async (req, res) => {
             .collection(DEVICES)
             .find(
               { $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] },
-              { projection: { imei: 1, costPrice: 1, currency: 1, supplierPrice: 1, supplierCurrency: 1 } },
+              { projection: { imei: 1, costPrice: 1, currency: 1, supplierPrice: 1, supplierCurrency: 1, blackbeltFailedTests: 1 } },
             )
             .toArray()
         : [];
@@ -522,7 +522,15 @@ router.get("/:id", MANAGE, async (req, res) => {
       if (ourPrice == null && d && d.supplierPrice != null && d.costPrice != null) {
         ourPrice = d.costPrice; // split device: its register cost is OURS (AUD)
       }
-      return { ...l, ourPrice, supplierPriceLive, supplierCurrencyLive };
+      // Blackbelt "Warning" (2026-11-10): the register's FAIL tests where the
+      // unit is on it (current standing), else the line's own lookup.
+      const bbFailedTests =
+        d && Array.isArray(d.blackbeltFailedTests)
+          ? d.blackbeltFailedTests
+          : l.bbDevice && Array.isArray(l.bbDevice.failedTests)
+            ? l.bbDevice.failedTests
+            : [];
+      return { ...l, ourPrice, supplierPriceLive, supplierCurrencyLive, bbFailedTests };
     });
 
     return res.json({

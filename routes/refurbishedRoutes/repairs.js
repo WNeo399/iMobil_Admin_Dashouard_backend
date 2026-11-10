@@ -226,7 +226,31 @@ router.get("/:id", VIEW, async (req, res) => {
   try {
     const ctx = await loadBatch(req, res);
     if (!ctx) return;
-    return res.json({ success: true, batch: { ...ctx.batch, summary: summarize(ctx.batch) } });
+    // Blackbelt "Warning" (2026-11-10): each line's FAIL tests — the
+    // register's where the unit is on it (current standing), else the
+    // line's own lookup. Read-only; the stored lines are left alone.
+    const lines = ctx.batch.lines || [];
+    const ids = lines.map((l) => l.deviceId).filter((x) => x && ObjectId.isValid(String(x))).map((x) => new ObjectId(String(x)));
+    const codes = lines.map((l) => l.code).filter(Boolean);
+    const devs = ids.length || codes.length
+      ? await ctx.db
+          .collection(DEVICES)
+          .find({ $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] }, { projection: { imei: 1, blackbeltFailedTests: 1 } })
+          .toArray()
+      : [];
+    const byId = new Map(devs.map((d) => [String(d._id), d]));
+    const byImei = new Map(devs.map((d) => [d.imei, d]));
+    const shaped = lines.map((l) => {
+      const d = (l.deviceId && byId.get(String(l.deviceId))) || byImei.get(l.code) || null;
+      const bbFailedTests =
+        d && Array.isArray(d.blackbeltFailedTests)
+          ? d.blackbeltFailedTests
+          : l.bbDevice && Array.isArray(l.bbDevice.failedTests)
+            ? l.bbDevice.failedTests
+            : [];
+      return { ...l, bbFailedTests };
+    });
+    return res.json({ success: true, batch: { ...ctx.batch, lines: shaped, summary: summarize(ctx.batch) } });
   } catch (e) {
     console.error("Get repair batch error:", e);
     return res.status(500).json({ success: false, message: "Failed to load the repair batch" });

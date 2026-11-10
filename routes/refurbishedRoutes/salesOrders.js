@@ -159,14 +159,20 @@ router.get("/:id", VIEW, async (req, res) => {
       const devs = await db
         .collection("refurb_devices")
         .find({ _id: { $in: ids.map((x) => new ObjectId(String(x))) } })
-        .project({ blackbeltChecked: 1, blackbeltStatus: 1, blackbeltReportId: 1 })
+        .project({ blackbeltChecked: 1, blackbeltStatus: 1, blackbeltReportId: 1, blackbeltFailedTests: 1 })
         .toArray();
       const byId = new Map(devs.map((d) => [String(d._id), d]));
       for (const l of order.lines) {
         const d = byId.get(String(l.deviceId));
         l.blackbelt = d
-          ? { checked: d.blackbeltChecked === true, status: d.blackbeltStatus || "", hasReport: !!d.blackbeltReportId }
-          : { checked: false, status: "", hasReport: false, missing: true };
+          ? {
+              checked: d.blackbeltChecked === true,
+              status: d.blackbeltStatus || "",
+              hasReport: !!d.blackbeltReportId,
+              // FAIL tests in the report — any one = Blackbelt "Warning" (2026-11-10)
+              failedTests: Array.isArray(d.blackbeltFailedTests) ? d.blackbeltFailedTests : [],
+            }
+          : { checked: false, status: "", hasReport: false, missing: true, failedTests: [] };
       }
     }
     return res.json({ success: true, order });

@@ -1140,6 +1140,7 @@ router.get("/statement/devices", DEVICES_PORTAL, async (req, res) => {
                 blackbeltChecked: 1,
                 blackbeltStatus: 1,
                 blackbeltReportId: 1,
+                blackbeltFailedTests: 1,
                 batteryCycleCount: 1,
                 batteryCapacity: 1,
                 aNumber: 1,
@@ -1177,6 +1178,8 @@ router.get("/statement/devices", DEVICES_PORTAL, async (req, res) => {
           bbChecked: reg.blackbeltChecked === true,
           bbStatus: reg.blackbeltStatus || "",
           bbReportId: reg.blackbeltReportId || "",
+          // FAIL tests in the report — any one = Blackbelt "Warning" (2026-11-10)
+          bbFailedTests: Array.isArray(reg.blackbeltFailedTests) ? reg.blackbeltFailedTests : [],
           batteryCycleCount: reg.batteryCycleCount != null ? reg.batteryCycleCount : null,
           batteryCapacity: reg.batteryCapacity || "",
           aNumber: reg.aNumber || "",
