@@ -8,7 +8,8 @@
 //
 //   GET    /website/banners             list, in carousel order
 //   POST   /website/banners             create (multipart: desktop, tablet,
-//                                       mobile images + title/link/newTab/active)
+//                                       mobile images + title/link/newTab/active,
+//                                       optional startAt/endAt — utils/webBannerSchedule)
 //   PUT    /website/banners/order       save the order { ids: [...] }
 //   PUT    /website/banners/:id         update fields; any image may be
 //                                       replaced (multipart, same names)
@@ -36,6 +37,7 @@ const { requirePermission } = require("../../middleware/auth");
 const { getCarouselSettings, saveCarouselSettings } = require("../../utils/webBannerSettings");
 const { getCatalog } = require("../../utils/sparePartsCatalog");
 const { cleanLink } = require("../../utils/webLink");
+const { scheduleOf } = require("../../utils/webBannerSchedule");
 
 const VIEW = requirePermission("web:banner:view");
 const MANAGE = requirePermission("web:banner:manage");
@@ -177,6 +179,8 @@ router.post("/banners", MANAGE, async (req, res) => {
     const title = str(req.body.title, 160);
     if (!title) return res.status(400).json({ success: false, message: "A title is required" });
     const link = cleanLink(req.body.link);
+    // checked before any image is stored
+    const schedule = scheduleOf(req.body);
 
     const _id = new ObjectId();
     const images = {};
@@ -195,6 +199,8 @@ router.post("/banners", MANAGE, async (req, res) => {
       link,
       newTab: bool(req.body.newTab, false),
       active: bool(req.body.active, true),
+      startAt: schedule.startAt || null,
+      endAt: schedule.endAt || null,
       order: last && Number.isFinite(last.order) ? last.order + 1 : 0,
       images,
       createdAt: now,
@@ -264,6 +270,7 @@ router.put("/banners/:id", MANAGE, async (req, res) => {
     if (body.link !== undefined) set.link = cleanLink(body.link);
     if (body.newTab !== undefined) set.newTab = bool(body.newTab, false);
     if (body.active !== undefined) set.active = bool(body.active, true);
+    Object.assign(set, scheduleOf(body, banner));
 
     const files = filesOf(req);
     const replaced = [];

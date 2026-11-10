@@ -1,6 +1,7 @@
 // Public read endpoint for the Banner Carousel widget (iMobile website).
 //
-//   GET /widget/bannerCarousel/banners   the active banners, in order, and
+//   GET /widget/bannerCarousel/banners   the active banners inside their
+//                                         period (if one is set), in order, and
 //                                         the display settings (max height /
 //                                         max width, set on the Banner page)
 //
@@ -19,6 +20,7 @@ var router = express.Router();
 const { connectToDatabase } = require("../../utils/mongodb");
 const { getAllowedOrigins } = require("../../utils/widgetOrigins");
 const { getCarouselSettings } = require("../../utils/webBannerSettings");
+const { showingNowFilter } = require("../../utils/webBannerSchedule");
 
 const WIDGET_NAME = "banner-carousel";
 const BANNERS = "imb_web_banners";
@@ -64,7 +66,7 @@ router.get("/banners", widgetCors, async (req, res) => {
     const db = await connectToDatabase();
     const rows = await db
       .collection(BANNERS)
-      .find({ active: true })
+      .find(showingNowFilter(new Date()))
       .sort({ order: 1, createdAt: 1 })
       .limit(50)
       .toArray();
@@ -86,7 +88,8 @@ router.get("/banners", widgetCors, async (req, res) => {
         };
       });
 
-    // A banner change shows on the site within a minute.
+    // A banner change — or a period starting or ending — shows on the site
+    // within a minute.
     res.set("Cache-Control", "public, max-age=60");
     return res.json({ success: true, banners, settings: await getCarouselSettings(db) });
   } catch (e) {
