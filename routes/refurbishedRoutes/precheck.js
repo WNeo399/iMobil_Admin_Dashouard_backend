@@ -141,6 +141,11 @@ router.get("/", VIEW, async (req, res) => {
     }
     const supplierId = str(req.query.supplierId, 40);
     if (supplierId && ObjectId.isValid(supplierId)) match["supplier.id"] = new ObjectId(supplierId);
+    // one repairer's devices (in repair or processed), or "none" = not with
+    // any repairer (user 2026-11-11)
+    const repairerId = str(req.query.repairerId, 40);
+    if (repairerId === "none") match["repairer.id"] = null;
+    else if (repairerId && ObjectId.isValid(repairerId)) match["repairer.id"] = new ObjectId(repairerId);
     // added=yes / no: in Stock already, or still to go
     if (req.query.added === "yes") match.addedToStock = { $exists: true };
     if (req.query.added === "no") match.addedToStock = { $exists: false };
