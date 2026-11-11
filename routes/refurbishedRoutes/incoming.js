@@ -543,6 +543,44 @@ router.get("/:id", MANAGE, async (req, res) => {
   }
 });
 
+// ── GET /refurbished/incoming/:id/report?code= ──────────────────────
+// The full Blackbelt report for one line of this batch — the stock-take
+// dialog's Blackbelt column opens it (2026-11-10). Only a code that is on
+// the batch is served. The register's report id wins (a later re-check may
+// have found a newer report, and the Warning icon reads the register too),
+// else the line's own lookup. Same answer shape as GET /devices/:id/report.
+router.get("/:id/report", MANAGE, async (req, res) => {
+  try {
+    const ctx = await loadBatch(req, res);
+    if (!ctx) return;
+    const { db, batch } = ctx;
+    const code = normalizeCode(req.query.code);
+    const line = code ? (batch.lines || []).find((l) => l.code === code) : null;
+    if (!line) return res.status(404).json({ success: false, message: "That device is not on this batch" });
+
+    const device = await db
+      .collection(DEVICES)
+      .findOne(
+        line.deviceId && ObjectId.isValid(String(line.deviceId)) ? { _id: new ObjectId(String(line.deviceId)) } : { imei: code },
+        { projection: { blackbeltReportId: 1 } },
+      );
+    const reportId = String((device && device.blackbeltReportId) || line.bbReportId || "");
+    if (!reportId) {
+      return res.json({ success: true, hasReport: false, message: "No Blackbelt report recorded for this device." });
+    }
+    const r = await blackbelt.fetchReportDetail(reportId);
+    if (r.notConfigured) {
+      return res.json({ success: true, hasReport: false, message: "Blackbelt credentials aren't set on the server." });
+    }
+    if (r.error) return res.json({ success: true, hasReport: false, message: r.error });
+    if (!r.found) return res.json({ success: true, hasReport: false, message: "Blackbelt no longer returns this report." });
+    return res.json({ success: true, hasReport: true, reportId, report: r.report });
+  } catch (e) {
+    console.error("Incoming line report error:", e);
+    return res.status(500).json({ success: false, message: "Failed to load the report" });
+  }
+});
+
 // ── POST /refurbished/incoming/:id/commit ───────────────────────────
 // Body: { codes: [...], grades: { code: grade }, location } — every code
 // the warehouse scanned this session, grades picked in the dialog for lines
