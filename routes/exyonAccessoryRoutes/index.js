@@ -25,6 +25,10 @@
 //   POST /exyon-accessories/orders/:orderId/cancel { reason, note?, dryRun? } — the whole order Cancelled in Neto
 
 //   PUT  /exyon-accessories/envelopes/:sku { size } — an item's envelope chosen by hand ("" = the rules)
+//   PUT  /exyon-accessories/orders/:orderId/envelope { size } — one order's envelope ("" = automatic);
+//        not for a processed order (that one changes with a new tracking number:)
+//   POST /exyon-accessories/pick-lists/:day/envelope { orderId, size, tracking } — a processed order's
+//        envelope + its new tracking number (a live AusPost label is cancelled)
 
 var express = require("express");
 var router = express.Router();
@@ -696,6 +700,77 @@ router.post("/pick-lists/:day/tracking", PICK_EDIT, async function (req, res) {
   }
 });
 
+// A processed order's envelope changed (user 2026-11-12: "on pick list allow
+// update the Envelope size as well … need to input a new tracking number as
+// well") — a new envelope is a new label, so the size and the new number go
+// together. Same refusals as the tracking number (dispatched, a number another
+// order has, a bad format), plus: not processed yet (no number to replace —
+// the plain envelope choice is for that), the same size, the same number. A
+// live AusPost label is the old envelope's: it is cancelled in AusPost first
+// (only before lodging — if AusPost refuses, nothing changes). The size is
+// kept as the order's own choice (exyon_envelope_order_overrides).
+//   POST /pick-lists/:day/envelope { orderId, size, tracking }
+//     → { orderId, size, was, tracking, wasTracking, auspostCancelled }
+router.post("/pick-lists/:day/envelope", PICK_EDIT, async function (req, res) {
+  const bad = (message, code = 400) => res.status(code).json({ success: false, message });
+  try {
+    const day = String(req.params.day || "");
+    const orderId = String((req.body && req.body.orderId) || "").trim();
+    const size = String((req.body && req.body.size) || "").trim().toLowerCase();
+    const tracking = String((req.body && req.body.tracking) || "").replace(/\s+/g, "");
+    if (!DAY_RE.test(day) || !orderId) return bad("Which order?");
+    if (!ENVELOPE_SIZES.includes(size)) return bad("Small, Medium, Large or Other");
+    if (!TRACKING_RE.test(tracking)) return bad(`"${tracking}" doesn't look like a tracking number`);
+    const col = await pickLists();
+    const on = await col.findOne({ day, ...LIVE_LIST }, { projection: { orders: { $elemMatch: { orderId } } } });
+    const entry = on && on.orders && on.orders[0];
+    if (!entry) return bad("That order is not on this list", 404);
+    if (dispatchStatusOf(entry) === "dispatched") return bad(`${orderId} is already dispatched — its envelope and tracking number stay`);
+    if (!entry.tracking) return bad(`${orderId} is not processed yet — choose its envelope, then process it`);
+    if (entry.tracking === tracking) return bad("A new envelope needs a new label — scan the new tracking number");
+    const ord = await orderEnvelopes([orderId]);
+    const was = envelopeOf(entry.items || [], await envelopeOverrides(), ord.get(orderId)).size;
+    if (was === size) return bad(`${orderId} is a ${size} envelope already — to change only the tracking number, use the pencil`);
+    const clash = await col.findOne({ ...LIVE_LIST, orders: { $elemMatch: { tracking, orderId: { $ne: orderId } } } }, { projection: { day: 1, orders: { $elemMatch: { tracking } } } });
+    if (clash) return bad(`${tracking} is already the tracking number of ${clash.orders[0].orderId} (${clash.day})`);
+    const now = new Date();
+    const by = actor(req);
+
+    // the old envelope's AusPost label goes first (nothing else changes if it can't)
+    let auspostCancelled = "";
+    const ap = (await auspostOf([orderId])).get(orderId);
+    if (ap) {
+      if (!auspost.configured()) return bad("Australia Post isn't set up — its AusPost label can't be cancelled", 503);
+      try {
+        await auspost.deleteShipment(ap.shipmentId);
+      } catch (e) {
+        return bad(`Could not cancel its AusPost label ${ap.articleId}: ${e.message}`, 502);
+      }
+      await (await auspostCol()).updateOne({ _id: ap._id }, { $set: { live: false, status: "deleted", deletedAt: now, deletedBy: by, deletedWhy: `envelope changed to ${size}` } });
+      auspostCancelled = ap.articleId;
+    }
+
+    await (await connectToDatabase()).collection(ORDER_ENVELOPES)
+      .updateOne({ _id: orderId }, { $set: { size, setAt: now, setBy: by } }, { upsert: true });
+    const r = await col.updateOne(
+      { day, ...LIVE_LIST, "orders.orderId": orderId },
+      {
+        $set: {
+          "orders.$.tracking": tracking, "orders.$.trackingChangedAt": now, "orders.$.trackingChangedBy": by,
+          "orders.$.envelope": size, "orders.$.envelopeChangedAt": now, "orders.$.envelopeChangedBy": by,
+          updatedAt: now, updatedBy: by,
+        },
+        $push: { history: { at: now, by, action: "envelope changed", orderId, size, was, tracking, wasTracking: entry.tracking, ...(auspostCancelled ? { auspostCancelled } : {}) } },
+      },
+    );
+    if (!r.modifiedCount) return bad("That order is not on this list", 404);
+    return res.json({ success: true, orderId, size, was, tracking, wasTracking: entry.tracking, auspostCancelled });
+  } catch (error) {
+    console.error("Exyon pick list envelope error:", error);
+    return res.status(502).json({ success: false, message: error.message || "Failed to change the envelope" });
+  }
+});
+
 // Processed on the Dispatch page (user 2026-10-08): each order with the
 // tracking number scanned for it goes on today's pick list — or, already on
 // a list, gets the tracking number there. Exyon / Neto are not touched yet:
@@ -1060,6 +1135,7 @@ router.post("/auspost/labels", PICK_EDIT, async function (req, res) {
     const have = await auspostOf(ids);
     const open = new Map((await openOrders()).map((o) => [o.orderId, o]));
     const envSet = await envelopeOverrides();
+    const ordEnv = await orderEnvelopes(ids);
     const results = new Map();
     const fresh = [];
     for (const a of asked) {
@@ -1067,7 +1143,7 @@ router.post("/auspost/labels", PICK_EDIT, async function (req, res) {
       if (reprintOnly) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: "has no AusPost label to print — make it in Process" }); continue; }
       const o = open.get(a.orderId);
       if (!o) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: "no longer an open order — refresh the page" }); continue; }
-      const size = a.envelope || envelopeOf(o.items, envSet).size;
+      const size = a.envelope || envelopeOf(o.items, envSet, ordEnv.get(a.orderId)).size;
       if (!AUSPOST_SIZES.includes(size)) { results.set(a.orderId, { orderId: a.orderId, ok: false, error: `a ${size} envelope doesn't take an AusPost label` }); continue; }
       fresh.push({ ...a, order: o });
     }
@@ -1301,6 +1377,47 @@ router.put("/envelopes/:sku", PICK_EDIT, async function (req, res) {
   }
 });
 
+// One ORDER's envelope chosen by hand (user 2026-11-12: "allow update the
+// Envelope for multiple line items as well") — it wins over the rules and the
+// items' choices, for that order only. Mongo exyon_envelope_order_overrides
+// { _id: orderId, size, setAt, setBy }. A processed order (tracking number on
+// its pick list) changes only with a new tracking number
+// (POST /pick-lists/:day/envelope); a dispatched one not at all. An order with
+// a live AusPost label keeps an AusPost size (Large / Other) until the label
+// is cancelled.
+const ORDER_ENVELOPES = "exyon_envelope_order_overrides";
+async function orderEnvelopes(orderIds) {
+  if (!orderIds.length) return new Map();
+  const db = await connectToDatabase();
+  const rows = await db.collection(ORDER_ENVELOPES).find({ _id: { $in: orderIds } }, { projection: { size: 1 } }).toArray();
+  return new Map(rows.map((r) => [String(r._id), r.size]));
+}
+
+router.put("/orders/:orderId/envelope", PICK_EDIT, async function (req, res) {
+  const bad = (message, code = 400) => res.status(code).json({ success: false, message });
+  try {
+    const orderId = String(req.params.orderId || "").trim();
+    if (!orderId) return bad("Which order?");
+    let size = String((req.body && req.body.size) || "").trim().toLowerCase();
+    if (size === "auto") size = "";
+    if (size && !ENVELOPE_SIZES.includes(size)) return bad("Small, Medium, Large or Other");
+    const known = await exQuery(`SELECT 1 AS ok FROM ${TABLE} WHERE order_id = ? LIMIT 1`, [orderId]);
+    if (!known.length) return bad(`No order ${orderId}`, 404);
+    const entry = (await pickEntriesOf([orderId])).get(orderId);
+    if (entry && dispatchStatusOf(entry) === "dispatched") return bad(`${orderId} is already dispatched — its envelope stays`);
+    if (entry && entry.tracking) return bad(`${orderId} is processed — change its envelope together with a new tracking number`);
+    const ap = (await auspostOf([orderId]).catch(() => new Map())).get(orderId);
+    if (ap && !AUSPOST_SIZES.includes(size)) return bad(`${orderId} has an AusPost label (${ap.articleId}) — cancel it first, or keep Large / Other`);
+    const col = (await connectToDatabase()).collection(ORDER_ENVELOPES);
+    if (!size) await col.deleteOne({ _id: orderId });
+    else await col.updateOne({ _id: orderId }, { $set: { size, setAt: new Date(), setBy: actor(req) } }, { upsert: true });
+    return res.json({ success: true, orderId, size: size || null });
+  } catch (error) {
+    console.error("Exyon order envelope set error:", error.message);
+    return res.status(500).json({ success: false, message: "Failed to change the envelope" });
+  }
+});
+
 router.get("/dispatch", VIEW, async function (req, res) {
   try {
 
@@ -1336,12 +1453,15 @@ router.get("/dispatch", VIEW, async function (req, res) {
     // AusPost label (2026-10-21) — the article id is its tracking number
     const posted = await auspostOf(orders.map((o) => o.orderId)).catch(() => new Map());
     const envSet = await envelopeOverrides();
+    // an order's own envelope chosen by hand (2026-11-12) — envelopeSet
+    const ordEnv = await orderEnvelopes(orders.map((o) => o.orderId));
     const brief = (o) => {
       const e = entry.get(o.orderId) || {};
       const ap = posted.get(o.orderId);
       return { orderId: o.orderId, channel: o.channel, account: o.account, customerName: o.customerName,
         status: o.status, datePlaced: o.datePlaced, orderTotal: o.orderTotal, pickDay: e.day || null, pickBatch: e.batch || null, tracking: e.tracking || "",
-        dispatch: e.dispatch || null, netoSynced: o.netoSynced || null, envelope: envelopeOf(o.items, envSet), auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
+        dispatch: e.dispatch || null, netoSynced: o.netoSynced || null, envelope: envelopeOf(o.items, envSet, ordEnv.get(o.orderId)), envelopeSet: ordEnv.get(o.orderId) || null,
+        auspost: ap ? { articleId: ap.articleId, cost: ap.cost == null ? null : ap.cost } : null };
     };
     const sku = new Map();
     const multiLine = [];

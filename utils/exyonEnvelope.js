@@ -15,6 +15,8 @@
 // Reasons come back as codes so the page can word (and translate) them.
 // An item's envelope can also be chosen by hand on the Dispatch page
 // (2026-10-22): it replaces the rules for that item (reason code "set").
+// And one ORDER's envelope (2026-11-12: multi-line orders, orders on a pick
+// list): it replaces everything else for that order (reason code "setOrder").
 
 const SIZES = ["small", "medium", "large", "other"];
 
@@ -44,12 +46,14 @@ function classify(productName) {
 const RANK = { small: 0, medium: 1, large: 2, other: 3 };
 const skuKeyOf = (sku) => String(sku || "").trim().toLowerCase();
 
-// items: [{ sku, productName, quantity }], overrides: Map(sku lower-cased → size)
+// items: [{ sku, productName, quantity }], overrides: Map(sku lower-cased → size),
+// orderSize: the order's own envelope chosen by hand (wins over everything)
 //   → { size, reasons: [{ code, n?, names? }] }
-//   codes: ipad · largeItem · cases (n) · screenProtectors (n) · unknown (names) · set (names)
+//   codes: ipad · largeItem · cases (n) · screenProtectors (n) · unknown (names) · set (names) · setOrder
 // An item chosen by hand counts as its size; the other items go through the
 // rules together; the order takes the bigger ("other" the biggest).
-function envelopeOf(items, overrides) {
+function envelopeOf(items, overrides, orderSize) {
+  if (orderSize && SIZES.includes(orderSize)) return { size: orderSize, reasons: [{ code: "setOrder" }] };
   const set = [];
   const rest = [];
   for (const it of items || []) {
