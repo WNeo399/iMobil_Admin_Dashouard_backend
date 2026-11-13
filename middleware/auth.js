@@ -76,6 +76,9 @@ async function authenticate(req, res, next) {
       refurbCustomerId: user.refurbCustomerId ? String(user.refurbCustomerId) : null,
       // Consignment-shop link — scopes the Consignment pages to one shop.
       consignShopId: user.consignShopId ? String(user.consignShopId) : null,
+      // Repair Customer link (2026-11-13) — the shop group (iMobile Repair
+      // → Shops) whose RepairDesk tickets the repair portal shows.
+      repairShopGroupId: user.repairShopGroupId ? String(user.repairShopGroupId) : null,
       // Phone-supplier stock source — stamped onto records they create.
       stockSource: user.stockSource || null,
     };

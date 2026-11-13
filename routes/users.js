@@ -70,6 +70,17 @@ async function devicesLink(db, raw) {
   return { set: { refurbCustomerId: rc._id, refurbCustomerName: rc.name || null } };
 }
 
+// The Repair Customer's link (2026-11-13): the shop group (iMobile Repair
+// → Shops, imb_repair_shop_groups) whose tickets the repair portal shows.
+async function repairShopLink(db, raw) {
+  if (raw === undefined) return { set: null };
+  if (!raw) return { set: { repairShopGroupId: null, repairShopGroupName: null } };
+  if (!ObjectId.isValid(String(raw))) return { error: "Pick a shop group for the Repair Customer role" };
+  const g = await db.collection("imb_repair_shop_groups").findOne({ _id: new ObjectId(String(raw)) }, { projection: { name: 1 } });
+  if (!g) return { error: "That shop group no longer exists" };
+  return { set: { repairShopGroupId: g._id, repairShopGroupName: g.name || null } };
+}
+
 router.get("/roles", requireUserAdmin, function (req, res) {
   const data = Object.values(ROLES).map((value) => ({
     value,
@@ -246,6 +257,13 @@ router.post("/create", requireUserAdmin, async function (req, res, next) {
       Object.assign(doc, link.set);
     }
 
+    // Repair Customer link — the shop group whose tickets the portal shows
+    if (roles.includes(ROLES.REPAIR_CUSTOMER)) {
+      const link = await repairShopLink(db, req.body.repairShopGroupId || null);
+      if (link.error) return res.status(400).json({ success: false, message: link.error });
+      Object.assign(doc, link.set);
+    }
+
     // Stock source — a phone supplier's stock comes from somewhere, and
     // that's the source stamped on the refurbished devices they add.
     if (roles.includes("phone-supplier")) {
@@ -336,6 +354,17 @@ router.put("/update/:id", requireUserAdmin, async function (req, res, next) {
     } else if (rolesChanged && existing.refurbCustomerId) {
       update.refurbCustomerId = null;
       update.refurbCustomerName = null;
+    }
+
+    // Repair Customer link — kept while the account holds the role,
+    // cleared when it is taken off
+    if (effectiveRoles.includes(ROLES.REPAIR_CUSTOMER)) {
+      const link = await repairShopLink(db, req.body.repairShopGroupId);
+      if (link.error) return res.status(400).json({ success: false, message: link.error });
+      if (link.set) Object.assign(update, link.set);
+    } else if (rolesChanged && existing.repairShopGroupId) {
+      update.repairShopGroupId = null;
+      update.repairShopGroupName = null;
     }
 
     // InFlow customer link — only meaningful for the inflow-customer role.

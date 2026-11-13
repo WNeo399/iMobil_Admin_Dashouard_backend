@@ -24,6 +24,12 @@ const ROLES = {
   // devices sold to the refurb customer on their user record. Combinable
   // with InFlow Customer, nothing else.
   DEVICES_CUSTOMER: "devices-customer",
+  // A shop that sends repairs to iMobile (2026-11-13, user: "allow them to
+  // login to the portal to see all their tickets and also enable them to
+  // create new tickets") — linked to ONE shop group of iMobile Repair → Shops
+  // (users.repairShopGroupId); sees only that group's RepairDesk tickets (no
+  // prices), their notes, and replies. An account's only role.
+  REPAIR_CUSTOMER: "repair-customer",
   // Supplier login — sees the Refurbished Phones market data + the AI Agent
   // (but not the Agent Skills knowledge base).
   PHONE_SUPPLIER: "phone-supplier",
@@ -65,6 +71,7 @@ const ROLE_LABELS = {
   [ROLES.REPAIR_SHOP]: "Repair Shop",
   [ROLES.INFLOW_CUSTOMER]: "InFlow Customer",
   [ROLES.DEVICES_CUSTOMER]: "Devices Customer",
+  [ROLES.REPAIR_CUSTOMER]: "Repair Customer",
   [ROLES.PHONE_SUPPLIER]: "Phone Supplier",
   [ROLES.CONSIGNMENT_SHOP]: "Consignment Shop",
   [ROLES.IMOBILE_PURCHASE]: "iMobile Purchase",
@@ -84,7 +91,9 @@ const ROLE_LABELS = {
 const ROLE_GROUPS = {
   IMOBILE: "imobile",
   TECHELITE: "techelite",
-  INFLOW: "inflow",
+  // the customer portal logins — InFlow Customer, Devices Customer, Repair
+  // Customer (user 2026-11-13: "rename the Inflow with customer"; was "InFlow")
+  CUSTOMER: "customer",
   CONSIGNMENT: "consignment",
   EXYON: "exyon",
 };
@@ -92,7 +101,7 @@ const ROLE_GROUPS = {
 const ROLE_GROUP_LABELS = {
   [ROLE_GROUPS.IMOBILE]: "iMobile",
   [ROLE_GROUPS.TECHELITE]: "TechElite",
-  [ROLE_GROUPS.INFLOW]: "InFlow",
+  [ROLE_GROUPS.CUSTOMER]: "Customer",
   [ROLE_GROUPS.CONSIGNMENT]: "Consignment",
   [ROLE_GROUPS.EXYON]: "Exyon",
 };
@@ -106,9 +115,11 @@ const ROLE_GROUP_OF = {
   [ROLES.SQT_CALL_CENTER]: ROLE_GROUPS.TECHELITE,
   [ROLES.SHOP_OWNER]: ROLE_GROUPS.TECHELITE,
   [ROLES.REPAIR_SHOP]: ROLE_GROUPS.TECHELITE,
-  [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.INFLOW,
-  // under InFlow in the Users role tree, beside InFlow Customer (user 2026-11-09)
-  [ROLES.DEVICES_CUSTOMER]: ROLE_GROUPS.INFLOW,
+  // the Customer group of the Users role tree (was InFlow; user 2026-11-13)
+  [ROLES.INFLOW_CUSTOMER]: ROLE_GROUPS.CUSTOMER,
+  [ROLES.DEVICES_CUSTOMER]: ROLE_GROUPS.CUSTOMER,
+  // a group label only: Repair Customer still combines with nothing
+  [ROLES.REPAIR_CUSTOMER]: ROLE_GROUPS.CUSTOMER,
   [ROLES.PHONE_SUPPLIER]: ROLE_GROUPS.IMOBILE,
   [ROLES.CONSIGNMENT_SHOP]: ROLE_GROUPS.CONSIGNMENT,
   [ROLES.IMOBILE_PURCHASE]: ROLE_GROUPS.IMOBILE,
@@ -178,6 +189,11 @@ const ROLE_PERMISSIONS = {
     "repair:ticket:note",
     "repair:shop:view",
   ],
+  // Repair Customer (2026-11-13): the shop portal only — its own group's
+  // tickets (no prices), notes / replies on them, and new tickets for its shops. NONE of the
+  // staff repair:ticket:* / repair:shop:* permissions. (repair:*:* staff can
+  // open the portal routes too, but have no shop group linked.)
+  [ROLES.REPAIR_CUSTOMER]: ["repair:portal:view", "repair:portal:create", "repair:portal:note"],
   // TechElite Admin owns the SQT domain. User management (System tab) was
   // revoked 2026-08 — system:user:manage is Admin-only now.
   [ROLES.TECHELITE_ADMIN]: ["sqt:*:*"],

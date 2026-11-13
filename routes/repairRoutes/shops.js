@@ -152,6 +152,8 @@ router.put("/:id", MANAGE, async function (req, res, next) {
     );
     const g = r && r.value !== undefined ? r.value : r;
     if (!g) return res.status(404).json({ success: false, message: "Group not found" });
+    // the shop logins linked to it (Repair Customer role) keep its name
+    await db.collection("users").updateMany({ repairShopGroupId: _id }, { $set: { repairShopGroupName: g.name || null } });
     return res.json({ success: true, data: shape(g) });
   } catch (error) {
     next(error);
@@ -164,6 +166,9 @@ router.delete("/:id", MANAGE, async function (req, res, next) {
     const _id = oid(req.params.id);
     if (!_id) return bad(res, "Bad group id");
     const db = await connectToDatabase();
+    // a group shop logins see their tickets through stays (2026-11-13)
+    const logins = await db.collection("users").find({ repairShopGroupId: _id }, { projection: { username: 1 } }).toArray();
+    if (logins.length) return bad(res, `${logins.map((u) => u.username).join(", ")} ${logins.length === 1 ? "logs" : "log"} in with this group — link ${logins.length === 1 ? "that login" : "those logins"} to another group first`);
     const r = await db.collection(GROUPS).deleteOne({ _id });
     if (!r.deletedCount) return res.status(404).json({ success: false, message: "Group not found" });
     return res.json({ success: true });

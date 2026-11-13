@@ -383,6 +383,9 @@ router.get("/tickets/:id", GATE_DETAIL, async function (req, res) {
 
 // iMobile Repair → Shops: RepairDesk customers grouped under one customer
 router.use("/shops", require("./shops"));
+// The shop portal (2026-11-13): a shop group's own tickets + new tickets,
+// for the Repair Customer role (repair:portal:*)
+router.use("/portal", require("./portal"));
 
 // RepairDesk's ticket statuses (GET /statuses), one per name — the account
 // lists Pending, Repaired, Waiting for Parts and Warranty Repair twice, and a
