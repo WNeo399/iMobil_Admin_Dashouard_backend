@@ -35,10 +35,11 @@
 // with neither falls back to the 60-day window.
 //
 // New tickets (user: "device + repair services", start status "Pending"):
-// the model and services come from RepairDesk's catalogue (/repaircategories,
-// cached); the services are checked against /problems/{device} — their price
-// / GST are RepairDesk's own (all $0 in this account on 2026-11-13) and never
-// shown. An internal note on the new ticket says which shop login made it.
+// brands + models come from RepairDesk's /devices, a model's services from
+// /problems/{device} — loaded step by step as the shop picks (2026-11-13: the
+// whole-catalogue /repaircategories took 12–15 s). The services are checked
+// against /problems again on create; their price / GST are RepairDesk's own
+// (all $0 in this account on 2026-11-13) and never shown. An internal note on the new ticket says which shop login made it.
 // Logged in Mongo imb_repair_portal_tickets.
 //
 // Mounted under /repair/portal by routes/repairRoutes/index.js.
@@ -50,8 +51,9 @@
 //                                     "enable print 50*40 label in the portal" — RepairDesk's own
 //                                     label: model, repair, IMEI, the fault, Code 128 of the ticket
 //                                     number, "Repair Ticket # …", the customer's name + mobile)
-//   GET  /catalog                     brands → models (ids, names)
-//   GET  /catalog/devices/:id/services  a model's services (ids, names)
+//   GET  /catalog/brands              the brands (id, name, models count)
+//   GET  /catalog/brands/:id/models   one brand's models (ids, names)
+//   GET  /catalog/devices/:id/services  a model's services (ids, names; "Other" last)
 //   POST /tickets { shopId, devices: [ONE { deviceId, serviceIds, imei?, serial?, passcode, fault }], dryRun? }
 
 var express = require("express");
@@ -146,35 +148,53 @@ async function statusTypes() {
   });
 }
 
-// RepairDesk's catalogue: brands → models → services (ids + names only kept)
-async function catalog() {
-  return cached("catalog", 6 * 60 * 60 * 1000, async () => {
-    const d = await rd.get("/repaircategories");
-    const brands = [];
-    const models = new Map();
-    for (const b of (d && d.data) || []) {
-      const devices = [];
-      for (const m of b.devices || []) {
-        const services = [];
-        const seen = new Set();
-        for (const p of m.problems || []) {
-          const name = str(p.name);
-          if (!p.id || !name || seen.has(name.toLowerCase()) || OTHER_NAME_RE.test(name)) continue;
-          seen.add(name.toLowerCase());
-          services.push({ id: String(p.id), name });
-        }
-        services.sort((a, c) => a.name.localeCompare(c.name));
-        services.push({ id: OTHER_ID, name: "Other" }); // always offered, last
-        const dev = { id: String(m.id), name: str(m.name), brand: str(b.name), services };
-        if (!dev.name) continue;
-        models.set(dev.id, dev);
-        devices.push({ id: dev.id, name: dev.name, services: services.length });
-      }
-      devices.sort((a, c) => a.name.localeCompare(c.name, undefined, { numeric: true }));
-      if (devices.length) brands.push({ id: String(b.id), name: str(b.name), devices });
+// RepairDesk's brands + models, from /devices: every model with its brand in
+// one quick answer (~0.4 s; 1,640 models / 22 brands on 2026-11-13). The old
+// source, /repaircategories, sends every brand, model AND repair at once —
+// 5 MB, 12–15 s (user: "the New repair ticket dialog load very slow"; then
+// "load the brand first … after select the brand, load the model and then
+// load the repair need"). Kept an hour.
+const DEVICES_TTL = 60 * 60 * 1000;
+// one-model junk brands (user 2026-11-13: "hide Hooli and Nova 3i")
+const HIDDEN_BRANDS = /^(hooli|nova 3i)$/i;
+async function devicesList() {
+  return cached("devices", DEVICES_TTL, async () => {
+    const d = await rd.get("/devices");
+    const byId = new Map(); // brand id → { id, name, models: [{ id, name }] }
+    const models = new Map(); // model id → { id, name, brand, brandId }
+    for (const x of (d && d.data) || []) {
+      const id = str(x && x.id);
+      const name = str(x && x.name);
+      const brandId = str(x && x.manufacturer_id);
+      const brand = str(x && x.company);
+      if (!id || !name || !brandId || HIDDEN_BRANDS.test(brand)) continue;
+      if (!byId.has(brandId)) byId.set(brandId, { id: brandId, name: brand || `Brand ${brandId}`, models: [] });
+      byId.get(brandId).models.push({ id, name });
+      models.set(id, { id, name, brand, brandId });
     }
-    brands.sort((a, c) => a.name.localeCompare(c.name));
-    return { brands, models };
+    for (const b of byId.values()) b.models.sort((a, c) => a.name.localeCompare(c.name, undefined, { numeric: true }));
+    const brands = [...byId.values()].sort((a, c) => a.name.localeCompare(c.name));
+    return { brands, byId, models };
+  });
+}
+
+// A model's repairs: RepairDesk's /problems/{model} (~0.3 s) — the same list a
+// new ticket is checked and priced against. Names only; the catalogue's own
+// "Other" / "Others" left out and ours last. Kept 10 minutes.
+async function servicesFor(modelId) {
+  return cached(`problems:${modelId}`, 10 * 60 * 1000, async () => {
+    const d = await rd.get(`/problems/${encodeURIComponent(modelId)}`);
+    const services = [];
+    const seen = new Set();
+    for (const p of (d && d.data) || []) {
+      const name = str(p && p.name);
+      if (!p || !p.id || !name || seen.has(name.toLowerCase()) || OTHER_NAME_RE.test(name)) continue;
+      seen.add(name.toLowerCase());
+      services.push({ id: String(p.id), name });
+    }
+    services.sort((a, c) => a.name.localeCompare(c.name));
+    services.push({ id: OTHER_ID, name: "Other" }); // always offered, last
+    return services;
   });
 }
 
@@ -542,23 +562,36 @@ router.post("/tickets/:id/notes", NOTE, async function (req, res) {
   }
 });
 
-// ── GET /catalog ── brands → models, for the new-ticket form
-router.get("/catalog", VIEW, async function (req, res) {
+// ── GET /catalog/brands ── the new-ticket form's first step
+router.get("/catalog/brands", VIEW, async function (req, res) {
   try {
-    const c = await catalog();
-    return res.json({ success: true, brands: c.brands });
+    const c = await devicesList();
+    return res.json({ success: true, brands: c.brands.map((b) => ({ id: b.id, name: b.name, models: b.models.length })) });
   } catch (error) {
-    console.error("Repair portal /catalog error:", error.message);
-    return res.status(502).json({ success: false, message: "Failed to load the device list" });
+    console.error("Repair portal brands error:", error.message);
+    return res.status(502).json({ success: false, message: "Failed to load the brands" });
   }
 });
 
-// ── GET /catalog/devices/:id/services ── a model's services (names only)
+// ── GET /catalog/brands/:id/models ── one brand's models
+router.get("/catalog/brands/:id/models", VIEW, async function (req, res) {
+  try {
+    const b = (await devicesList()).byId.get(str(req.params.id));
+    if (!b) return res.status(404).json({ success: false, message: "Unknown brand" });
+    return res.json({ success: true, brand: { id: b.id, name: b.name }, models: b.models });
+  } catch (error) {
+    console.error("Repair portal models error:", error.message);
+    return res.status(502).json({ success: false, message: "Failed to load the models" });
+  }
+});
+
+// ── GET /catalog/devices/:id/services ── a model's repairs (names only, "Other" last)
 router.get("/catalog/devices/:id/services", VIEW, async function (req, res) {
   try {
-    const m = (await catalog()).models.get(str(req.params.id));
+    const m = (await devicesList()).models.get(str(req.params.id));
     if (!m) return res.status(404).json({ success: false, message: "Unknown model" });
-    return res.json({ success: true, device: { id: m.id, name: m.name, brand: m.brand }, services: m.services });
+    const services = await servicesFor(m.id);
+    return res.json({ success: true, device: { id: m.id, name: m.name, brand: m.brand }, services });
   } catch (error) {
     console.error("Repair portal services error:", error.message);
     return res.status(502).json({ success: false, message: "Failed to load the services" });
@@ -583,7 +616,7 @@ router.post("/tickets", CREATE, async function (req, res) {
     const asked = Array.isArray(b.devices) ? b.devices : [];
     if (!asked.length) return bad("Add a device");
     if (asked.length > MAX_DEVICES) return bad("One device per ticket");
-    const cat = await catalog();
+    const cat = await devicesList();
     const lines = [];
     for (const x of asked) {
       const model = cat.models.get(str(x && x.deviceId));
@@ -592,8 +625,6 @@ router.post("/tickets", CREATE, async function (req, res) {
       const fault = str(x.fault).slice(0, FAULT_MAX);
       if (!ids.length && !fault) return bad("Pick the repair needed, or describe the fault");
       if (ids.includes(OTHER_ID) && !fault) return bad("Describe the fault for Other");
-      const unknown = ids.filter((id) => !model.services.some((s) => s.id === id));
-      if (unknown.length) return bad(`A service isn't offered for the ${model.name}`);
       const imei = str(x.imei).replace(/\s+/g, "");
       const serial = str(x.serial).replace(/\s+/g, "");
       // both optional (user 2026-11-13); an IMEI given must look like one
@@ -603,7 +634,8 @@ router.post("/tickets", CREATE, async function (req, res) {
     }
     if (!(await statusTypes()).has(START_STATUS)) return bad(`RepairDesk has no "${START_STATUS}" status`, 502);
 
-    // each model's services as RepairDesk prices them (never shown to the shop)
+    // each model's services as RepairDesk prices them now (never shown to the
+    // shop) — a service it doesn't list (any more) is refused
     const devices = [];
     for (const l of lines) {
       let priced = [];
@@ -612,7 +644,10 @@ router.post("/tickets", CREATE, async function (req, res) {
         const d = await rd.get(`/problems/${l.model.id}`);
         const rows = (d && d.data) || [];
         priced = catIds.map((id) => rows.find((r) => String(r.id) === id)).filter(Boolean);
-        if (priced.length !== catIds.length) return bad(`The ${l.model.name}'s services changed in RepairDesk — please pick them again`, 409);
+        if (priced.length !== catIds.length) {
+          cache.delete(`problems:${l.model.id}`); // the form's list is stale
+          return bad(`A service isn't offered for the ${l.model.name} — please pick the repair again`);
+        }
         await sleep(120);
       }
       const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
