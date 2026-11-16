@@ -100,6 +100,10 @@ var widgetRouter = require('./routes/widgetRoutes/index');
 // tracking number to the matching sales order on an SQT case. Public (Zoho
 // Flow can't carry our JWT); optional shared secret inside the router.
 var shipmentWebhookRouter = require('./routes/shipmentWebhookRoutes/index');
+// Customer stock chat — GET /stock-chat/:token, POST /stock-chat/:token/ask.
+// Public: the random per-customer token in the link is the credential
+// (staff send it on WhatsApp); rate-limited per link inside the router.
+var stockChatPublicRouter = require('./routes/stockChatPublicRoutes/index');
 var { authenticate } = require('./middleware/auth');
 
 var app = express();
@@ -158,6 +162,7 @@ app.use('/widget', widgetRouter);
 // Public Apple SVP serial lookup — GET /svp/lookup. Read-only; rate-limited
 // inside the router (trusted lookup server bypasses via the shared secret).
 app.use('/svp', svpPublicRouter);
+app.use('/stock-chat', stockChatPublicRouter);
 // Static serve for the built widget bundles produced by
 // `npm run build:to-backend` in the iMobile_Widget repo. Each bundle
 // lands at public/widgets/<widget-name>/v<N>.js and is served from
