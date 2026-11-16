@@ -6,8 +6,11 @@
 // else:
 //
 //   · the register's In Stock devices at iMobile or Assigned To Exyon;
-//   · minus units Exyon's own database shows sold, being picked, or in a
-//     zone that isn't sellable (our register lags behind Exyon's sales);
+//   · minus units at Assigned To Exyon that Exyon's own database shows sold,
+//     being picked, or in a zone that isn't sellable (our register lags
+//     behind Exyon). Units Exyon hasn't received yet (no stock row: in
+//     transit, or on a receiving list not counted in) ARE shown (user
+//     2026-11-17) — staff see how many in the preview;
 //   · grouped by Model + Storage + Grade + Colour with a quantity;
 //   · priced from our price list (Model + Storage + Grade; a blank storage
 //     or grade on a price row covers every storage / grade), else no price
@@ -87,12 +90,12 @@ async function getSettings(db) {
 }
 
 // ── Exyon ────────────────────────────────────────────────────────────
-// The IMEIs / serials (upper case) Exyon shows as not available: the
-// latest stock row for the code has a pick (sold or being picked) or sits
-// in a non-sellable zone. Codes Exyon doesn't know stay available — our
-// register is the record for those.
-async function exyonUnavailable(codes) {
-  const out = new Set();
+// Each IMEI / serial (upper case) Exyon has a stock row for → that latest
+// row. A unit at Assigned To Exyon is hidden when that row is gone (a pick:
+// sold / being picked; or a non-sellable zone). A unit with no row at all
+// hasn't been received by Exyon yet — still shown (user 2026-11-17: "we can
+// show stocks that are assigned to Exyon but not yet received in exdb").
+async function exyonLatestRows(codes) {
   const list = [...new Set(codes.filter(Boolean))];
   const latest = new Map(); // code → latest stock row
   for (let i = 0; i < list.length; i += EX_CHUNK) {
@@ -112,11 +115,20 @@ async function exyonUnavailable(codes) {
       }
     }
   }
-  for (const [k, r] of latest) {
-    const zone = `${r.zone_number || ""} ${r.location_alias || ""}`;
-    if (r.pick_id || EXYON_HIDE_ZONE.test(zone)) out.add(k);
+  return latest;
+}
+
+// "in-stock" | "gone" (sold, being picked, non-sellable zone) | "unconfirmed"
+// (no stock row at Exyon under the unit's IMEI or serial)
+function exyonStateOf(latest, codes) {
+  let row = null;
+  for (const c of codes) {
+    const r = c && latest.get(c);
+    if (r && (!row || Number(r.id) > Number(row.id))) row = r;
   }
-  return out;
+  if (!row) return "unconfirmed";
+  const zone = `${row.zone_number || ""} ${row.location_alias || ""}`;
+  return row.pick_id || EXYON_HIDE_ZONE.test(zone) ? "gone" : "in-stock";
 }
 
 // ── the stock snapshot (cached, single-flight) ──────────────────────
@@ -135,21 +147,28 @@ async function buildSnapshot() {
 
   const code = (v) => String(v || "").trim().toUpperCase();
   const atExyon = devices.filter((d) => d.location === LOCATION_EXYON);
-  let hidden = new Set();
+  let latest = null;
   let exyonOk = true;
   let exyonError = null;
   try {
-    hidden = await exyonUnavailable(atExyon.flatMap((d) => [code(d.imei), code(d.serialNumber)]));
+    latest = await exyonLatestRows(atExyon.flatMap((d) => [code(d.imei), code(d.serialNumber)]));
   } catch (e) {
-    // Exyon unreachable: the register alone answers (staff see a warning).
+    // Exyon unreachable: the register alone answers (staff see a warning) —
+    // hiding every Exyon unit would empty the chat.
     exyonOk = false;
     exyonError = (e && e.message) || String(e);
     console.error("Stock chat: Exyon check failed —", exyonError);
   }
 
-  const available = devices.filter(
-    (d) => !(d.location === LOCATION_EXYON && (hidden.has(code(d.imei)) || hidden.has(code(d.serialNumber)))),
-  );
+  let hiddenAtExyon = 0; // sold / being picked / non-sellable zone at Exyon → hidden
+  let unconfirmedAtExyon = 0; // not received by Exyon yet (no stock row) → shown, counted for staff
+  const available = devices.filter((d) => {
+    if (d.location !== LOCATION_EXYON || !latest) return true;
+    const st = exyonStateOf(latest, [code(d.imei), code(d.serialNumber)]);
+    if (st === "gone") hiddenAtExyon += 1;
+    if (st === "unconfirmed") unconfirmedAtExyon += 1;
+    return st !== "gone";
+  });
   const groups = new Map();
   for (const d of available) {
     const key = [modelKey(d.model), storageKey(d.storage), gradeKey(d.grade), colorKey(d.color)].join("|");
@@ -182,7 +201,8 @@ async function buildSnapshot() {
     at: new Date(),
     groups: list,
     units: available.length,
-    hiddenAtExyon: devices.length - available.length,
+    hiddenAtExyon,
+    unconfirmedAtExyon,
     exyonOk,
     exyonError,
   };

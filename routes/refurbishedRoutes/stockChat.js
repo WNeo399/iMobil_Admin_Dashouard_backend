@@ -408,6 +408,7 @@ router.get("/preview", MANAGE, async (req, res) => {
       pricedRows: priced.length,
       pricedUnits: priced.reduce((n, g) => n + g.qty, 0),
       hiddenAtExyon: s.hiddenAtExyon,
+      unconfirmedAtExyon: s.unconfirmedAtExyon,
       hiddenUnits: s.hiddenUnits,
       belowCostUnits: s.belowCostUnits,
       exyonOk: s.exyonOk,
