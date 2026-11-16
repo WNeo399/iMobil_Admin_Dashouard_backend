@@ -289,11 +289,17 @@ function sortRows(rows) {
   );
 }
 
-// Every matching row, colours combined: one per Model + Storage + Grade.
+// The price is part of a row's identity: units of one Model + Storage +
+// Grade can be split into priced ones and "Contact us" (below cost) ones,
+// and those must never merge.
+const priceKey = (g) => (g.price == null ? "-" : `${g.currency || ""}${g.price}`);
+const rowKey = (r) => [SC.modelKey(r.model), SC.storageKey(r.storage), SC.gradeKey(r.grade === "Ungraded" ? "" : r.grade), priceKey(r)].join("|");
+
+// Every matching row, colours combined: one per Model + Storage + Grade (+ price).
 function combineByGrade(hits) {
   const by = new Map();
   for (const g of hits) {
-    const k = [SC.modelKey(g.model), SC.storageKey(g.storage), SC.gradeKey(g.grade)].join("|");
+    const k = [SC.modelKey(g.model), SC.storageKey(g.storage), SC.gradeKey(g.grade), priceKey(g)].join("|");
     let r = by.get(k);
     if (!r) {
       r = { model: g.model, storage: g.storage, grade: gradeLabel(g.grade), colors: [], qty: 0, price: g.price, currency: g.currency };
@@ -314,9 +320,8 @@ function buildReply(groups, input) {
   const layout = i.layout === "list" || i.layout === "cards" ? i.layout : hasMatching ? "list" : "cards";
   let rows = resolveShow(groups, i.show, layout === "list" ? ROWS_IN_LIST : ROWS_TO_CLIENT);
   if (hasMatching) {
-    const have = new Set(rows.map((r) => [SC.modelKey(r.model), SC.storageKey(r.storage), SC.gradeKey(r.grade)].join("|")));
-    const more = combineByGrade(filterGroups(groups, i.show_matching).hits)
-      .filter((r) => !have.has([SC.modelKey(r.model), SC.storageKey(r.storage), SC.gradeKey(r.grade)].join("|")));
+    const have = new Set(rows.map(rowKey));
+    const more = combineByGrade(filterGroups(groups, i.show_matching).hits).filter((r) => !have.has(rowKey(r)));
     rows = sortRows(rows.concat(more));
   }
   const cap = layout === "list" ? ROWS_IN_LIST : ROWS_TO_CLIENT;
@@ -340,7 +345,7 @@ function resolveShow(groups, show, cap = ROWS_TO_CLIENT) {
       if (st !== null && SC.storageKey(g.storage) !== st) continue;
       if (gr !== null && SC.gradeKey(g.grade) !== gr) continue;
       if (c !== null && SC.colorKey(g.color) !== c) continue;
-      const k = [m, SC.storageKey(g.storage), SC.gradeKey(g.grade), c === null ? "" : SC.colorKey(g.color)].join("|");
+      const k = [m, SC.storageKey(g.storage), SC.gradeKey(g.grade), priceKey(g), c === null ? "" : SC.colorKey(g.color)].join("|");
       if (seen.has(k)) continue;
       let r = by.get(k);
       if (!r) {
@@ -404,7 +409,7 @@ router.post("/:token/ask", askLimiter, async (req, res) => {
 
     const settings = await SC.getSettings(db);
     const used = await usedToday(db, customer._id);
-    if (used >= settings.dailyLimit) {
+    if (settings.dailyLimit > 0 && used >= settings.dailyLimit) {
       return res.status(429).json({
         success: false,
         message: "You've reached today's question limit. Please message us on WhatsApp, or try again tomorrow.",

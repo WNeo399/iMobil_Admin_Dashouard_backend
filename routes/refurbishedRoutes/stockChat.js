@@ -13,7 +13,7 @@
 //   PUT    /refurbished/stock-chat/prices/:id
 //   DELETE /refurbished/stock-chat/prices/:id
 //   POST   /refurbished/stock-chat/prices/import          { rows, mode: "replace" | "merge" }
-//   GET    /refurbished/stock-chat/settings · PUT
+//   GET    /refurbished/stock-chat/settings · PUT     price note, daily limit, hidden models, HKD / CNY → AUD
 //   GET    /refurbished/stock-chat/preview?fresh=1        exactly what customers see
 //
 // All of it needs refurb:stockchat:manage (Admin's wildcard for now).
@@ -358,10 +358,28 @@ router.put("/settings", MANAGE, async (req, res) => {
     if (b.priceNote !== undefined) set.priceNote = SC.clean(b.priceNote).slice(0, 120);
     if (b.dailyLimit !== undefined) {
       const n = parseInt(b.dailyLimit, 10);
-      if (!Number.isFinite(n) || n < 1 || n > 500) {
-        return res.status(400).json({ success: false, message: "Daily limit must be 1–500" });
+      // 0 = no limit
+      if (!Number.isFinite(n) || n < 0 || n > 500) {
+        return res.status(400).json({ success: false, message: "Daily limit must be 0–500 (0 = no limit)" });
       }
       set.dailyLimit = n;
+    }
+    // models customers never see (whole name, any case)
+    if (b.hiddenModels !== undefined) {
+      if (!Array.isArray(b.hiddenModels)) return res.status(400).json({ success: false, message: "Hidden models must be a list" });
+      set.hiddenModels = [...new Set(b.hiddenModels.map((m) => SC.clean(m).slice(0, 120)).filter(Boolean))].slice(0, 200);
+    }
+    // AUD per 1 HKD / CNY, for the below-cost check
+    if (b.fxToAud !== undefined) {
+      const fx = {};
+      for (const cur of ["HKD", "CNY"]) {
+        const v = Number(b.fxToAud && b.fxToAud[cur]);
+        if (!Number.isFinite(v) || v <= 0 || v > 10) {
+          return res.status(400).json({ success: false, message: `${cur} → AUD rate must be a number above 0` });
+        }
+        fx[cur] = Math.round(v * 10000) / 10000;
+      }
+      set.fxToAud = fx;
     }
     const d = await db();
     await d.collection(SC.SETTINGS).updateOne(
@@ -390,6 +408,8 @@ router.get("/preview", MANAGE, async (req, res) => {
       pricedRows: priced.length,
       pricedUnits: priced.reduce((n, g) => n + g.qty, 0),
       hiddenAtExyon: s.hiddenAtExyon,
+      hiddenUnits: s.hiddenUnits,
+      belowCostUnits: s.belowCostUnits,
       exyonOk: s.exyonOk,
       exyonError: s.exyonOk ? null : "Exyon's database couldn't be checked — units it may have sold are still shown.",
     });

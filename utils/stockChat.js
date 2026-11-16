@@ -36,7 +36,14 @@ const EXYON_HIDE_ZONE = /kpay sold|missing|quarantine|fixing/i;
 
 const DEFAULT_SETTINGS = {
   priceNote: "Prices in AUD, ex GST",
-  dailyLimit: 40, // questions per customer per day (Melbourne)
+  // questions per customer per day (Melbourne); 0 = no limit — the default
+  // while the chat is in internal testing (user 2026-11-16)
+  dailyLimit: 0,
+  // models customers never see (user 2026-11-16), matched on the whole name
+  hiddenModels: ["17 pro max service pack", "给ADT"],
+  // a unit's cost in AUD for the below-cost check: 1 HKD / 1 CNY = this many
+  // AUD (CNY at 4.7 per AUD, as the AI Agent's margin rule)
+  fxToAud: { HKD: 0.19, CNY: 0.2128 },
 };
 
 // ── keys ─────────────────────────────────────────────────────────────
@@ -122,7 +129,7 @@ async function buildSnapshot() {
     .collection(DEVICES)
     .find(
       { status: "In Stock", location: { $in: [LOCATION_IMOBILE, LOCATION_EXYON] } },
-      { projection: { brand: 1, model: 1, storage: 1, color: 1, grade: 1, imei: 1, serialNumber: 1, location: 1 } },
+      { projection: { brand: 1, model: 1, storage: 1, color: 1, grade: 1, imei: 1, serialNumber: 1, location: 1, costPrice: 1, currency: 1 } },
     )
     .toArray();
 
@@ -155,10 +162,14 @@ async function buildSnapshot() {
         grade: clean(d.grade),
         color: clean(d.color),
         qty: 0,
+        // each unit's cost — server-side only, for the below-cost check;
+        // stripped before anything leaves pricedStock()
+        costs: [],
       };
       groups.set(key, g);
     }
     g.qty += 1;
+    g.costs.push(d.costPrice == null || d.costPrice === "" ? null : { amount: Number(d.costPrice), currency: d.currency || "AUD" });
   }
   const list = [...groups.values()].sort(
     (a, b) =>
@@ -210,15 +221,58 @@ function priceFor(idx, g) {
   return null;
 }
 
-// The snapshot's groups with prices — exactly what a customer may see.
+// A unit's cost in AUD; null when it has none (or no rate for its currency).
+function costInAud(c, fx) {
+  if (!c || !Number.isFinite(c.amount)) return null;
+  const cur = String(c.currency || "AUD").toUpperCase();
+  if (cur === "AUD") return c.amount;
+  const rate = Number(fx && fx[cur]);
+  return Number.isFinite(rate) && rate > 0 ? c.amount * rate : null;
+}
+
+// The snapshot's groups with prices — exactly what a customer may see:
+//   · hidden models left out;
+//   · a listed price only for units it doesn't undercut: a unit whose cost
+//     is above the price shows "Contact us" (user 2026-11-16) — so one
+//     Model + Storage + Grade + Colour can come back as two rows, the priced
+//     units and the `belowCost` ones. A unit with no cost keeps the price.
+// Costs never leave this function.
 async function pricedStock({ fresh = false } = {}) {
   const db = await connectToDatabase();
-  const [snap, idx] = await Promise.all([stockSnapshot({ fresh }), loadPriceIndex(db)]);
-  const groups = snap.groups.map((g) => {
+  const [snap, idx, settings] = await Promise.all([stockSnapshot({ fresh }), loadPriceIndex(db), getSettings(db)]);
+  const hidden = new Set((settings.hiddenModels || []).map(modelKey).filter(Boolean));
+  const fx = settings.fxToAud || {};
+  const groups = [];
+  let hiddenUnits = 0;
+  let belowCostUnits = 0;
+  for (const g of snap.groups) {
+    const { costs, ...base } = g;
+    if (hidden.has(modelKey(g.model))) {
+      hiddenUnits += g.qty;
+      continue;
+    }
     const p = priceFor(idx, g);
-    return { ...g, price: p ? p.price : null, currency: p ? p.currency : null };
-  });
-  return { ...snap, groups };
+    if (!p) {
+      groups.push({ ...base, price: null, currency: null });
+      continue;
+    }
+    const low = (costs || []).filter((c) => {
+      const aud = costInAud(c, fx);
+      return aud != null && p.currency === "AUD" && aud > p.price;
+    }).length;
+    if (g.qty - low > 0) groups.push({ ...base, qty: g.qty - low, price: p.price, currency: p.currency });
+    if (low > 0) {
+      groups.push({ ...base, qty: low, price: null, currency: null, belowCost: true });
+      belowCostUnits += low;
+    }
+  }
+  return {
+    ...snap,
+    groups,
+    units: snap.units - hiddenUnits,
+    hiddenUnits,
+    belowCostUnits,
+  };
 }
 
 module.exports = {
