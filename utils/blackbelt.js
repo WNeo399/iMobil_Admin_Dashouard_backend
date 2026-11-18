@@ -166,6 +166,10 @@ function parseReport(xml) {
     // (user 2026-11-10): any one makes the device's Blackbelt status
     // "Warning". NOT TESTED / NOT SUPPORTED don't count.
     failedTests: failedTestsOf(collectTests(tree)),
+    // Whether the test run finished: "Completed", "Not Completed" or
+    // "Failed" (aborted). Only a Completed report holds the test results —
+    // anything else is a Blackbelt "Warning" too (user 2026-11-18).
+    reportState: reportStateOf(tree),
   };
   // A report with nothing identifying in it is no use to the caller.
   if (!data.modelName && !data.brandName && !data.imei && !data.serialNumber) return null;
@@ -226,13 +230,17 @@ async function searchOn(token, code, field) {
   for (const d of devices) {
     for (const rep of asArray(d && (d.report || d.reports))) {
       const id = rep && (rep["@id"] || rep.id || rep["@_id"]);
-      if (id) reports.push({ id: String(id), date: (rep && rep.date) || "" });
+      if (id) reports.push({ id: String(id), date: (rep && rep.date) || "", status: str(rep && rep.status) });
     }
   }
   if (!reports.length) return null;
   // Newest first; reports without a usable date keep their original order.
   reports.sort((a, b) => String(b.date).localeCompare(String(a.date)));
-  return reports[0].id;
+  // The newest COMPLETED run wins (user 2026-11-18): a later run that was
+  // aborted or never finished holds no test results, so it must not hide
+  // a full test. With no completed run, the newest one is all there is.
+  const done = reports.find((r) => r.status.toLowerCase() === "completed");
+  return (done || reports[0]).id;
 }
 
 // Find the device's report id. 15 pure digits is an IMEI and goes to the
@@ -301,6 +309,17 @@ function collectTests(tree) {
 // Names of the tests that came back FAIL ([] when none did).
 function failedTestsOf(tests) {
   return (tests || []).filter((t) => String(t.result).trim().toUpperCase() === "FAIL").map((t) => t.name);
+}
+
+// The report's <DataWipe><Result>: 1 = Completed, 2 = Not Completed,
+// 0 = Failed (test aborted) — the same words Blackbelt's report list uses
+// (checked against it on 27 reports, 2026-11-18). "" when unknown.
+const REPORT_STATES = { 1: "Completed", 2: "Not Completed", 0: "Failed" };
+function reportStateOf(tree) {
+  const wipe = findNode(tree, "DataWipe");
+  const raw = wipe && (wipe.Result != null ? wipe.Result : wipe.result);
+  const code = raw == null ? "" : String(typeof raw === "object" ? raw["#text"] : raw).trim();
+  return code !== "" && REPORT_STATES[code] ? REPORT_STATES[code] : "";
 }
 
 function parseReportDetail(xml) {
@@ -380,6 +399,8 @@ function parseReportDetail(xml) {
 
   return {
     status: f("Status"),
+    // Completed / Not Completed / Failed — see reportStateOf
+    reportState: reportStateOf(tree),
     testCaseFails: toInt(findField(tree, "TestCaseFails")),
     device,
     battery,

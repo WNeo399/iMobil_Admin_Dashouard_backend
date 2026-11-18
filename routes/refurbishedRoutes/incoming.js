@@ -122,6 +122,8 @@ async function askBlackbelt(code) {
           reportStatus: d.reportStatus || "",
           // FAIL tests in the report — any one = Blackbelt status "Warning"
           failedTests: d.failedTests || [],
+          // Not "Completed" (an unfinished / aborted run) = "Warning" too
+          reportState: d.reportState || "",
         },
       };
     }
@@ -184,18 +186,24 @@ async function applyBlackbeltToRegister(db, code, result, by) {
     const failedKnown = Array.isArray(bb.failedTests);
     const failsChanged = failedKnown && (d.blackbeltFailedTests || []).join("|") !== bb.failedTests.join("|");
     const failsNew = failedKnown && !Array.isArray(d.blackbeltFailedTests);
-    if (!changes.length && !newlyChecked && !reportChanged && !failsChanged && !failsNew) continue;
+    // Likewise the run's state (Completed / Not Completed / Failed).
+    const stateKnown = typeof bb.reportState === "string" && bb.reportState !== "";
+    const stateChanged = stateKnown && d.blackbeltReportState !== bb.reportState;
+    if (!changes.length && !newlyChecked && !reportChanged && !failsChanged && !failsNew && !stateChanged) continue;
 
     const $set = { ...answered, blackbeltChecked: true, updatedAt: now };
     if (result.bbReportId) $set.blackbeltReportId = result.bbReportId;
     if (bb.reportStatus) $set.blackbeltStatus = bb.reportStatus;
     if (failedKnown) $set.blackbeltFailedTests = bb.failedTests;
+    if (stateKnown) $set.blackbeltReportState = bb.reportState;
 
     const described = changes
       .filter(([f]) => ["model", "color", "storage", "brand"].includes(f))
       .map(([f, v]) => `${f} → ${v}`)
       .join(", ");
-    const warned = failedKnown && bb.failedTests.length && failsChanged ? ` · Warning: FAIL ${bb.failedTests.join(", ")}` : "";
+    const warned =
+      (failedKnown && bb.failedTests.length && failsChanged ? ` · Warning: FAIL ${bb.failedTests.join(", ")}` : "") +
+      (stateChanged && bb.reportState !== "Completed" ? ` · Warning: report ${bb.reportState}` : "");
     const action = (described
       ? `Blackbelt check updated ${described}`
       : "Blackbelt check confirmed the device details") + warned;
@@ -500,7 +508,7 @@ router.get("/:id", MANAGE, async (req, res) => {
             .collection(DEVICES)
             .find(
               { $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] },
-              { projection: { imei: 1, costPrice: 1, currency: 1, supplierPrice: 1, supplierCurrency: 1, blackbeltFailedTests: 1 } },
+              { projection: { imei: 1, costPrice: 1, currency: 1, supplierPrice: 1, supplierCurrency: 1, blackbeltFailedTests: 1, blackbeltReportState: 1 } },
             )
             .toArray()
         : [];
@@ -530,7 +538,12 @@ router.get("/:id", MANAGE, async (req, res) => {
           : l.bbDevice && Array.isArray(l.bbDevice.failedTests)
             ? l.bbDevice.failedTests
             : [];
-      return { ...l, ourPrice, supplierPriceLive, supplierCurrencyLive, bbFailedTests };
+      // …and whether that report's run finished ("" = not known).
+      const bbReportState =
+        d && typeof d.blackbeltReportState === "string"
+          ? d.blackbeltReportState
+          : (l.bbDevice && l.bbDevice.reportState) || "";
+      return { ...l, ourPrice, supplierPriceLive, supplierCurrencyLive, bbFailedTests, bbReportState };
     });
 
     return res.json({
@@ -830,6 +843,7 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
       blackbeltReportId: l.bbReportId || "",
       blackbeltStatus: bb.reportStatus || "",
       ...(Array.isArray(bb.failedTests) ? { blackbeltFailedTests: bb.failedTests } : {}),
+      ...(bb.reportState ? { blackbeltReportState: bb.reportState } : {}),
       note: "",
       incomingBatchId: batch._id,
       history,
@@ -880,6 +894,9 @@ async function receiveScanned({ db, batch }, req, codes, { location, sale = null
             : Array.isArray(held.blackbeltFailedTests)
               ? { blackbeltFailedTests: held.blackbeltFailedTests }
               : {}),
+          ...(doc.blackbeltReportState || held.blackbeltReportState
+            ? { blackbeltReportState: doc.blackbeltReportState || held.blackbeltReportState }
+            : {}),
           location,
           status: doc.status,
           salesOrder: doc.salesOrder,

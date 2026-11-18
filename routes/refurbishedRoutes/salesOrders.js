@@ -159,7 +159,7 @@ router.get("/:id", VIEW, async (req, res) => {
       const devs = await db
         .collection("refurb_devices")
         .find({ _id: { $in: ids.map((x) => new ObjectId(String(x))) } })
-        .project({ blackbeltChecked: 1, blackbeltStatus: 1, blackbeltReportId: 1, blackbeltFailedTests: 1 })
+        .project({ blackbeltChecked: 1, blackbeltStatus: 1, blackbeltReportId: 1, blackbeltFailedTests: 1, blackbeltReportState: 1 })
         .toArray();
       const byId = new Map(devs.map((d) => [String(d._id), d]));
       for (const l of order.lines) {
@@ -171,8 +171,10 @@ router.get("/:id", VIEW, async (req, res) => {
               hasReport: !!d.blackbeltReportId,
               // FAIL tests in the report — any one = Blackbelt "Warning" (2026-11-10)
               failedTests: Array.isArray(d.blackbeltFailedTests) ? d.blackbeltFailedTests : [],
+              // Not "Completed" = the run never finished = "Warning" (2026-11-18)
+              reportState: d.blackbeltReportState || "",
             }
-          : { checked: false, status: "", hasReport: false, missing: true, failedTests: [] };
+          : { checked: false, status: "", hasReport: false, missing: true, failedTests: [], reportState: "" };
       }
     }
     return res.json({ success: true, order });

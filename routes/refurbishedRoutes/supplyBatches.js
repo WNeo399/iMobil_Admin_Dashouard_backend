@@ -650,6 +650,7 @@ router.post("/:id/confirm", MANAGE, async (req, res) => {
               aNumber: d.aNumber || "",
               reportStatus: d.blackbeltStatus || "",
               ...(Array.isArray(d.blackbeltFailedTests) ? { failedTests: d.blackbeltFailedTests } : {}),
+              ...(d.blackbeltReportState ? { reportState: d.blackbeltReportState } : {}),
             }
           : null,
         received: false,

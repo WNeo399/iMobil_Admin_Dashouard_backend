@@ -165,7 +165,16 @@ function buildDevice(body, { partial = false } = {}) {
   // Left off when not sent: a missing field means "not evaluated yet".
   const failed = failedTestsList(body.blackbeltFailedTests);
   if (failed) doc.blackbeltFailedTests = failed;
+  // Whether that report's test run finished (anything but "Completed" =
+  // "Warning"). Same rule: left off when not sent or not a known state.
+  const state = reportState(body.blackbeltReportState);
+  if (state) doc.blackbeltReportState = state;
   return doc;
+}
+
+const REPORT_STATES = ["Completed", "Not Completed", "Failed"];
+function reportState(v) {
+  return REPORT_STATES.includes(v) ? v : null;
 }
 
 // A list of test names (the lookup's blackbeltFailedTests), tidied; null
@@ -491,6 +500,8 @@ router.get("/lookup", VIEW, async (req, res) => {
       blackbeltStatus: d.reportStatus || "",
       // FAIL tests in the report — any one = Blackbelt status "Warning"
       blackbeltFailedTests: d.failedTests || [],
+      // "Completed" / "Not Completed" / "Failed" — not Completed = "Warning"
+      blackbeltReportState: d.reportState || "",
       device: {
         // Keep the scanned code as the register's key — the report's own
         // IMEI field is blank for serial-number lookups.
@@ -598,6 +609,7 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
       blackbeltReportId: r.reportID || "",
       blackbeltStatus: d.reportStatus || "",
       blackbeltFailedTests: d.failedTests || [],
+      blackbeltReportState: d.reportState || "",
       updatedAt: new Date(),
       updatedBy: (req.user && req.user.username) || null,
     };
@@ -657,7 +669,12 @@ router.post("/:id/blackbelt-check", MANAGE, async (req, res) => {
       blank.length ? `this report has no ${blank.join(" or ")}` : "",
     ].filter(Boolean);
     if (set.blackbeltFailedTests.length) parts.push(`Warning: FAIL ${set.blackbeltFailedTests.join(", ")}`);
-    const message = `Report found — ${parts.join(" · ") || "everything already matches"}`;
+    if (set.blackbeltReportState && set.blackbeltReportState !== "Completed") {
+      parts.push(`Warning: the report is ${set.blackbeltReportState} — test the device again in Blackbelt`);
+    }
+    // A refresh that picked up a different run is worth saying so.
+    const newer = !!existing.blackbeltReportId && set.blackbeltReportId && set.blackbeltReportId !== existing.blackbeltReportId;
+    const message = `${newer ? `New report ${set.blackbeltReportId}` : "Report found"} — ${parts.join(" · ") || "everything already matches"}`;
 
     const changes = diffDevice(existing, set);
     const update = { $set: set };

@@ -123,6 +123,8 @@ async function askBlackbelt(code) {
           reportStatus: d.reportStatus || "",
           // FAIL tests in the report — any one = Blackbelt status "Warning"
           failedTests: d.failedTests || [],
+          // Not "Completed" (an unfinished / aborted run) = "Warning" too
+          reportState: d.reportState || "",
         },
       };
     }
@@ -159,6 +161,7 @@ function repairingGhost(line, { batchId, stockSource, currency, title, who, now 
     blackbeltReportId: line.bbReportId || "",
     blackbeltStatus: bb.reportStatus || "",
     ...(Array.isArray(bb.failedTests) ? { blackbeltFailedTests: bb.failedTests } : {}),
+    ...(bb.reportState ? { blackbeltReportState: bb.reportState } : {}),
     note: "",
     repairBatchId: batchId,
     history: [{ at: now, by: who, action: "created", note: `Uploaded on repair batch ${title}` }],
@@ -235,7 +238,7 @@ router.get("/:id", VIEW, async (req, res) => {
     const devs = ids.length || codes.length
       ? await ctx.db
           .collection(DEVICES)
-          .find({ $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] }, { projection: { imei: 1, blackbeltFailedTests: 1 } })
+          .find({ $or: [{ _id: { $in: ids } }, { imei: { $in: codes } }] }, { projection: { imei: 1, blackbeltFailedTests: 1, blackbeltReportState: 1 } })
           .toArray()
       : [];
     const byId = new Map(devs.map((d) => [String(d._id), d]));
@@ -248,7 +251,11 @@ router.get("/:id", VIEW, async (req, res) => {
           : l.bbDevice && Array.isArray(l.bbDevice.failedTests)
             ? l.bbDevice.failedTests
             : [];
-      return { ...l, bbFailedTests };
+      const bbReportState =
+        d && typeof d.blackbeltReportState === "string"
+          ? d.blackbeltReportState
+          : (l.bbDevice && l.bbDevice.reportState) || "";
+      return { ...l, bbFailedTests, bbReportState };
     });
     return res.json({ success: true, batch: { ...ctx.batch, lines: shaped, summary: summarize(ctx.batch) } });
   } catch (e) {
@@ -319,6 +326,9 @@ router.post("/", MANAGE, async (req, res) => {
                 batteryCapacity: str(r.bbDevice.batteryCapacity, 40),
                 aNumber: str(r.bbDevice.aNumber, 40),
                 reportStatus: str(r.bbDevice.reportStatus, 200),
+                ...(["Completed", "Not Completed", "Failed"].includes(r.bbDevice.reportState)
+                  ? { reportState: r.bbDevice.reportState }
+                  : {}),
                 ...(Array.isArray(r.bbDevice.failedTests)
                   ? { failedTests: r.bbDevice.failedTests.map((t) => str(t, 60)).filter(Boolean).slice(0, 50) }
                   : {}),
@@ -965,6 +975,7 @@ router.post("/:id/return", MANAGE, async (req, res, next) => {
             blackbeltReportId: l.bbReportId || "",
             blackbeltStatus: bb.reportStatus || "",
             ...(Array.isArray(bb.failedTests) ? { blackbeltFailedTests: bb.failedTests } : {}),
+            ...(bb.reportState ? { blackbeltReportState: bb.reportState } : {}),
             note: l.issues ? `Repaired: ${l.issues}` : "",
             repairBatchId: batch._id,
             history: [
