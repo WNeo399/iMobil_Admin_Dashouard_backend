@@ -8,6 +8,17 @@
 //   GET  /stock-chat/:token        who the link is for + today's usage
 //   POST /stock-chat/:token/ask    { messages: [{ role, text }] } → answer
 //
+// Server API (2026-11-18) for our WhatsApp helper, which answers customers
+// inside WhatsApp. Authenticated by the X-API-Key header (env
+// STOCK_CHAT_API_KEY, comma-separated to allow a rotation overlap); the
+// customer is the phone number WhatsApp gives that server.
+//
+//   POST /stock-chat/customer      { phone } → { enabled, name }
+//   POST /stock-chat/ask           { phone, channel: "whatsapp", messages } → answer
+//
+// Refusals carry a `code` (BAD_API_KEY, NOT_A_CUSTOMER, DISABLED, ...); only
+// that server calls these, never the dashboard's axios client.
+//
 // The AI never touches the database. It gets three fixed tools over the
 // customer-safe stock view in utils/stockChat.js (model / storage / grade /
 // colour / quantity / listed price — nothing else), and the rows shown to
@@ -17,6 +28,7 @@
 var express = require("express");
 var router = express.Router();
 var rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 const Anthropic = require("@anthropic-ai/sdk");
 const { connectToDatabase } = require("../../utils/mongodb");
 const SC = require("../../utils/stockChat");
@@ -52,7 +64,7 @@ const askLimiter = rateLimit({
   message: { success: false, message: "Too many questions at once — please wait a minute." },
 });
 
-const busy = new Set(); // one question at a time per link
+const busy = new Set(); // one question at a time per customer (web and WhatsApp share it)
 
 async function customerFor(db, token) {
   if (!TOKEN_RE.test(String(token || ""))) return null;
@@ -165,7 +177,14 @@ const TOOLS = [
   },
 ];
 
-function systemPrompt(settings) {
+// Where the customer reaches our team: the web page sends them to WhatsApp;
+// on WhatsApp they're already talking to us.
+function contactLine(channel) {
+  return channel === "whatsapp" ? "ask our team here in this WhatsApp chat" : "message iMobile on WhatsApp";
+}
+
+function systemPrompt(settings, channel = "web") {
+  const contact = contactLine(channel);
   return [
     "You are the stock assistant for iMobile, an Australian wholesaler of refurbished phones, tablets and accessories. " +
       "Wholesale customers use you to check what iMobile has in stock right now and the listed prices.",
@@ -174,10 +193,10 @@ function systemPrompt(settings) {
     "- Use the tools for every stock question. Every model, quantity and price you mention must come from a tool result in this turn — never guess, estimate or remember.",
     "- Model names in stock can be written loosely (e.g. 'IPAD 9' and 'iPad 9th Gen WiFi', or 'PRO1 耳机' for AirPods Pro). If a search finds nothing, try list_models and shorter words before saying it's not in stock.",
     "- Storage goes in the storage filter, not in the query words.",
-    "- A row without a listed price shows 'Contact us' — tell the customer to message iMobile on WhatsApp for that price. Never quote a price that isn't listed.",
+    `- A row without a listed price shows 'Contact us' — tell the customer to ${contact} for that price. Never quote a price that isn't listed.`,
     `- Listed prices: ${settings.priceNote || "as shown"}.`,
     "- Grades are as listed (e.g. A++, A+, A, B). 'Ungraded' means the unit hasn't been graded yet. Don't explain what a grade means beyond that — suggest asking iMobile.",
-    "- You can't take orders, hold stock, give discounts or promise delivery. To buy or reserve, the customer messages iMobile on WhatsApp.",
+    `- You can't take orders, hold stock, give discounts or promise delivery. To buy or reserve, the customer should ${contact}.`,
     "- Only talk about iMobile's current stock and prices. Politely decline anything else in one sentence.",
     "- You only know model, storage, grade, colour, quantity and listed price. You have no costs, suppliers, IMEIs or warehouse details — say so if asked.",
     "- Reply in the customer's language. Keep it short and friendly.",
@@ -185,6 +204,12 @@ function systemPrompt(settings) {
     "  · One or two specific models: layout 'cards' with the rows in `show`.",
     "  · Broad questions (everything in stock, a brand, all iPads / iPhones, many models): layout 'list' with `show_matching` " +
       "(e.g. {} for all stock, {query: 'ipad'} for iPads) — the page lists every matching row grouped by model.",
+    ...(channel === "whatsapp"
+      ? [
+          "- This customer is on WhatsApp: the rows are listed under your text as a WhatsApp message. Write plain text — no markdown, " +
+            "headings or tables — and don't say 'cards', 'below on the page' or 'click'.",
+        ]
+      : []),
   ].join("\n");
 }
 
@@ -384,148 +409,265 @@ function buildMessages(raw) {
   return out;
 }
 
-// ── POST /stock-chat/:token/ask ─────────────────────────────────────
-router.post("/:token/ask", askLimiter, async (req, res) => {
-  const token = String(req.params.token || "");
+// A refusal with an HTTP status, a machine-readable code (server API only)
+// and a message the customer can read.
+class AskError extends Error {
+  constructor(status, code, message, extra) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.extra = extra || {};
+  }
+}
+
+const AI_BUSY = "The assistant is busy — please try again in a minute.";
+const AI_FAILED = "Something went wrong — please try again.";
+
+// Answers one question for one customer — shared by the web page (link
+// token) and the server API (phone number). Returns the reply body or
+// throws an AskError. Every answered question is logged and counted for the
+// day; a failed one is logged for staff but not counted.
+async function answerQuestion(db, customer, rawMessages, channel) {
   const started = Date.now();
-  let db;
-  let customer;
-  let question = "";
+  // Checked on the raw text: buildMessages already cuts it to MAX_QUESTION.
+  // A little over is trimmed; a long paste is refused.
+  const raw = Array.isArray(rawMessages) ? rawMessages : [];
+  const rawLast = raw[raw.length - 1];
+  if (rawLast && rawLast.role !== "assistant" && SC.clean(rawLast.text).length > MAX_QUESTION + 200) {
+    throw new AskError(400, "BAD_REQUEST", `Please keep questions under ${MAX_QUESTION} characters.`);
+  }
+  const messages = buildMessages(raw);
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== "user") throw new AskError(400, "BAD_REQUEST", "Type a question first.");
+  const question = String(last.content).slice(0, MAX_QUESTION);
+
+  const settings = await SC.getSettings(db);
+  const used = await usedToday(db, customer._id);
+  if (settings.dailyLimit > 0 && used >= settings.dailyLimit) {
+    throw new AskError(
+      429,
+      "LIMIT_REACHED",
+      channel === "whatsapp"
+        ? "You've reached today's question limit. Please try again tomorrow."
+        : "You've reached today's question limit. Please message us on WhatsApp, or try again tomorrow.",
+      { used, limit: settings.dailyLimit },
+    );
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    throw new AskError(503, "UNAVAILABLE", "The stock assistant isn't available right now.");
+  }
+  const lock = String(customer._id);
+  if (busy.has(lock)) throw new AskError(429, "BUSY", "Still answering your last question…");
+  busy.add(lock);
+
   const log = { tools: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  const who = { customerId: customer._id, phone: customer.phone, name: customer.name || "", channel };
   try {
-    db = await connectToDatabase();
-    customer = await customerFor(db, token);
-    if (!customer) return res.status(404).json({ success: false, message: NOT_ACTIVE });
+    const stock = await SC.pricedStock();
+    const groups = stock.groups;
+    const client = new Anthropic();
+    let answer = "";
+    let rows = [];
+    let layout = "cards";
+    let more = 0;
+    let done = false;
 
-    const messages = buildMessages(req.body && req.body.messages);
-    const last = messages[messages.length - 1];
-    if (!last || last.role !== "user") {
-      return res.status(400).json({ success: false, message: "Type a question first." });
-    }
-    question = String(last.content).slice(0, MAX_QUESTION);
-    if (String(last.content).length > MAX_QUESTION + 200) {
-      return res.status(400).json({ success: false, message: `Please keep questions under ${MAX_QUESTION} characters.` });
-    }
-
-    const settings = await SC.getSettings(db);
-    const used = await usedToday(db, customer._id);
-    if (settings.dailyLimit > 0 && used >= settings.dailyLimit) {
-      return res.status(429).json({
-        success: false,
-        message: "You've reached today's question limit. Please message us on WhatsApp, or try again tomorrow.",
-        used,
-        limit: settings.dailyLimit,
-      });
-    }
-    if (!process.env.ANTHROPIC_API_KEY) {
-      return res.status(503).json({ success: false, message: "The stock assistant isn't available right now." });
-    }
-    if (busy.has(token)) {
-      return res.status(429).json({ success: false, message: "Still answering your last question…" });
-    }
-    busy.add(token);
-
-    try {
-      const stock = await SC.pricedStock();
-      const groups = stock.groups;
-      const client = new Anthropic();
-      let answer = "";
-      let rows = [];
-      let layout = "cards";
-      let done = false;
-
-      for (let i = 0; i < MAX_ITERS && !done; i++) {
-        // On the last round only `reply` is offered, so the answer always lands.
-        const lastRound = i === MAX_ITERS - 1;
-        const resp = await client.messages.create({
-          model: MODEL,
-          max_tokens: MAX_TOKENS,
-          system: [{ type: "text", text: systemPrompt(settings), cache_control: { type: "ephemeral" } }],
-          tools: TOOLS,
-          tool_choice: lastRound ? { type: "tool", name: "reply" } : { type: "any" },
-          messages,
-        });
-        const u = resp.usage || {};
-        log.usage.input += u.input_tokens || 0;
-        log.usage.output += u.output_tokens || 0;
-        log.usage.cacheRead += u.cache_read_input_tokens || 0;
-        log.usage.cacheWrite += u.cache_creation_input_tokens || 0;
-        messages.push({ role: "assistant", content: resp.content });
-
-        const calls = resp.content.filter((b) => b.type === "tool_use");
-        if (!calls.length) {
-          answer = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-          break;
-        }
-        const results = [];
-        for (const call of calls) {
-          log.tools.push({ name: call.name, input: call.input });
-          if (call.name === "reply") {
-            answer = SC.clean(call.input && call.input.text) ? String(call.input.text).trim() : "";
-            const built = buildReply(groups, call.input);
-            rows = built.rows;
-            layout = built.layout;
-            done = true;
-            results.push({ type: "tool_result", tool_use_id: call.id, content: "Sent." });
-          } else {
-            let out;
-            if (call.name === "list_models") out = toolListModels(groups, call.input);
-            else if (call.name === "search_stock") out = toolSearch(groups, call.input);
-            else out = { error: `Unknown tool ${call.name}` };
-            results.push({ type: "tool_result", tool_use_id: call.id, content: JSON.stringify(out) });
-          }
-        }
-        if (!done) messages.push({ role: "user", content: results });
-      }
-
-      if (!answer && !rows.length) answer = "Sorry, I couldn't work that out — please try asking another way.";
-      log.answer = answer;
-      log.rows = rows.length;
-      const nowUsed = used + 1;
-      await db.collection(SC.LOG).insertOne({
-        customerId: customer._id,
-        phone: customer.phone,
-        name: customer.name || "",
-        day: SC.melbourneDay(),
-        at: new Date(),
-        question,
-        answer,
-        rows: rows.length,
-        layout,
-        tools: log.tools,
-        usage: log.usage,
+    for (let i = 0; i < MAX_ITERS && !done; i++) {
+      // On the last round only `reply` is offered, so the answer always lands.
+      const lastRound = i === MAX_ITERS - 1;
+      const resp = await client.messages.create({
         model: MODEL,
-        ms: Date.now() - started,
+        max_tokens: MAX_TOKENS,
+        system: [{ type: "text", text: systemPrompt(settings, channel), cache_control: { type: "ephemeral" } }],
+        tools: TOOLS,
+        tool_choice: lastRound ? { type: "tool", name: "reply" } : { type: "any" },
+        messages,
       });
-      await db.collection(SC.CUSTOMERS).updateOne({ _id: customer._id }, { $set: { lastUsedAt: new Date() } });
-      return res.json({
-        success: true,
-        answer,
-        rows,
-        layout,
-        priceNote: settings.priceNote || "",
-        used: nowUsed,
-        limit: settings.dailyLimit,
-      });
-    } finally {
-      busy.delete(token);
+      const u = resp.usage || {};
+      log.usage.input += u.input_tokens || 0;
+      log.usage.output += u.output_tokens || 0;
+      log.usage.cacheRead += u.cache_read_input_tokens || 0;
+      log.usage.cacheWrite += u.cache_creation_input_tokens || 0;
+      messages.push({ role: "assistant", content: resp.content });
+
+      const calls = resp.content.filter((b) => b.type === "tool_use");
+      if (!calls.length) {
+        answer = resp.content.filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+        break;
+      }
+      const results = [];
+      for (const call of calls) {
+        log.tools.push({ name: call.name, input: call.input });
+        if (call.name === "reply") {
+          answer = SC.clean(call.input && call.input.text) ? String(call.input.text).trim() : "";
+          const built = buildReply(groups, call.input);
+          rows = built.rows;
+          layout = built.layout;
+          more = built.more;
+          done = true;
+          results.push({ type: "tool_result", tool_use_id: call.id, content: "Sent." });
+        } else {
+          let out;
+          if (call.name === "list_models") out = toolListModels(groups, call.input);
+          else if (call.name === "search_stock") out = toolSearch(groups, call.input);
+          else out = { error: `Unknown tool ${call.name}` };
+          results.push({ type: "tool_result", tool_use_id: call.id, content: JSON.stringify(out) });
+        }
+      }
+      if (!done) messages.push({ role: "user", content: results });
     }
+
+    if (!answer && !rows.length) answer = "Sorry, I couldn't work that out — please try asking another way.";
+    await db.collection(SC.LOG).insertOne({
+      ...who,
+      day: SC.melbourneDay(),
+      at: new Date(),
+      question,
+      answer,
+      rows: rows.length,
+      layout,
+      tools: log.tools,
+      usage: log.usage,
+      model: MODEL,
+      ms: Date.now() - started,
+    });
+    await db.collection(SC.CUSTOMERS).updateOne({ _id: customer._id }, { $set: { lastUsedAt: new Date() } });
+    return {
+      answer,
+      rows,
+      layout,
+      more,
+      priceNote: settings.priceNote || "",
+      used: used + 1,
+      limit: settings.dailyLimit,
+    };
   } catch (e) {
     console.error("Stock chat ask error:", e);
-    let message = "Something went wrong — please try again.";
-    if (e && (e.status === 429 || e.status === 529)) message = "The assistant is busy — please try again in a minute.";
-    // A failed question is logged (for staff) but not counted against the day.
-    if (db && customer) {
-      db.collection(SC.LOG).insertOne({
-        customerId: customer._id, phone: customer.phone, name: customer.name || "", day: null, failedDay: SC.melbourneDay(),
-        at: new Date(), question, error: (e && e.message) || String(e), tools: log.tools, usage: log.usage, model: MODEL,
-        ms: Date.now() - started,
-      }).catch(() => {});
+    db.collection(SC.LOG)
+      .insertOne({
+        ...who, day: null, failedDay: SC.melbourneDay(), at: new Date(), question,
+        error: (e && e.message) || String(e), tools: log.tools, usage: log.usage, model: MODEL, ms: Date.now() - started,
+      })
+      .catch(() => {});
+    if (e && (e.status === 429 || e.status === 529)) throw new AskError(503, "UNAVAILABLE", AI_BUSY);
+    throw new AskError(500, "ERROR", AI_FAILED);
+  } finally {
+    busy.delete(lock);
+  }
+}
+
+// ── POST /stock-chat/:token/ask ─────────────────────────────────────
+// The web page's body has no `code` and keeps its old statuses (an AI
+// overload stays a 500 there).
+router.post("/:token/ask", askLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await customerFor(db, req.params.token);
+    if (!customer) return res.status(404).json({ success: false, message: NOT_ACTIVE });
+    const out = await answerQuestion(db, customer, req.body && req.body.messages, "web");
+    return res.json({ success: true, ...out });
+  } catch (e) {
+    if (e instanceof AskError) {
+      const status = e.code === "UNAVAILABLE" && e.message === AI_BUSY ? 500 : e.status;
+      return res.status(status).json({ success: false, message: e.message, ...e.extra });
     }
-    return res.status(500).json({ success: false, message });
+    console.error("Stock chat ask error:", e);
+    return res.status(500).json({ success: false, message: AI_FAILED });
+  }
+});
+
+// ── server API (WhatsApp helper) ─────────────────────────────────────
+const API_CHANNELS = ["whatsapp"];
+
+function apiKeys() {
+  return String(process.env.STOCK_CHAT_API_KEY || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 16);
+}
+
+const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest();
+
+// Compares hashes so the check takes the same time whatever was sent.
+function apiKeyMatches(given) {
+  if (!given) return false;
+  const g = sha256(given);
+  let ok = false;
+  for (const k of apiKeys()) if (crypto.timingSafeEqual(g, sha256(k))) ok = true;
+  return ok;
+}
+
+function apiFail(res, status, code, message, extra) {
+  return res.status(status).json({ success: false, code, message, ...(extra || {}) });
+}
+
+function requireApiKey(req, res, next) {
+  if (!apiKeys().length) return apiFail(res, 503, "UNAVAILABLE", "The server API isn't set up yet.");
+  if (!apiKeyMatches(req.get("X-API-Key"))) return apiFail(res, 401, "BAD_API_KEY", "Missing or wrong X-API-Key.");
+  return next();
+}
+
+const phoneOf = (req) => SC.normalizePhone(req.body && req.body.phone);
+
+const apiLimit = (max, keyGenerator, message) =>
+  rateLimit({
+    windowMs: 60 * 1000,
+    max,
+    keyGenerator,
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: false,
+    message: { success: false, code: "TOO_MANY_REQUESTS", message },
+  });
+// After the key check, so callers without the key can't use up the budget.
+const apiAllLimiter = apiLimit(300, () => "server-api", "Too many requests — please wait a minute.");
+const apiAskLimiter = apiLimit(8, (req) => "phone:" + (phoneOf(req) || "-"), "Too many questions from this number — please wait a minute.");
+
+// The customer's own web page (the link staff send), e.g. for "see the
+// full list" under a long WhatsApp answer.
+function pageLinkFor(customer) {
+  const base = String(process.env.STOCK_CHAT_PAGE_URL || "https://imbadmin.up.railway.app").replace(/\/+$/, "");
+  return customer.token ? `${base}/stock/${customer.token}` : null;
+}
+
+// ── POST /stock-chat/customer ────────────────────────────────────────
+router.post("/customer", requireApiKey, apiAllLimiter, async (req, res) => {
+  try {
+    const phone = phoneOf(req);
+    if (!phone) return apiFail(res, 400, "BAD_REQUEST", "phone is missing or not a valid number.");
+    const db = await connectToDatabase();
+    const c = await db.collection(SC.CUSTOMERS).findOne({ phone }, { projection: { name: 1, enabled: 1 } });
+    if (!c) return apiFail(res, 404, "NOT_A_CUSTOMER", "This number isn't on the Stock Chat list.", { phone });
+    return res.json({ success: true, phone, enabled: c.enabled === true, name: c.name || "" });
+  } catch (e) {
+    console.error("Stock chat customer lookup error:", e);
+    return apiFail(res, 500, "ERROR", AI_FAILED);
+  }
+});
+
+// ── POST /stock-chat/ask ─────────────────────────────────────────────
+router.post("/ask", requireApiKey, apiAllLimiter, apiAskLimiter, async (req, res) => {
+  try {
+    const phone = phoneOf(req);
+    if (!phone) return apiFail(res, 400, "BAD_REQUEST", "phone is missing or not a valid number.");
+    const channel = req.body.channel == null || req.body.channel === "" ? "whatsapp" : String(req.body.channel);
+    if (!API_CHANNELS.includes(channel)) return apiFail(res, 400, "BAD_REQUEST", `channel must be one of: ${API_CHANNELS.join(", ")}.`);
+    const db = await connectToDatabase();
+    const customer = await db.collection(SC.CUSTOMERS).findOne({ phone });
+    if (!customer) return apiFail(res, 404, "NOT_A_CUSTOMER", "This number isn't on the Stock Chat list.", { phone });
+    const who = { name: customer.name || "", enabled: customer.enabled === true };
+    if (customer.enabled !== true) return apiFail(res, 403, "DISABLED", "This number is switched off for Stock Chat.", { customer: who });
+    const out = await answerQuestion(db, customer, req.body.messages, channel);
+    return res.json({ success: true, ...out, link: pageLinkFor(customer), customer: who });
+  } catch (e) {
+    if (e instanceof AskError) return apiFail(res, e.status, e.code, e.message, e.extra);
+    console.error("Stock chat API ask error:", e);
+    return apiFail(res, 500, "ERROR", AI_FAILED);
   }
 });
 
 module.exports = router;
 // exposed for the offline tests
-module.exports._internals = { toolSearch, toolListModels, resolveShow, buildReply, buildMessages, matchesWords, TOOLS, systemPrompt };
+module.exports._internals = {
+  toolSearch, toolListModels, resolveShow, buildReply, buildMessages, matchesWords, TOOLS, systemPrompt, apiKeyMatches,
+};
