@@ -26,6 +26,7 @@ const { ObjectId } = require("mongodb");
 const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const blackbelt = require("../../utils/blackbelt");
+const { removeFromPendingSupplyDrafts } = require("../../utils/supplyDraftCleanup");
 const {
   DEFAULT_STOCK_SOURCE,
   normalizeStockSource,
@@ -89,6 +90,26 @@ function outcome(v) {
 
 function actor(req) {
   return (req.user && req.user.username) || null;
+}
+
+// Register entries a repair list created (status Repairing) leave with their
+// lines or their batch. Like any deleted device, they also leave the Pending
+// supply drafts that list them (user 2026-11-23) — a draft naming a deleted
+// device can't be saved or confirmed. The draft clean-up is non-fatal.
+async function deleteRepairGhosts(db, filter, who) {
+  const docs = await db
+    .collection(DEVICES)
+    .find(filter, { projection: { imei: 1, model: 1, storage: 1 } })
+    .toArray();
+  if (!docs.length) return { deletedCount: 0, removedFromDrafts: [] };
+  const r = await db.collection(DEVICES).deleteMany({ _id: { $in: docs.map((d) => d._id) } });
+  let removedFromDrafts = [];
+  try {
+    removedFromDrafts = await removeFromPendingSupplyDrafts(db, docs, who || "");
+  } catch (e) {
+    console.error("Repair batch: supply draft cleanup failed:", e);
+  }
+  return { deletedCount: r.deletedCount, removedFromDrafts };
 }
 
 // lookupDevice answers { found, device, reportID } — note the capital ID,
@@ -612,12 +633,13 @@ router.post("/:id/lines", MANAGE, async (req, res) => {
         .collection(BATCHES)
         .updateOne({ _id: batch._id }, { $set: set }, { arrayFilters: filters });
     }
+    let removedFromDrafts = [];
     if (removedDeviceIds.length) {
-      await db.collection(DEVICES).deleteMany({
-        _id: { $in: removedDeviceIds },
-        repairBatchId: batch._id,
-        status: STATUS_REPAIRING,
-      });
+      ({ removedFromDrafts } = await deleteRepairGhosts(
+        db,
+        { _id: { $in: removedDeviceIds }, repairBatchId: batch._id, status: STATUS_REPAIRING },
+        actor(req),
+      ));
     }
     if (added.length) {
       // Scanned extras that aren't in the register join it as Repairing,
@@ -661,6 +683,7 @@ router.post("/:id/lines", MANAGE, async (req, res) => {
     if (added.length) parts.push(`${added.length} added`);
     if (edits.length) parts.push(`${edits.length} updated`);
     if (removeCodes.length) parts.push(`${removeCodes.length} removed`);
+    if (removedFromDrafts.length) parts.push(`also taken off supply draft ${removedFromDrafts.join(", ")}`);
     return res.json({
       success: true,
       message: parts.join(" · "),
@@ -668,6 +691,7 @@ router.post("/:id/lines", MANAGE, async (req, res) => {
       updated: edits.length,
       removed: removeCodes.length,
       skipped,
+      removedFromDrafts,
     });
   } catch (e) {
     console.error("Save repair lines error:", e);
@@ -1095,9 +1119,7 @@ router.delete("/:id", MANAGE, async (req, res) => {
 
     // Register entries this list created that never came back as real
     // stock leave with the paperwork.
-    const ghosts = await db
-      .collection(DEVICES)
-      .deleteMany({ repairBatchId: batch._id, status: STATUS_REPAIRING });
+    const ghosts = await deleteRepairGhosts(db, { repairBatchId: batch._id, status: STATUS_REPAIRING }, actor(req));
 
     let restored = 0;
     if (away.length) {
@@ -1136,10 +1158,11 @@ router.delete("/:id", MANAGE, async (req, res) => {
     return res.json({
       success: true,
       removedDevices: ghosts.deletedCount,
+      removedFromDrafts: ghosts.removedFromDrafts,
       restored,
-      message: restored
-        ? `Repair batch removed — ${restored} device(s) put back`
-        : "Repair batch removed",
+      message:
+        (restored ? `Repair batch removed — ${restored} device(s) put back` : "Repair batch removed") +
+        (ghosts.removedFromDrafts.length ? ` · also taken off supply draft ${ghosts.removedFromDrafts.join(", ")}` : ""),
     });
   } catch (e) {
     console.error("Delete repair batch error:", e);

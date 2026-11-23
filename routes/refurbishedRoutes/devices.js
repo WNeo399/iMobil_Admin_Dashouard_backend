@@ -20,6 +20,7 @@ const { connectToDatabase } = require("../../utils/mongodb");
 const { requirePermission } = require("../../middleware/auth");
 const { actsAsPhoneSupplier } = require("../../constants/roles");
 const blackbelt = require("../../utils/blackbelt");
+const { removeFromPendingSupplyDrafts } = require("../../utils/supplyDraftCleanup");
 const {
   stockSourceForUser,
   locationForUser,
@@ -978,7 +979,7 @@ router.delete("/:id", MANAGE, async (req, res) => {
     // A sold device is referenced by its sales order — cancel that first.
     const existing = await db
       .collection(DEVICES)
-      .findOne({ _id }, { projection: { status: 1, salesOrder: 1, stockSource: 1, location: 1 } });
+      .findOne({ _id }, { projection: { status: 1, salesOrder: 1, stockSource: 1, location: 1, imei: 1, model: 1, storage: 1 } });
     if (!existing || outOfScope(req.user, existing)) {
       return res.status(404).json({ success: false, message: "Device not found" });
     }
@@ -1001,7 +1002,16 @@ router.delete("/:id", MANAGE, async (req, res) => {
     }
     const r = await db.collection(DEVICES).deleteOne({ _id });
     if (!r.deletedCount) return res.status(404).json({ success: false, message: "Device not found" });
-    return res.json({ success: true });
+    // It also leaves any Pending supply draft that lists it, or that draft
+    // could no longer be saved or confirmed (user 2026-11-23, SPL-10060).
+    // Non-fatal: the device is gone either way; the answer names the drafts.
+    let removedFromDrafts = [];
+    try {
+      removedFromDrafts = await removeFromPendingSupplyDrafts(db, [existing], (req.user && req.user.username) || "");
+    } catch (err) {
+      console.error("Refurb device delete: supply draft cleanup failed:", err);
+    }
+    return res.json({ success: true, removedFromDrafts });
   } catch (e) {
     console.error("Refurb device delete error:", e);
     return res.status(500).json({ success: false, message: "Failed to delete device" });
