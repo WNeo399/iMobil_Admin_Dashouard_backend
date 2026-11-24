@@ -362,14 +362,16 @@ router.get("/orders", VIEW, async (req, res, next) => {
     const col = db.collection(ORDERS);
     await fillSeaCategories(db);
     const counts = { total: { $sum: 1 }, open: { $sum: { $cond: [{ $in: ["$status", OPEN] }, 1, 0] } }, pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } } };
-    // Open urgent lines first (user ask 2026-10-29), then by date; the
-    // received list stays newest-received first.
+    // Urgent PENDING lines first (user ask 2026-10-29; since 2026-11-24 only
+    // pending ones — an urgent line already ordered or shipped sorts by its
+    // date like the rest), then by date; the received list stays
+    // newest-received first.
     const byDate = String(q.sort) === "received" ? { receivedAt: -1, _id: -1 } : { createdAt: dir, _id: dir };
     const pageRows = String(q.sort) === "received"
       ? col.find(match, { projection: { history: 0 } }).sort(byDate).skip((page - 1) * pageSize).limit(pageSize).toArray()
       : col.aggregate([
           { $match: match },
-          { $addFields: { _urgentTop: { $cond: [{ $and: [{ $eq: ["$urgent", true] }, { $in: ["$status", OPEN] }] }, 1, 0] } } },
+          { $addFields: { _urgentTop: { $cond: [{ $and: [{ $eq: ["$urgent", true] }, { $eq: ["$status", "pending"] }] }, 1, 0] } } },
           { $sort: { _urgentTop: -1, ...byDate } },
           { $skip: (page - 1) * pageSize },
           { $limit: pageSize },
@@ -408,9 +410,76 @@ router.get("/meta", requireAny("spp:order:view", "spp:batch:create"), async (req
   }
 });
 
+// Which batches already hold these order lines (user 2026-11-23: "raise a
+// warning when adding a line to a draft PB when it is already in another
+// batch"). Cancelled batches don't count; `selfId` — the draft being edited —
+// is left out. Map orderId → [{ id, batchNo, status, tracking, by, at }].
+async function inBatchesFor(db, ids, selfId) {
+  const list = [...new Set((ids || []).map((x) => String(x || "")))].filter(Boolean);
+  const out = new Map();
+  if (!list.length) return out;
+  const q = { status: { $ne: "cancelled" }, "lines.orderId": { $in: [...list.map(oid).filter(Boolean), ...list] } };
+  const self = oid(selfId);
+  if (self) q._id = { $ne: self };
+  const batches = await db.collection(BATCHES)
+    .find(q, { projection: { batchNo: 1, status: 1, tracking: 1, createdBy: 1, createdAt: 1, "lines.orderId": 1 } })
+    .toArray();
+  const want = new Set(list);
+  for (const b of batches) {
+    const brief = { id: String(b._id), batchNo: b.batchNo || "", status: b.status, tracking: b.tracking || "", by: b.createdBy || "", at: b.createdAt || null };
+    for (const l of b.lines || []) {
+      const k = String(l.orderId || "");
+      if (!want.has(k)) continue;
+      if (!out.has(k)) out.set(k, []);
+      if (!out.get(k).some((x) => x.id === brief.id)) out.get(k).push(brief);
+    }
+  }
+  return out;
+}
+
+// The waiting lines a picker / scan answers with carry `inBatches` when another
+// batch already holds them (?draft=<id> leaves the draft being edited out).
+// Patches res.json so the routes' many return paths stay as they are.
+function tagInBatches(req, res, next) {
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    const rows = body && body.success !== false ? [body.match, ...(body.all || []), ...(body.rows || [])].filter((r) => r && r._id) : [];
+    if (!rows.length) return json(body);
+    connectToDatabase()
+      .then((db) => inBatchesFor(db, rows.map((r) => r._id), str(req.query.draft)))
+      .then((m) => {
+        for (const r of rows) { const x = m.get(String(r._id)); if (x && x.length) r.inBatches = x; }
+        json(body);
+      })
+      .catch(() => json(body));
+    return res;
+  };
+  next();
+}
+
+// A draft's order lines checked again when it is opened: their order's state
+// now (a line another batch shipped meanwhile can't ship here) and the other
+// batches holding them. Body { ids, draft }.
+router.post("/orders/batch-check", BATCH_VIEW, async (req, res, next) => {
+  try {
+    const ids = [...new Set((Array.isArray(req.body && req.body.ids) ? req.body.ids : []).map(String))].slice(0, 500);
+    const oids = ids.map(oid).filter(Boolean);
+    const db = await connectToDatabase();
+    const recs = oids.length ? await db.collection(ORDERS).find({ _id: { $in: oids } }, { projection: { orderNo: 1, status: 1, batchNo: 1, splitTo: 1 } }).toArray() : [];
+    const inB = await inBatchesFor(db, ids, str(req.body && req.body.draft));
+    const lines = {};
+    for (const r of recs) {
+      lines[String(r._id)] = { orderNo: r.orderNo, status: r.status, batchNo: r.batchNo || "", splitTo: r.splitTo || "", inBatches: inB.get(String(r._id)) || [] };
+    }
+    return res.json({ success: true, lines });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // The ordered (then pending) lines waiting to ship — the Create Batch picker.
 // ?freight=sea|air: only the lines a batch of that kind takes.
-router.get("/orders/open-lines", BATCH_VIEW, async (req, res, next) => {
+router.get("/orders/open-lines", BATCH_VIEW, tagInBatches, async (req, res, next) => {
   try {
     const search = str(req.query.search);
     const match = { status: { $in: ["ordered", "pending"] } };
@@ -474,7 +543,7 @@ async function customerCodeLookup(db, code, { openOnes, elsewhere }) {
 // again walks to its next order. ?freight=sea|air (the batch's kind): only
 // lines of that kind match; when the SKU waits only on the other kind the
 // reply says so (`otherFreight`) instead of treating the scan as not in PO.
-router.get("/orders/lookup", BATCH_VIEW, async (req, res, next) => {
+router.get("/orders/lookup", BATCH_VIEW, tagInBatches, async (req, res, next) => {
   try {
     const sku = str(req.query.sku);
     if (!sku) return bad(res, "sku is required");
@@ -1842,6 +1911,26 @@ async function draftPayload(db, b, freight) {
   return { freight, lines, unmatchedCount: lines.filter((l) => l.unmatched).length, tracking: str(b.tracking), shippedAt: dayDate(b.shippedAt), note: str(b.note), shippingCost: ship.value, zohoVendorId: vendor ? vendor.id : "", zohoVendorName: vendor ? vendor.name : "" };
 }
 
+// A saved draft's order lines that can't ship from it as they stand (user
+// 2026-11-23): already shipped (another batch took the line), or also on
+// another batch. Non-fatal — the draft is saved either way.
+async function draftWarnings(db, lines, selfId) {
+  try {
+    const ordered = (lines || []).filter((l) => l.orderId);
+    if (!ordered.length) return [];
+    const inB = await inBatchesFor(db, ordered.map((l) => l.orderId), selfId);
+    const out = [];
+    for (const l of ordered) {
+      const others = inB.get(String(l.orderId)) || [];
+      const gone = !["ordered", "pending"].includes(l.status);
+      if (gone || others.length) out.push({ orderId: String(l.orderId), orderNo: l.orderNo, sku: l.sku, status: l.status, inBatches: others });
+    }
+    return out;
+  } catch (e) {
+    return [];
+  }
+}
+
 // The kind a batch being made is: the draft's own, else the body's. None
 // given → air (user 2026-10-16: a page from before the 海运 / 空运 split
 // sends none, and neither does a draft from before then); only a value
@@ -1866,7 +1955,7 @@ router.post("/batches", BATCH_CREATE, async (req, res, next) => {
       const now = new Date();
       const doc = { batchNo: "", seq: null, status: "draft", ...d, lineCount: d.lines.length, totalQty: d.lines.reduce((t, l) => t + (l.qty || 0), 0), createdAt: now, createdBy: actor(req), updatedAt: now };
       const r = await db.collection(BATCHES).insertOne(doc);
-      return res.json({ success: true, batch: { _id: r.insertedId, ...doc } });
+      return res.json({ success: true, batch: { _id: r.insertedId, ...doc }, warnings: await draftWarnings(db, d.lines, r.insertedId) });
     }
     const out = await shipBatch(db, req, b, null);
     if (out.error) return res.status(out.status || 400).json({ success: false, message: out.error });
@@ -1889,7 +1978,7 @@ router.put("/batches/:id/draft", BATCH_CREATE, async (req, res, next) => {
     if (d.error) return bad(res, d.error);
     const set = { ...d, lineCount: d.lines.length, totalQty: d.lines.reduce((t, l) => t + (l.qty || 0), 0), updatedAt: new Date() };
     await db.collection(BATCHES).updateOne({ _id }, { $set: set });
-    return res.json({ success: true, batch: { ...draft, ...set } });
+    return res.json({ success: true, batch: { ...draft, ...set }, warnings: await draftWarnings(db, d.lines, _id) });
   } catch (error) {
     next(error);
   }
@@ -2063,7 +2152,7 @@ async function shipBatch(db, req, b, draft) {
         // line, a Special Order's requester / urgency / quote mark, Warranty
         const carry = {};
         for (const k of SPLIT_CARRY) if (rec[k] !== undefined && rec[k] !== null && rec[k] !== "") carry[k] = rec[k];
-        await col.insertOne({
+        const rIns = await col.insertOne({
           ...carry,
           orderNo: rNo,
           seq: rSeq,
@@ -2099,7 +2188,7 @@ async function shipBatch(db, req, b, draft) {
         set.splitTo = rNo;
         detail.short = remainder;
         detail.remainderTo = rNo;
-        remainders.push({ from: rec.orderNo, to: rNo, sku: rec.sku, qty: remainder });
+        remainders.push({ from: rec.orderNo, to: rNo, sku: rec.sku, qty: remainder, fromId: p._id, toId: rIns.insertedId });
       }
       await col.updateOne({ _id: p._id }, { $set: set, $push: { history: hist("shipped", by, detail) } });
       lines.push({
@@ -2146,14 +2235,68 @@ async function shipBatch(db, req, b, draft) {
     if (draft) await db.collection(BATCHES).replaceOne({ _id: batchId }, batch);
     else await db.collection(BATCHES).insertOne(batch);
 
+    // Other drafts that list a line this batch shipped short now list its
+    // remainder instead (user 2026-11-23) — left on the shipped line they
+    // could never ship. Non-fatal.
+    let repointed = [];
+    try {
+      repointed = await repointDrafts(db, remainders, batchId, batchNo, by);
+    } catch (e) {
+      console.error("Spare parts batch: re-pointing drafts failed:", e);
+    }
+
     // The Zoho Inventory purchase order(s) for the shipment — one per
     // vendor. Non-fatal: the batch stands, the outcome is stored and can
     // be retried from the Batches page (POST /batches/:id/zoho).
     const zoho = await createBatchPurchaseOrders(db, batch, null);
     await db.collection(BATCHES).updateOne({ _id: batchId }, { $set: { zoho } });
     batch.zoho = zoho;
-    return { batch, remainders, zoho };
+    return { batch, remainders, zoho, repointed };
   }
+}
+
+// After a short shipment: every OTHER draft holding the short-shipped line is
+// moved onto its remainder line (the pending line that carries the rest). The
+// draft keeps its own count, price and supplier; an `adjustments` entry says
+// what changed. Returns [{ draftId, tracking, from, to }].
+async function repointDrafts(db, remainders, batchId, batchNo, by) {
+  const out = [];
+  const col = db.collection(BATCHES);
+  const blank = (v) => v === undefined || v === null || v === "";
+  for (const r of remainders || []) {
+    if (!r.fromId || !r.toId) continue;
+    const from = String(r.fromId), to = String(r.toId);
+    const drafts = await col.find({ _id: { $ne: batchId }, status: "draft", "lines.orderId": { $in: [r.fromId, from] } }, { projection: { tracking: 1, lines: 1, updatedAt: 1 } }).toArray();
+    for (const d of drafts) {
+      const lines = (d.lines || []).map((l) => ({ ...l }));
+      const oi = lines.findIndex((l) => String(l.orderId || "") === from);
+      if (oi < 0) continue;
+      const old = lines[oi];
+      const ri = lines.findIndex((l) => String(l.orderId || "") === to);
+      if (ri >= 0) {
+        // the remainder is on the draft already (picked after the split): the
+        // old line's count, price and supplier go onto it, the old line goes
+        const rem = lines[ri];
+        if (!blank(old.qty)) rem.qty = blank(rem.qty) ? old.qty : Number(rem.qty) + Number(old.qty);
+        if (blank(rem.unitPrice) && !blank(old.unitPrice)) rem.unitPrice = old.unitPrice;
+        if (blank(rem.supplier) && !blank(old.supplier)) rem.supplier = old.supplier;
+        lines.splice(oi, 1);
+      } else {
+        Object.assign(old, { orderId: r.toId, orderNo: r.to, status: "pending", orderQty: r.qty, orderedAt: null });
+      }
+      const now = new Date();
+      const u = await col.updateOne(
+        // only if nobody saved the draft meanwhile
+        { _id: d._id, status: "draft", updatedAt: d.updatedAt },
+        {
+          $set: { lines, lineCount: lines.length, totalQty: lines.reduce((t, l) => t + (Number(l.qty) || 0), 0), updatedAt: now },
+          $push: { adjustments: { at: now, by: by || "", action: "line-repointed", from: r.from, to: r.to, sku: r.sku || "", merged: ri >= 0, byBatch: batchNo, note: `${r.from} shipped short on ${batchNo}; this draft now holds its remainder ${r.to}` } },
+        },
+      );
+      if (u.modifiedCount) out.push({ draftId: String(d._id), tracking: d.tracking || "", from: r.from, to: r.to, merged: ri >= 0 });
+    }
+  }
+  return out;
 }
 
 // Tracking / ship date / note can be fixed after the fact (a tracking number
