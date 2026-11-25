@@ -38,6 +38,8 @@ router.use("/sales-orders", require("./salesOrders"));
 router.use("/sales-returns", require("./salesReturns"));
 // Customer stock chat: enable list, price list, preview (2026-11-16).
 router.use("/stock-chat", require("./stockChat"));
+// Orders from the WhatsApp chat bot, apart from Sales Orders (2026-11-25).
+router.use("/chat-orders", require("./chatOrders"));
 
 const VIEW = requirePermission("refurb:offer:view");
 const TABLE = "stg_reebelo_offers";

@@ -13,7 +13,7 @@
 //   PUT    /refurbished/stock-chat/prices/:id
 //   DELETE /refurbished/stock-chat/prices/:id
 //   POST   /refurbished/stock-chat/prices/import          { rows, mode: "replace" | "merge" }
-//   GET    /refurbished/stock-chat/settings · PUT     price note, daily limit, hidden models, HKD / CNY → AUD
+//   GET    /refurbished/stock-chat/settings · PUT     price note, daily limit, hidden models, HKD / CNY → AUD, order hold hours
 //   GET    /refurbished/stock-chat/preview?fresh=1        exactly what customers see
 //
 // All of it needs refurb:stockchat:manage (Admin's wildcard for now).
@@ -381,6 +381,14 @@ router.put("/settings", MANAGE, async (req, res) => {
       }
       set.fxToAud = fx;
     }
+    // how long a pending chat order holds its stock (2026-11-25)
+    if (b.orderHoldHours !== undefined) {
+      const h = parseInt(b.orderHoldHours, 10);
+      if (!Number.isFinite(h) || h < 1 || h > 168) {
+        return res.status(400).json({ success: false, message: "Order hold must be 1–168 hours" });
+      }
+      set.orderHoldHours = h;
+    }
     const d = await db();
     await d.collection(SC.SETTINGS).updateOne(
       { _id: "settings" },
@@ -411,6 +419,7 @@ router.get("/preview", MANAGE, async (req, res) => {
       unconfirmedAtExyon: s.unconfirmedAtExyon,
       hiddenUnits: s.hiddenUnits,
       belowCostUnits: s.belowCostUnits,
+      heldUnits: s.heldUnits, // held by open chat orders
       exyonOk: s.exyonOk,
       exyonError: s.exyonOk ? null : "Exyon's database couldn't be checked — units it may have sold are still shown.",
     });

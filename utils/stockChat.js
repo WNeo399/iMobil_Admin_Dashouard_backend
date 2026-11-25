@@ -14,7 +14,11 @@
 //   · grouped by Model + Storage + Grade + Colour with a quantity;
 //   · priced from our price list (Model + Storage + Grade; a blank storage
 //     or grade on a price row covers every storage / grade), else no price
-//     ("Contact us").
+//     ("Contact us");
+//   · minus what open chat orders hold (2026-11-25, utils/stockChatOrders):
+//     a pending order for its hold time, a confirmed one until it's
+//     completed or cancelled — so two customers can't order the last unit.
+//     The register itself is never touched by a chat order.
 //
 // Never anything else — no cost, supplier, IMEI or location leaves here.
 
@@ -26,6 +30,7 @@ const CUSTOMERS = "refurb_stock_chat_customers";
 const PRICES = "refurb_stock_chat_prices";
 const SETTINGS = "refurb_stock_chat_settings";
 const LOG = "refurb_stock_chat_log";
+const ORDERS = "refurb_chat_orders"; // chat orders (CO-), utils/stockChatOrders.js
 const DEVICES = "refurb_devices";
 
 const LOCATION_IMOBILE = "iMobile";
@@ -47,6 +52,8 @@ const DEFAULT_SETTINGS = {
   // a unit's cost in AUD for the below-cost check: 1 HKD / 1 CNY = this many
   // AUD (CNY at 4.7 per AUD, as the AI Agent's margin rule)
   fxToAud: { HKD: 0.19, CNY: 0.2128 },
+  // a pending chat order holds its stock this long (user 2026-11-25: 24 h)
+  orderHoldHours: 24,
 };
 
 // ── keys ─────────────────────────────────────────────────────────────
@@ -58,6 +65,8 @@ const storageKey = (v) => {
 };
 const gradeKey = (v) => clean(v).toUpperCase();
 const colorKey = (v) => clean(v).toLowerCase();
+// one Model + Storage + Grade + Colour (what a chat order's hold points at)
+const unitKey = (g) => [modelKey(g.model), storageKey(g.storage), gradeKey(g.grade), colorKey(g.color)].join("|");
 
 // The date in Melbourne (YYYY-MM-DD) — the daily question cap resets there.
 function melbourneDay(d = new Date()) {
@@ -208,8 +217,11 @@ async function buildSnapshot() {
   };
 }
 
-async function stockSnapshot({ fresh = false } = {}) {
-  const ttl = cache && cache.exyonOk ? SNAPSHOT_TTL_MS : SNAPSHOT_RETRY_MS;
+// maxAgeMs: a tighter limit than the usual 5 min (an order checks stock no
+// older than a minute)
+async function stockSnapshot({ fresh = false, maxAgeMs = null } = {}) {
+  let ttl = cache && cache.exyonOk ? SNAPSHOT_TTL_MS : SNAPSHOT_RETRY_MS;
+  if (maxAgeMs != null) ttl = Math.min(ttl, maxAgeMs);
   if (!fresh && cache && Date.now() - cache.at.getTime() < ttl) return cache;
   if (!building) {
     building = buildSnapshot()
@@ -250,16 +262,73 @@ function costInAud(c, fx) {
   return Number.isFinite(rate) && rate > 0 ? c.amount * rate : null;
 }
 
+// ── chat order holds ────────────────────────────────────────────────
+// What open chat orders hold: unitKey + "#" + kind ("priced" | "contact") →
+// units. Open = confirmed, or pending inside its hold time. Each order line
+// records where its units came from (`alloc`: colour + kind + qty).
+async function orderHolds(db, excludeOrderId = null) {
+  const q = { $or: [{ status: "confirmed" }, { status: "pending", holdUntil: { $gt: new Date() } }] };
+  if (excludeOrderId) q._id = { $ne: excludeOrderId };
+  const docs = await db.collection(ORDERS).find(q, { projection: { items: 1 } }).toArray();
+  const held = new Map();
+  for (const o of docs) {
+    for (const it of o.items || []) {
+      for (const a of it.alloc || []) {
+        // a line keeps the register's own model / storage / grade ("" = ungraded)
+        const k = unitKey({ model: it.model, storage: it.storage, grade: it.grade, color: a.color }) + "#" + (a.kind === "contact" ? "contact" : "priced");
+        held.set(k, (held.get(k) || 0) + (Number(a.qty) || 0));
+      }
+    }
+  }
+  return held;
+}
+
+// The groups minus the holds: from the same kind of row first (priced /
+// Contact us), then the other (a price may have changed since); rows left
+// empty drop out. Returns { groups, heldUnits }.
+function applyHolds(groups, held) {
+  const out = groups.map((g) => ({ ...g }));
+  const slots = new Map();
+  for (const g of out) {
+    const k = unitKey(g);
+    if (!slots.has(k)) slots.set(k, {});
+    slots.get(k)[g.price == null ? "contact" : "priced"] = g;
+  }
+  let heldUnits = 0;
+  for (const [hk, qty] of held) {
+    const i = hk.lastIndexOf("#");
+    const slot = slots.get(hk.slice(0, i));
+    if (!slot) continue;
+    const kind = hk.slice(i + 1);
+    let left = qty;
+    for (const g of [slot[kind], slot[kind === "priced" ? "contact" : "priced"]]) {
+      if (!g || left <= 0) continue;
+      const take = Math.min(g.qty, left);
+      g.qty -= take;
+      left -= take;
+      heldUnits += take;
+    }
+  }
+  return { groups: out.filter((g) => g.qty > 0), heldUnits };
+}
+
 // The snapshot's groups with prices — exactly what a customer may see:
 //   · hidden models left out;
 //   · a listed price only for units it doesn't undercut: a unit whose cost
 //     is above the price shows "Contact us" (user 2026-11-16) — so one
 //     Model + Storage + Grade + Colour can come back as two rows, the priced
-//     units and the `belowCost` ones. A unit with no cost keeps the price.
+//     units and the `belowCost` ones. A unit with no cost keeps the price;
+//   · minus what open chat orders hold (`excludeOrderId`: not that order's
+//     own hold — when it is re-checked).
 // Costs never leave this function.
-async function pricedStock({ fresh = false } = {}) {
+async function pricedStock({ fresh = false, maxAgeMs = null, excludeOrderId = null } = {}) {
   const db = await connectToDatabase();
-  const [snap, idx, settings] = await Promise.all([stockSnapshot({ fresh }), loadPriceIndex(db), getSettings(db)]);
+  const [snap, idx, settings, held] = await Promise.all([
+    stockSnapshot({ fresh, maxAgeMs }),
+    loadPriceIndex(db),
+    getSettings(db),
+    orderHolds(db, excludeOrderId),
+  ]);
   const hidden = new Set((settings.hiddenModels || []).map(modelKey).filter(Boolean));
   const fx = settings.fxToAud || {};
   const groups = [];
@@ -286,12 +355,14 @@ async function pricedStock({ fresh = false } = {}) {
       belowCostUnits += low;
     }
   }
+  const after = applyHolds(groups, held);
   return {
     ...snap,
-    groups,
-    units: snap.units - hiddenUnits,
+    groups: after.groups,
+    units: snap.units - hiddenUnits - after.heldUnits,
     hiddenUnits,
     belowCostUnits,
+    heldUnits: after.heldUnits,
   };
 }
 
@@ -300,12 +371,15 @@ module.exports = {
   PRICES,
   SETTINGS,
   LOG,
+  ORDERS,
   DEFAULT_SETTINGS,
   clean,
   modelKey,
   storageKey,
   gradeKey,
   colorKey,
+  unitKey,
+  applyHolds,
   melbourneDay,
   normalizePhone,
   newToken,

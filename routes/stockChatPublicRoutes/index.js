@@ -8,6 +8,13 @@
 //   GET  /stock-chat/:token        who the link is for + today's usage
 //   POST /stock-chat/:token/ask    { messages: [{ role, text }] } → answer
 //
+// Ordering from the page (2026-11-25) — the same chat orders as the
+// WhatsApp API below (utils/stockChatOrders.js), channel "web":
+//
+//   POST /stock-chat/:token/orders                   { items, note?, clientRef, dryRun? } → { order }
+//   GET  /stock-chat/:token/orders                   the customer's orders, newest first
+//   POST /stock-chat/:token/orders/:orderNo/cancel   { reason? } (pending only)
+//
 // Server API (2026-11-18) for our WhatsApp helper, which answers customers
 // inside WhatsApp. Authenticated by the X-API-Key header (env
 // STOCK_CHAT_API_KEY, comma-separated to allow a rotation overlap); the
@@ -15,6 +22,14 @@
 //
 //   POST /stock-chat/customer      { phone } → { enabled, name }
 //   POST /stock-chat/ask           { phone, channel: "whatsapp", messages } → answer
+//
+// Chat orders (2026-11-25, utils/stockChatOrders.js) — separate from the
+// normal sales orders; by Model + Storage + Grade (+ Colour) and quantity:
+//
+//   POST /stock-chat/orders         { phone, items, note?, clientRef, dryRun? } → { order }
+//   POST /stock-chat/orders/list    { phone, status?, limit? } → { orders }
+//   POST /stock-chat/orders/status  { phone, orderNo } → { order }
+//   POST /stock-chat/orders/cancel  { phone, orderNo, reason? } → { order } (pending only)
 //
 // Refusals carry a `code` (BAD_API_KEY, NOT_A_CUSTOMER, DISABLED, ...); only
 // that server calls these, never the dashboard's axios client.
@@ -32,6 +47,7 @@ const crypto = require("crypto");
 const Anthropic = require("@anthropic-ai/sdk");
 const { connectToDatabase } = require("../../utils/mongodb");
 const SC = require("../../utils/stockChat");
+const CO = require("../../utils/stockChatOrders");
 
 const MODEL = process.env.STOCK_CHAT_MODEL || process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5";
 const MAX_ITERS = 6; // tool rounds per question
@@ -64,6 +80,16 @@ const askLimiter = rateLimit({
   message: { success: false, message: "Too many questions at once — please wait a minute." },
 });
 
+const webOrderLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  keyGenerator: tokenKey,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: false,
+  message: { success: false, code: "TOO_MANY_REQUESTS", message: "Too many order requests — please wait a minute." },
+});
+
 const busy = new Set(); // one question at a time per customer (web and WhatsApp share it)
 
 async function customerFor(db, token) {
@@ -90,6 +116,8 @@ router.get("/:token", readLimiter, async (req, res) => {
       priceNote: settings.priceNote || "",
       used: await usedToday(db, c._id),
       limit: settings.dailyLimit,
+      // how long an order from the page holds its stock (2026-11-25)
+      orderHoldHours: settings.orderHoldHours,
     });
   } catch (e) {
     console.error("Stock chat session error:", e);
@@ -193,10 +221,15 @@ function systemPrompt(settings, channel = "web") {
     "- Use the tools for every stock question. Every model, quantity and price you mention must come from a tool result in this turn — never guess, estimate or remember.",
     "- Model names in stock can be written loosely (e.g. 'IPAD 9' and 'iPad 9th Gen WiFi', or 'PRO1 耳机' for AirPods Pro). If a search finds nothing, try list_models and shorter words before saying it's not in stock.",
     "- Storage goes in the storage filter, not in the query words.",
-    `- A row without a listed price shows 'Contact us' — tell the customer to ${contact} for that price. Never quote a price that isn't listed.`,
+    channel === "web"
+      ? "- A row without a listed price shows 'Contact us' — the customer can still add it to an order and our team will quote the price, or message iMobile on WhatsApp. Never quote a price that isn't listed."
+      : `- A row without a listed price shows 'Contact us' — tell the customer to ${contact} for that price. Never quote a price that isn't listed.`,
     `- Listed prices: ${settings.priceNote || "as shown"}.`,
     "- Grades are as listed (e.g. A++, A+, A, B). 'Ungraded' means the unit hasn't been graded yet. Don't explain what a grade means beyond that — suggest asking iMobile.",
-    `- You can't take orders, hold stock, give discounts or promise delivery. To buy or reserve, the customer should ${contact}.`,
+    channel === "web"
+      ? "- You can't place orders yourself, hold stock, give discounts or promise delivery. To order, the customer taps 'Add' on the stock you show, then 'Place order' in the order bar at the bottom of the page; " +
+        "our team confirms it and arranges delivery and payment. When someone wants to buy, show the rows they want (cards) so they can add them."
+      : `- You can't take orders, hold stock, give discounts or promise delivery. To buy or reserve, the customer should ${contact}.`,
     "- Only talk about iMobile's current stock and prices. Politely decline anything else in one sentence.",
     "- You only know model, storage, grade, colour, quantity and listed price. You have no costs, suppliers, IMEIs or warehouse details — say so if asked.",
     "- Reply in the customer's language. Keep it short and friendly.",
@@ -663,6 +696,140 @@ router.post("/ask", requireApiKey, apiAllLimiter, apiAskLimiter, async (req, res
     if (e instanceof AskError) return apiFail(res, e.status, e.code, e.message, e.extra);
     console.error("Stock chat API ask error:", e);
     return apiFail(res, 500, "ERROR", AI_FAILED);
+  }
+});
+
+// ── chat orders (2026-11-25) ─────────────────────────────────────────
+const apiOrderLimiter = apiLimit(20, (req) => "order:" + (phoneOf(req) || "-"), "Too many order requests from this number — please wait a minute.");
+const ORDER_FAILED = "Something went wrong with the order — please try again.";
+
+// The caller's customer, or the refusal already sent (null). Placing an
+// order needs the number switched on; reading / cancelling its own orders
+// doesn't.
+async function apiCustomer(db, req, res, mustBeEnabled) {
+  const phone = phoneOf(req);
+  if (!phone) { apiFail(res, 400, "BAD_REQUEST", "phone is missing or not a valid number."); return null; }
+  const customer = await db.collection(SC.CUSTOMERS).findOne({ phone });
+  if (!customer) { apiFail(res, 404, "NOT_A_CUSTOMER", "This number isn't on the Stock Chat list.", { phone }); return null; }
+  if (mustBeEnabled && customer.enabled !== true) {
+    apiFail(res, 403, "DISABLED", "This number is switched off for Stock Chat.", { customer: { name: customer.name || "", enabled: false } });
+    return null;
+  }
+  return customer;
+}
+
+function orderFail(res, e, what) {
+  if (e instanceof CO.OrderError) return apiFail(res, e.status, e.code, e.message, e.extra);
+  console.error(`Stock chat order ${what} error:`, e);
+  return apiFail(res, 500, "ERROR", ORDER_FAILED);
+}
+
+// ── POST /stock-chat/orders ──────────────────────────────────────────
+router.post("/orders", requireApiKey, apiAllLimiter, apiOrderLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await apiCustomer(db, req, res, true);
+    if (!customer) return;
+    const channel = req.body.channel == null || req.body.channel === "" ? "whatsapp" : String(req.body.channel);
+    if (!API_CHANNELS.includes(channel)) return apiFail(res, 400, "BAD_REQUEST", `channel must be one of: ${API_CHANNELS.join(", ")}.`);
+    const out = await CO.placeOrder(db, customer, req.body, { channel });
+    const body = { success: true, order: CO.publicOrder(out.order) };
+    if (out.dryRun) body.dryRun = true;
+    if (out.duplicate) body.duplicate = true;
+    return res.json(body);
+  } catch (e) {
+    return orderFail(res, e, "place");
+  }
+});
+
+// ── POST /stock-chat/orders/list ─────────────────────────────────────
+router.post("/orders/list", requireApiKey, apiAllLimiter, apiOrderLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await apiCustomer(db, req, res, false);
+    if (!customer) return;
+    const status = req.body.status == null || req.body.status === "" ? null : String(req.body.status);
+    const orders = await CO.customerOrders(db, customer.phone, { status, limit: req.body.limit });
+    return res.json({ success: true, orders: orders.map(CO.publicOrder) });
+  } catch (e) {
+    return orderFail(res, e, "list");
+  }
+});
+
+// ── POST /stock-chat/orders/status ───────────────────────────────────
+router.post("/orders/status", requireApiKey, apiAllLimiter, apiOrderLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await apiCustomer(db, req, res, false);
+    if (!customer) return;
+    const o = await CO.customerOrder(db, customer.phone, req.body.orderNo);
+    return res.json({ success: true, order: CO.publicOrder(o) });
+  } catch (e) {
+    return orderFail(res, e, "status");
+  }
+});
+
+// ── POST /stock-chat/orders/cancel ───────────────────────────────────
+router.post("/orders/cancel", requireApiKey, apiAllLimiter, apiOrderLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await apiCustomer(db, req, res, false);
+    if (!customer) return;
+    const out = await CO.customerCancel(db, customer.phone, req.body.orderNo, req.body.reason);
+    const body = { success: true, order: CO.publicOrder(out.order) };
+    if (out.already) body.already = true;
+    return res.json(body);
+  } catch (e) {
+    return orderFail(res, e, "cancel");
+  }
+});
+
+// ── ordering from the customer's page (2026-11-25) ───────────────────
+// The link is the credential, as for asking; a switched-off number's link
+// is dead, so these answer 404 too. Refusals carry `code` (the page reads
+// it with plain fetch, never the dashboard's axios client).
+function webOrderFail(res, e, what) {
+  if (e instanceof CO.OrderError) return res.status(e.status).json({ success: false, code: e.code, message: e.message, ...e.extra });
+  console.error(`Stock chat web order ${what} error:`, e);
+  return res.status(500).json({ success: false, code: "ERROR", message: ORDER_FAILED });
+}
+
+router.post("/:token/orders", webOrderLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await customerFor(db, req.params.token);
+    if (!customer) return res.status(404).json({ success: false, code: "NOT_ACTIVE", message: NOT_ACTIVE });
+    const out = await CO.placeOrder(db, customer, req.body, { channel: "web" });
+    const body = { success: true, order: CO.publicOrder(out.order) };
+    if (out.dryRun) body.dryRun = true;
+    if (out.duplicate) body.duplicate = true;
+    return res.json(body);
+  } catch (e) {
+    return webOrderFail(res, e, "place");
+  }
+});
+
+router.get("/:token/orders", readLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await customerFor(db, req.params.token);
+    if (!customer) return res.status(404).json({ success: false, code: "NOT_ACTIVE", message: NOT_ACTIVE });
+    const orders = await CO.customerOrders(db, customer.phone, { limit: 20 });
+    return res.json({ success: true, orders: orders.map(CO.publicOrder) });
+  } catch (e) {
+    return webOrderFail(res, e, "list");
+  }
+});
+
+router.post("/:token/orders/:orderNo/cancel", webOrderLimiter, async (req, res) => {
+  try {
+    const db = await connectToDatabase();
+    const customer = await customerFor(db, req.params.token);
+    if (!customer) return res.status(404).json({ success: false, code: "NOT_ACTIVE", message: NOT_ACTIVE });
+    const out = await CO.customerCancel(db, customer.phone, req.params.orderNo, (req.body || {}).reason);
+    return res.json({ success: true, order: CO.publicOrder(out.order), ...(out.already ? { already: true } : {}) });
+  } catch (e) {
+    return webOrderFail(res, e, "cancel");
   }
 });
 
