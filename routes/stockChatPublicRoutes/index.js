@@ -199,8 +199,41 @@ const TOOLS = [
             required: ["model"],
           },
         },
+        // What the customer wants + the products they mean (2026-11-25, for
+        // the WhatsApp helper's buttons); the server adds availability.
+        intent: {
+          type: "string",
+          enum: ["greeting", "stock_query", "full_list", "order_intent", "price_negotiation", "order_status", "human", "other"],
+          description:
+            "What the customer mainly wants with THIS message — one value. greeting: hello / small talk, no request. " +
+            "stock_query: stock, price, colour or grade of something. full_list: everything in stock or a whole category. " +
+            "order_intent: clearly wants to buy, order or reserve ('5 of the A++ please', 'I'll take it', 'hold 3 for me'). " +
+            "price_negotiation: a discount, a better or bulk price. order_status: an existing order, dispatch, delivery. " +
+            "human: wants a person, a complaint, after-sales. other: none of these. " +
+            "Several at once → the main one ('any iPhone 15? if so 5 of them' = order_intent).",
+        },
+        items: {
+          type: "array",
+          description:
+            "The products this message is about, COMPLETED FROM THE CONVERSATION: if they asked about iPhone 15 128GB and now say " +
+            "'the A++ ones, 5 please', give model iPhone 15, storage 128GB, grade A++, qty 5. Give what the CUSTOMER asked for, " +
+            "even when we don't have it (they ask for 256GB and we only have 128GB → storage 256GB; the system works out " +
+            "availability). Spell model, storage, grade and colour as in the tool results when they are there. Leave out what the " +
+            "customer didn't say or you can't tell; leave model out rather than guess one. [] when no specific product " +
+            "(greetings, order status, a whole category).",
+          items: {
+            type: "object",
+            properties: {
+              model: { type: "string" },
+              storage: { type: "string" },
+              grade: { type: "string", description: "A++, A+, A, B+, B, C+, C or Ungraded." },
+              color: { type: "string" },
+              qty: { type: "integer", description: "How many they want, only when they said a number." },
+            },
+          },
+        },
       },
-      required: ["text"],
+      required: ["text", "intent"],
     },
   },
 ];
@@ -234,6 +267,7 @@ function systemPrompt(settings, channel = "web") {
     "- You only know model, storage, grade, colour, quantity and listed price. You have no costs, suppliers, IMEIs or warehouse details — say so if asked.",
     "- Reply in the customer's language. Keep it short and friendly.",
     "- Always finish by calling reply: a short text plus the stock to show — never write the stock out in the text.",
+    "  · Always set intent (what the customer mainly wants with this message) and items (the products they mean, completed from earlier messages).",
     "  · One or two specific models: layout 'cards' with the rows in `show`.",
     "  · Broad questions (everything in stock, a brand, all iPads / iPhones, many models): layout 'list' with `show_matching` " +
       "(e.g. {} for all stock, {query: 'ipad'} for iPads) — the page lists every matching row grouped by model.",
@@ -422,6 +456,54 @@ function resolveShow(groups, show, cap = ROWS_TO_CLIENT) {
   return rows.slice(0, cap);
 }
 
+// The reply's intent + items (2026-11-25, asked for by the WhatsApp helper
+// to pick its buttons): the AI names what the customer wants and the
+// products they mean; the server writes those in our stock's own spelling
+// and decides availability from the same stock view as the rows —
+//   available "yes" (enough, or in stock when no qty), "partial" (some, not
+//   qty), "no" (none / not a model we have), null (no model to check);
+//   availableQty = the units that fit.
+const INTENTS = ["greeting", "stock_query", "full_list", "order_intent", "price_negotiation", "order_status", "human", "other"];
+const MAX_INTENT_ITEMS = 10;
+
+function intentItems(groups, input) {
+  const i = input || {};
+  const intent = INTENTS.includes(i.intent) ? i.intent : null;
+  const opt = (v, n) => (v == null || SC.clean(v) === "" ? null : SC.clean(v).slice(0, n));
+  const items = (Array.isArray(i.items) ? i.items : []).slice(0, MAX_INTENT_ITEMS).map((x) => {
+    const it = x && typeof x === "object" ? x : {};
+    let model = opt(it.model, 120);
+    let storage = opt(it.storage, 40);
+    let grade = opt(it.grade, 20);
+    let color = opt(it.color, 60);
+    const q = Number(it.qty);
+    const qty = it.qty == null || it.qty === "" || !Number.isInteger(q) || q < 1 ? null : q;
+    if (grade !== null) grade = gradeInputKey(grade) || "Ungraded";
+    if (!model) return { model: null, storage, grade, color, qty, available: null, availableQty: null };
+
+    let c = groups.filter((g) => SC.modelKey(g.model) === SC.modelKey(model));
+    if (c.length) model = c[0].model;
+    if (storage !== null) {
+      c = c.filter((g) => SC.storageKey(g.storage) === SC.storageKey(storage));
+      if (c.length) storage = c[0].storage;
+    }
+    if (grade !== null) c = c.filter((g) => SC.gradeKey(g.grade) === gradeInputKey(grade));
+    if (color !== null) {
+      // the stock's own colour name: exact first, then a part of it ("black" → "Black Titanium")
+      const want = SC.colorKey(color);
+      let cc = c.filter((g) => SC.colorKey(g.color) === want);
+      if (!cc.length) cc = c.filter((g) => SC.colorKey(g.color).includes(want));
+      const names = [...new Set(cc.map((g) => g.color))];
+      if (names.length === 1) color = names[0];
+      c = cc;
+    }
+    const availableQty = c.reduce((s, g) => s + g.qty, 0);
+    const available = availableQty === 0 ? "no" : qty === null || qty <= availableQty ? "yes" : "partial";
+    return { model, storage, grade, color, qty, available, availableQty };
+  });
+  return { intent, items };
+}
+
 // Earlier turns as plain text (the client keeps them), alternating and
 // starting with the customer, ending with the new question.
 function buildMessages(raw) {
@@ -503,6 +585,8 @@ async function answerQuestion(db, customer, rawMessages, channel) {
     let rows = [];
     let layout = "cards";
     let more = 0;
+    let intent = null;
+    let items = [];
     let done = false;
 
     for (let i = 0; i < MAX_ITERS && !done; i++) {
@@ -537,6 +621,7 @@ async function answerQuestion(db, customer, rawMessages, channel) {
           rows = built.rows;
           layout = built.layout;
           more = built.more;
+          ({ intent, items } = intentItems(groups, call.input));
           done = true;
           results.push({ type: "tool_result", tool_use_id: call.id, content: "Sent." });
         } else {
@@ -559,6 +644,8 @@ async function answerQuestion(db, customer, rawMessages, channel) {
       answer,
       rows: rows.length,
       layout,
+      intent,
+      items,
       tools: log.tools,
       usage: log.usage,
       model: MODEL,
@@ -570,6 +657,9 @@ async function answerQuestion(db, customer, rawMessages, channel) {
       rows,
       layout,
       more,
+      // what the customer wants + the products they mean (null / [] when the AI gave none)
+      intent,
+      items,
       priceNote: settings.priceNote || "",
       used: used + 1,
       limit: settings.dailyLimit,
@@ -836,5 +926,5 @@ router.post("/:token/orders/:orderNo/cancel", webOrderLimiter, async (req, res) 
 module.exports = router;
 // exposed for the offline tests
 module.exports._internals = {
-  toolSearch, toolListModels, resolveShow, buildReply, buildMessages, matchesWords, TOOLS, systemPrompt, apiKeyMatches,
+  toolSearch, toolListModels, resolveShow, buildReply, buildMessages, matchesWords, TOOLS, systemPrompt, apiKeyMatches, intentItems,
 };
