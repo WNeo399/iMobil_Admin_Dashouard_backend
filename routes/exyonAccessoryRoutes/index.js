@@ -880,6 +880,23 @@ router.post("/pick-lists/today/process", PICK_EDIT, async function (req, res) {
 const HOLD_REASONS = ["Insufficient stock", "Damaged item", "Address issue", "Customer cancelled", "Other"];
 const NETO_SHIPPING_METHOD = "Australia Post";
 const confirming = new Set(); // days being confirmed right now (one at a time)
+// Neto's "Dispatched" update for an order: every line shipped in full with the
+// tracking number. `n` is the order as GetOrder answered it (OrderLine with
+// SKU + Quantity). Shared by Confirm dispatch and Re-dispatch.
+function netoDispatchPayload(orderId, n, tracking) {
+  const lines = [].concat((n && n.OrderLine) || []).filter((l) => String(l.SKU || "").trim());
+  return {
+    Order: [{
+      OrderID: orderId,
+      OrderStatus: "Dispatched",
+      OrderLine: lines.map((l) => ({
+        SKU: String(l.SKU).trim(),
+        QuantityShipped: Number(l.Quantity) || 0,
+        TrackingDetails: { ShippingMethod: NETO_SHIPPING_METHOD, TrackingNumber: tracking },
+      })),
+    }],
+  };
+}
 router.post("/pick-lists/:day/dispatch", PICK_EDIT, async function (req, res) {
   const bad = (message) => res.status(400).json({ success: false, message });
   const day = req.params.day;
@@ -963,18 +980,7 @@ router.post("/pick-lists/:day/dispatch", PICK_EDIT, async function (req, res) {
         results.push({ orderId: p.orderId, outcome: "failed", message: "Cancelled in Neto" });
         continue;
       }
-      const lines = [].concat(n.OrderLine || []).filter((l) => String(l.SKU || "").trim());
-      const payload = {
-        Order: [{
-          OrderID: p.orderId,
-          OrderStatus: "Dispatched",
-          OrderLine: lines.map((l) => ({
-            SKU: String(l.SKU).trim(),
-            QuantityShipped: Number(l.Quantity) || 0,
-            TrackingDetails: { ShippingMethod: NETO_SHIPPING_METHOD, TrackingNumber: p.tracking },
-          })),
-        }],
-      };
+      const payload = netoDispatchPayload(p.orderId, n, p.tracking);
       if (dryRun) { results.push({ orderId: p.orderId, outcome: "dry-run", message: `Neto ${status || "?"} → Dispatched`, payload }); continue; }
       try {
         const r = await netoCall("UpdateOrder", payload);
@@ -993,6 +999,121 @@ router.post("/pick-lists/:day/dispatch", PICK_EDIT, async function (req, res) {
     return res.status(502).json({ success: false, message: error.message || "Failed to confirm the dispatch" });
   } finally {
     if (!dryRun) confirming.delete(day);
+  }
+});
+
+// ── Neto status of a list's orders + re-dispatch (user 2026-11-25) ──────
+// Neto can move an order we dispatched back to Pick (25 Nov: 173 Reebelo
+// orders of the 23 Nov list, our tracking still on them). The Pick Lists page
+// asks for the live status of the orders it shows, warns where our list says
+// dispatched but Neto has Pick / New, and can send those again.
+async function netoOrdersById(ids, fields) {
+  const out = new Map();
+  for (let i = 0; i < ids.length; i += 100) {
+    const d = await netoCall("GetOrder", { Filter: { OrderID: ids.slice(i, i + 100), OutputSelector: fields } });
+    for (const o of [].concat(d.Order || [])) out.set(String(o.OrderID), o);
+  }
+  return out;
+}
+
+//   POST /pick-lists/:day/neto-status { orderIds? } → { statuses: { [orderId]: { status, tracking } }, checkedAt }
+// No orderIds = the whole list. Read-only in Neto; the answers refresh our cache.
+router.post("/pick-lists/:day/neto-status", VIEW, async function (req, res) {
+  try {
+    const day = req.params.day;
+    if (!DAY_RE.test(day)) return res.status(400).json({ success: false, message: "Bad day" });
+    const col = await pickLists();
+    const list = await col.findOne({ day, ...LIVE_LIST }, { projection: { "orders.orderId": 1 } });
+    if (!list) return res.status(404).json({ success: false, message: "No pick list for that day" });
+    const onList = new Set((list.orders || []).map((o) => String(o.orderId)));
+    const asked = Array.isArray(req.body && req.body.orderIds) ? req.body.orderIds.map(String) : null;
+    const ids = (asked ? asked.filter((id) => onList.has(id)) : [...onList]).slice(0, 1000);
+    const neto = await netoOrdersById(ids, ["OrderID", "OrderStatus", "OrderLine", "OrderLine.ShippingTracking"]);
+    const statuses = {};
+    for (const id of ids) {
+      const n = neto.get(id);
+      if (!n) { statuses[id] = { status: "", missing: true }; continue; }
+      const status = String(n.OrderStatus || "");
+      const tracking = [...new Set([].concat(n.OrderLine || []).map((l) => String(l.ShippingTracking || "").trim()).filter(Boolean))].join(", ");
+      statuses[id] = { status, tracking };
+      if (status) await rememberNetoStatus(id, status).catch(() => {});
+    }
+    return res.json({ success: true, statuses, checkedAt: new Date() });
+  } catch (error) {
+    console.error("Exyon pick list Neto status error:", error);
+    return res.status(502).json({ success: false, message: `Could not reach Neto: ${error.message || error}` });
+  }
+});
+
+//   POST /pick-lists/:day/redispatch { orderIds } → { results: [{ orderId, outcome, netoStatus?, message? }] }
+// Only orders our list has as dispatched. Each is read from Neto first:
+// Dispatched → nothing sent ("already"); Cancelled / not in Neto → not sent;
+// anything else (Pick, New, …) → the same "Dispatched" update as Confirm
+// dispatch with the order's tracking number, then read back.
+router.post("/pick-lists/:day/redispatch", PICK_EDIT, async function (req, res) {
+  const bad = (message, status = 400) => res.status(status).json({ success: false, message });
+  const day = req.params.day;
+  if (!DAY_RE.test(day)) return bad("Bad day");
+  const asked = [...new Set((Array.isArray(req.body && req.body.orderIds) ? req.body.orderIds : []).map((x) => String(x || "").trim()).filter(Boolean))];
+  if (!asked.length) return bad("Nothing to re-dispatch");
+  if (asked.length > 300) return bad("At most 300 orders at a time");
+  if (confirming.has(day)) return bad("This list is being confirmed by someone else right now — try again in a moment", 409);
+  confirming.add(day);
+  try {
+    const col = await pickLists();
+    const list = await col.findOne({ day, ...LIVE_LIST }, { projection: { orders: 1 } });
+    if (!list) return bad("No pick list for that day", 404);
+    const onList = new Map((list.orders || []).map((o) => [String(o.orderId), o]));
+    for (const id of asked) {
+      const entry = onList.get(id);
+      if (!entry) return bad(`${id} is not on this list`);
+      if (dispatchStatusOf(entry) !== "dispatched") return bad(`${id} isn't dispatched on this list — use Confirm dispatch`);
+    }
+    const neto = await netoOrdersById(asked, ["OrderID", "OrderStatus", "OrderLine", "OrderLine.SKU", "OrderLine.Quantity", "OrderLine.ShippingTracking"]);
+    const by = actor(req);
+    const results = [];
+    for (const orderId of asked) {
+      const entry = onList.get(orderId);
+      const tracking = String(entry.tracking || (entry.dispatch && entry.dispatch.tracking) || "").replace(/\s+/g, "");
+      const n = neto.get(orderId);
+      const status = n ? String(n.OrderStatus || "") : "";
+      let result;
+      if (!n) result = { outcome: "failed", message: "Neto has no such order" };
+      else if (status === "Dispatched") result = { outcome: "already", netoStatus: status, message: "Neto already has it as Dispatched" };
+      else if (status === "Cancelled") result = { outcome: "cancelled", netoStatus: status, message: "Cancelled in Neto — not sent" };
+      else if (!TRACKING_RE.test(tracking)) result = { outcome: "failed", netoStatus: status, message: "No tracking number on the list" };
+      else {
+        try {
+          const r = await netoCall("UpdateOrder", netoDispatchPayload(orderId, n, tracking));
+          const back = await netoOrdersById([orderId], ["OrderID", "OrderStatus"]);
+          const now = String((back.get(orderId) || {}).OrderStatus || "");
+          result = now === "Dispatched"
+            ? { outcome: "dispatched", netoStatus: now, ...(r.Ack === "Warning" && r.Messages ? { message: JSON.stringify(r.Messages).slice(0, 300) } : {}) }
+            : { outcome: "not-changed", netoStatus: now, message: `Neto still has it as ${now || "?"}` };
+        } catch (e) {
+          result = { outcome: "failed", netoStatus: status, message: String(e.message || e).slice(0, 300) };
+        }
+      }
+      if (result.netoStatus) await rememberNetoStatus(orderId, result.netoStatus).catch(() => {});
+      // the attempt goes on the entry and the list's history (the dispatch itself stays as it was)
+      if (["dispatched", "not-changed", "failed"].includes(result.outcome)) {
+        const at = new Date();
+        await col.updateOne(
+          { day, "orders.orderId": orderId },
+          {
+            $set: { "orders.$.dispatch.reDispatch": { status: result.outcome, netoStatusBefore: status, netoStatus: result.netoStatus || "", tracking, at, by, ...(result.message ? { message: result.message } : {}) }, updatedAt: at, updatedBy: by },
+            $push: { history: { at, by, action: `re-dispatch:${result.outcome}`, orderId, ...(status ? { netoStatusBefore: status } : {}) } },
+          },
+        );
+      }
+      results.push({ orderId, ...result });
+    }
+    return res.json({ success: true, results });
+  } catch (error) {
+    console.error("Exyon pick list re-dispatch error:", error);
+    return res.status(502).json({ success: false, message: error.message || "Failed to re-dispatch" });
+  } finally {
+    confirming.delete(day);
   }
 });
 
