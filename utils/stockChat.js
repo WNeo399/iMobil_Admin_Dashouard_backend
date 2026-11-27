@@ -11,9 +11,13 @@
 //     behind Exyon). Units Exyon hasn't received yet (no stock row: in
 //     transit, or on a receiving list not counted in) ARE shown (user
 //     2026-11-17) — staff see how many in the preview;
-//   · grouped by Model + Storage + Grade + Colour with a quantity;
+//   · graded the chat's way (user 2026-11-27, chatGrade below): Exyon's
+//     grade for a unit at Assigned To Exyon (ours when Exyon has none yet),
+//     grouped into A+ 100% Battery / A / B / C (D, E as they are);
+//   · grouped by Model + Storage + that Grade + Colour with a quantity;
 //   · priced from our price list (Model + Storage + Grade; a blank storage
-//     or grade on a price row covers every storage / grade), else no price
+//     or grade on a price row covers every storage / grade; a grade group is
+//     priced at its own grade, A+ 100% Battery at A+), else no price
 //     ("Contact us");
 //   · minus what open chat orders hold (2026-11-25, utils/stockChatOrders):
 //     a pending order for its hold time, a confirmed one until it's
@@ -68,6 +72,53 @@ const colorKey = (v) => clean(v).toLowerCase();
 // one Model + Storage + Grade + Colour (what a chat order's hold points at)
 const unitKey = (g) => [modelKey(g.model), storageKey(g.storage), gradeKey(g.grade), colorKey(g.color)].join("|");
 
+// ── the chat's grade (user 2026-11-27) ──────────────────────────────
+// Source: a unit at Assigned To Exyon takes Exyon's grade (its variant
+// name, "… Grade B+"; a few names end in the grade word without "Grade"),
+// ours when Exyon has none (not received yet). Its battery is Exyon's
+// reading then (ours when Exyon has none), else ours. Groups:
+//   A+ or A++ with 100% battery → "A+ 100% Battery" (priced at A+);
+//   A / A+ / A++ → "A", B / B+ → "B", C / C+ → "C"; D, E as they are;
+//   no grade → "" (Ungraded).
+// AirPods / watches / Pencils never make the battery group — Exyon books a
+// blanket 100 per batch for them, not a reading.
+const GRADE_100 = "A+ 100% Battery";
+const GRADE_WORD = /^(A\+\+|A\+|A|B\+|B|C\+|C|D|E)$/i;
+const NO_BATTERY_GRADE = /airpods|耳机|pencil|watch|^pro \d+(st|nd|rd|th) gen/i;
+
+function exyonGradeOf(variantName) {
+  const n = clean(variantName);
+  if (!n) return "";
+  const i = n.search(/\bGrade\b/i);
+  if (i >= 0) return n.slice(i + 5).trim();
+  const last = n.split(" ").pop();
+  return GRADE_WORD.test(last) ? last.toUpperCase() : "";
+}
+
+function chatGrade(grade, battery, model) {
+  const g = gradeKey(grade);
+  if (!g || g === "UNGRADED") return "";
+  if (g === gradeKey(GRADE_100)) return GRADE_100;
+  if ((g === "A+" || g === "A++") && Number(battery) >= 100 && !NO_BATTERY_GRADE.test(clean(model))) return GRADE_100;
+  const m = g.match(/^([A-E])\+*$/);
+  return m ? m[1] : clean(grade);
+}
+
+// A grade as a customer, the AI or an API caller writes it → the chat
+// grade's key ("" = ungraded): "A++" / "a+" → "A", "B+" → "B",
+// "A+ 100% battery" / "100% battery" → "A+ 100% BATTERY".
+function gradeInputKey(v) {
+  const s = clean(v).toUpperCase();
+  if (!s || s === "UNGRADED" || s === "NONE" || s === "-") return "";
+  if (/100/.test(s) && (/BATT|电池/.test(s) || /^A/.test(s))) return gradeKey(GRADE_100);
+  const m = s.match(/^([A-E])\s*\+*$/);
+  return m ? m[1] : gradeKey(s);
+}
+// that key written the way the stock shows it ("A+ 100% BATTERY" → "A+ 100% Battery")
+const gradeFromKey = (k) => (k === gradeKey(GRADE_100) ? GRADE_100 : k);
+// the price-list grade a chat grade is priced at
+const priceGrade = (g) => (gradeKey(g) === gradeKey(GRADE_100) ? "A+" : g);
+
 // The date in Melbourne (YYYY-MM-DD) — the daily question cap resets there.
 function melbourneDay(d = new Date()) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Australia/Melbourne" }).format(d);
@@ -110,8 +161,11 @@ async function exyonLatestRows(codes) {
   for (let i = 0; i < list.length; i += EX_CHUNK) {
     const c = list.slice(i, i + EX_CHUNK);
     const rows = await exQuery(
-      `SELECT s.id, s.imei, s.serial_number, s.pick_id, z.zone_number, z.location_alias
+      // the variant name carries Exyon's grade; received_battery_health its battery reading
+      `SELECT s.id, s.imei, s.serial_number, s.pick_id, s.received_battery_health, pv.name AS product,
+              z.zone_number, z.location_alias
          FROM exyon.stocks s LEFT JOIN exyon.zone_locations z ON z.id = s.zone_location_id
+         LEFT JOIN exyon_products.product_variants pv ON pv.id = s.variant_id
         WHERE UPPER(s.imei) IN (?) OR UPPER(s.serial_number) IN (?)`,
       [c, c],
     );
@@ -127,17 +181,56 @@ async function exyonLatestRows(codes) {
   return latest;
 }
 
-// "in-stock" | "gone" (sold, being picked, non-sellable zone) | "unconfirmed"
-// (no stock row at Exyon under the unit's IMEI or serial)
-function exyonStateOf(latest, codes) {
+const codeKey = (v) => String(v || "").trim().toUpperCase();
+const deviceCodes = (d) => [codeKey(d.imei), codeKey(d.serialNumber)];
+
+// a register device's latest Exyon stock row (under its IMEI or serial), or null
+function exyonRowOf(latest, codes) {
   let row = null;
   for (const c of codes) {
     const r = c && latest.get(c);
     if (r && (!row || Number(r.id) > Number(row.id))) row = r;
   }
+  return row;
+}
+
+// "in-stock" | "gone" (sold, being picked, non-sellable zone) | "unconfirmed"
+// (no stock row at Exyon under the unit's IMEI or serial)
+function exyonStateOf(row) {
   if (!row) return "unconfirmed";
   const zone = `${row.zone_number || ""} ${row.location_alias || ""}`;
   return row.pick_id || EXYON_HIDE_ZONE.test(zone) ? "gone" : "in-stock";
+}
+
+// A register device's chat grade: Exyon's grade + battery for a unit at
+// Exyon that Exyon has graded (`latest` null = Exyon unreachable → ours).
+function unitChatGrade(d, latest) {
+  let grade = d.grade;
+  let battery = d.batteryHealth;
+  if (latest && d.location === LOCATION_EXYON) {
+    const row = exyonRowOf(latest, deviceCodes(d));
+    const ex = row ? exyonGradeOf(row.product) : "";
+    if (ex) {
+      grade = ex;
+      if (row.received_battery_health != null && row.received_battery_health !== "") battery = Number(row.received_battery_health);
+    }
+  }
+  return chatGrade(grade, battery, d.model);
+}
+
+// Chat grades of a few register devices (a chat order's scan / confirm):
+// device id → grade. Exyon unreachable → our grades.
+async function deviceChatGrades(devices) {
+  const atExyon = devices.filter((d) => d.location === LOCATION_EXYON);
+  let latest = null;
+  if (atExyon.length) {
+    try {
+      latest = await exyonLatestRows(atExyon.flatMap(deviceCodes));
+    } catch (e) {
+      console.error("Stock chat: Exyon grade check failed —", (e && e.message) || e);
+    }
+  }
+  return new Map(devices.map((d) => [String(d._id), unitChatGrade(d, latest)]));
 }
 
 // ── the stock snapshot (cached, single-flight) ──────────────────────
@@ -150,17 +243,16 @@ async function buildSnapshot() {
     .collection(DEVICES)
     .find(
       { status: "In Stock", location: { $in: [LOCATION_IMOBILE, LOCATION_EXYON] } },
-      { projection: { brand: 1, model: 1, storage: 1, color: 1, grade: 1, imei: 1, serialNumber: 1, location: 1, costPrice: 1, currency: 1 } },
+      { projection: { brand: 1, model: 1, storage: 1, color: 1, grade: 1, batteryHealth: 1, imei: 1, serialNumber: 1, location: 1, costPrice: 1, currency: 1 } },
     )
     .toArray();
 
-  const code = (v) => String(v || "").trim().toUpperCase();
   const atExyon = devices.filter((d) => d.location === LOCATION_EXYON);
   let latest = null;
   let exyonOk = true;
   let exyonError = null;
   try {
-    latest = await exyonLatestRows(atExyon.flatMap((d) => [code(d.imei), code(d.serialNumber)]));
+    latest = await exyonLatestRows(atExyon.flatMap(deviceCodes));
   } catch (e) {
     // Exyon unreachable: the register alone answers (staff see a warning) —
     // hiding every Exyon unit would empty the chat.
@@ -173,21 +265,27 @@ async function buildSnapshot() {
   let unconfirmedAtExyon = 0; // not received by Exyon yet (no stock row) → shown, counted for staff
   const available = devices.filter((d) => {
     if (d.location !== LOCATION_EXYON || !latest) return true;
-    const st = exyonStateOf(latest, [code(d.imei), code(d.serialNumber)]);
+    const st = exyonStateOf(exyonRowOf(latest, deviceCodes(d)));
     if (st === "gone") hiddenAtExyon += 1;
     if (st === "unconfirmed") unconfirmedAtExyon += 1;
     return st !== "gone";
   });
+  let gradedByExyon = 0; // shown units graded by Exyon (staff preview)
   const groups = new Map();
   for (const d of available) {
-    const key = [modelKey(d.model), storageKey(d.storage), gradeKey(d.grade), colorKey(d.color)].join("|");
+    const grade = unitChatGrade(d, latest);
+    if (latest && d.location === LOCATION_EXYON) {
+      const row = exyonRowOf(latest, deviceCodes(d));
+      if (row && exyonGradeOf(row.product)) gradedByExyon += 1;
+    }
+    const key = [modelKey(d.model), storageKey(d.storage), gradeKey(grade), colorKey(d.color)].join("|");
     let g = groups.get(key);
     if (!g) {
       g = {
         brand: clean(d.brand),
         model: clean(d.model),
         storage: clean(d.storage),
-        grade: clean(d.grade),
+        grade,
         color: clean(d.color),
         qty: 0,
         // each unit's cost — server-side only, for the below-cost check;
@@ -212,6 +310,7 @@ async function buildSnapshot() {
     units: available.length,
     hiddenAtExyon,
     unconfirmedAtExyon,
+    gradedByExyon,
     exyonOk,
     exyonError,
   };
@@ -240,11 +339,12 @@ async function loadPriceIndex(db) {
 }
 
 // Exact Model + Storage + Grade first, then a row with a blank grade, a
-// blank storage, or both.
+// blank storage, or both. A chat grade is priced at its own grade (A at A,
+// B at B …) and "A+ 100% Battery" at A+ — the A++ / B+ / C+ rows go unused.
 function priceFor(idx, g) {
   const m = modelKey(g.model);
   const s = storageKey(g.storage);
-  const gr = gradeKey(g.grade);
+  const gr = gradeKey(priceGrade(g.grade));
   if (!m) return null;
   for (const k of [[m, s, gr], [m, s, ""], [m, "", gr], [m, "", ""]]) {
     const hit = idx.get(k.join("|"));
@@ -379,6 +479,13 @@ module.exports = {
   gradeKey,
   colorKey,
   unitKey,
+  GRADE_100,
+  exyonGradeOf,
+  chatGrade,
+  gradeInputKey,
+  gradeFromKey,
+  priceGrade,
+  deviceChatGrades,
   applyHolds,
   melbourneDay,
   normalizePhone,

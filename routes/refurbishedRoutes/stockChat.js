@@ -417,6 +417,7 @@ router.get("/preview", MANAGE, async (req, res) => {
       pricedUnits: priced.reduce((n, g) => n + g.qty, 0),
       hiddenAtExyon: s.hiddenAtExyon,
       unconfirmedAtExyon: s.unconfirmedAtExyon,
+      gradedByExyon: s.gradedByExyon, // shown units carrying Exyon's grade (2026-11-27)
       hiddenUnits: s.hiddenUnits,
       belowCostUnits: s.belowCostUnits,
       heldUnits: s.heldUnits, // held by open chat orders

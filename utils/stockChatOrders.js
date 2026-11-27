@@ -17,8 +17,9 @@
 //
 // Confirming needs every unit picked (user 2026-11-25): staff scan each
 // device's IMEI / serial; it must be In Stock at iMobile or Assigned To
-// Exyon, match its line (model, storage, grade, and colour when the line
-// names one) and not be picked for another chat order. The devices are
+// Exyon, match its line (model, storage, chat grade — Exyon's for a unit at
+// Exyon, 2026-11-27 — and colour when the line names one) and not be
+// picked for another chat order. The devices are
 // recorded on the order (`picked`) and the hold moves to their colours.
 //
 // Prices always come from our price list at order time; a "Contact us"
@@ -97,10 +98,8 @@ async function nextOrderNo(db) {
 
 // ── items ────────────────────────────────────────────────────────────
 const gradeLabel = (g) => g || "Ungraded";
-const gradeInputKey = (v) => {
-  const k = SC.gradeKey(v);
-  return k === "UNGRADED" || k === "NONE" || k === "-" ? "" : k;
-};
+// "A++" → A, "B+" → B, "100% battery" → A+ 100% Battery … (utils/stockChat)
+const gradeInputKey = SC.gradeInputKey;
 const round2 = (n) => Math.round(n * 100) / 100;
 const optText = (v, max) => (v == null || SC.clean(v) === "" ? null : SC.clean(v).slice(0, max));
 
@@ -129,7 +128,7 @@ const distinct = (vals) => [...new Set(vals)];
 // The items against the stock view's groups (holds already taken off).
 // Each item's units come from priced rows first (largest colour first),
 // then "Contact us" rows — an item can become two lines. Returns { lines,
-// unclear, short, priceChanged }; a line keeps the register's own model /
+// unclear, short, priceChanged }; a line keeps the stock view's model / chat grade /
 // storage / grade ("" = ungraded) and `alloc` (colour + kind + qty: where
 // its hold sits).
 function resolveItems(groups, items) {
@@ -423,18 +422,27 @@ async function staffReopen(db, id, user) {
 const normalizeCode = (v) => String(v == null ? "" : v).replace(/[\s-]/g, "").trim().toUpperCase();
 const lineText = (l) => [l.model, l.storage, gradeLabel(l.grade), l.color || "any colour"].filter(Boolean).join(" · ");
 
-// does this device fit this order line?
+// does this device fit this order line? Grade = the device's chat grade
+// (`chatGrade`, set by withChatGrades: Exyon's grade for a unit at Exyon,
+// grouped) — the grade the customer ordered from.
 function lineMatches(line, d) {
   return SC.modelKey(line.model) === SC.modelKey(d.model) &&
     SC.storageKey(line.storage) === SC.storageKey(d.storage) &&
-    SC.gradeKey(line.grade) === SC.gradeKey(d.grade) &&
+    SC.gradeKey(line.grade) === SC.gradeKey(d.chatGrade) &&
     (line.color == null || SC.colorKey(line.color) === SC.colorKey(d.color));
+}
+
+async function withChatGrades(devices) {
+  const grades = await SC.deviceChatGrades(devices);
+  for (const d of devices) d.chatGrade = grades.get(String(d._id)) || "";
+  return devices;
 }
 
 function deviceRecord(d) {
   return {
     deviceId: d._id, imei: d.imei || "", serialNumber: d.serialNumber || "",
-    model: d.model || "", storage: d.storage || "", grade: d.grade || "", color: d.color || "", location: d.location || "",
+    model: d.model || "", storage: d.storage || "", grade: d.chatGrade || "", registerGrade: d.grade || "",
+    color: d.color || "", location: d.location || "",
   };
 }
 
@@ -476,7 +484,7 @@ function deviceProblem(d) {
 // a line asking for its colour before an any-colour line.
 function lineFor(order, d, counts) {
   const fits = (order.items || []).map((l, i) => ({ l, i })).filter(({ l }) => lineMatches(l, d));
-  if (!fits.length) return { error: `${d.imei || d.serialNumber} (${[d.model, d.storage, gradeLabel(d.grade), d.color].filter(Boolean).join(" · ")}) isn't on this order.` };
+  if (!fits.length) return { error: `${d.imei || d.serialNumber} (${[d.model, d.storage, gradeLabel(d.chatGrade), d.color].filter(Boolean).join(" · ")}) isn't on this order.` };
   fits.sort((a, b) => (a.l.color == null) - (b.l.color == null) || a.i - b.i);
   const open = fits.find(({ l, i }) => (counts[i] || 0) < l.qty);
   if (!open) return { error: `All ${fits.reduce((s, f) => s + f.l.qty, 0)} of ${lineText(fits[0].l)} are already scanned.` };
@@ -499,6 +507,7 @@ async function staffScan(db, id, code, rawPicks) {
   if (p1) throw new OrderError(409, "NOT_SELLABLE", p1);
   const elsewhere = await pickedElsewhere(db, [d._id], o._id);
   if (elsewhere.size) throw new OrderError(409, "PICKED_ELSEWHERE", `${c} is already picked for ${elsewhere.get(String(d._id))}.`);
+  await withChatGrades([d]);
   const counts = {};
   for (const p of picks) counts[p.lineIndex] = (counts[p.lineIndex] || 0) + 1;
   const where = lineFor(o, d, counts);
@@ -519,7 +528,7 @@ async function staffConfirm(db, id, user, note, rawPicks) {
     if (picks.length !== need) throw new OrderError(400, "NOT_ALL_PICKED", `Scan all ${need} devices first (${picks.length} scanned).`, { need, scanned: picks.length });
     const ids = picks.map((p) => p.deviceId);
     if (new Set(ids.map(String)).size !== ids.length) throw bad("A device is scanned twice.");
-    const devices = await db.collection(DEVICES).find({ _id: { $in: ids } }).toArray();
+    const devices = await withChatGrades(await db.collection(DEVICES).find({ _id: { $in: ids } }).toArray());
     const byId = new Map(devices.map((d) => [String(d._id), d]));
     const elsewhere = await pickedElsewhere(db, ids, o._id);
     const counts = {};

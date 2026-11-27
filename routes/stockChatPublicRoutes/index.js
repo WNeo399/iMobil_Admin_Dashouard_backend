@@ -149,7 +149,7 @@ const TOOLS = [
       properties: {
         query: { type: "string", description: "Words the brand or model name must ALL contain, e.g. 'iphone 14 pro', 'ipad 9th gen cellular'." },
         storage: { type: "string", description: "Optional exact storage, e.g. '128GB'." },
-        grade: { type: "string", description: "Optional exact grade as listed, e.g. 'A++', 'A+', 'A', 'B', or 'Ungraded'." },
+        grade: { type: "string", description: "Optional grade as listed: 'A+ 100% Battery', 'A', 'B', 'C', 'D' or 'Ungraded'." },
         color: { type: "string", description: "Optional colour words, e.g. 'black'." },
       },
     },
@@ -207,7 +207,7 @@ const TOOLS = [
           description:
             "What the customer mainly wants with THIS message — one value. greeting: hello / small talk, no request. " +
             "stock_query: stock, price, colour or grade of something. full_list: everything in stock or a whole category. " +
-            "order_intent: clearly wants to buy, order or reserve ('5 of the A++ please', 'I'll take it', 'hold 3 for me'). " +
+            "order_intent: clearly wants to buy, order or reserve ('5 of the grade A please', 'I'll take it', 'hold 3 for me'). " +
             "price_negotiation: a discount, a better or bulk price. order_status: an existing order, dispatch, delivery. " +
             "human: wants a person, a complaint, after-sales. other: none of these. " +
             "Several at once → the main one ('any iPhone 15? if so 5 of them' = order_intent).",
@@ -216,7 +216,7 @@ const TOOLS = [
           type: "array",
           description:
             "The products this message is about, COMPLETED FROM THE CONVERSATION: if they asked about iPhone 15 128GB and now say " +
-            "'the A++ ones, 5 please', give model iPhone 15, storage 128GB, grade A++, qty 5. Give what the CUSTOMER asked for, " +
+            "'the grade A ones, 5 please', give model iPhone 15, storage 128GB, grade A, qty 5. Give what the CUSTOMER asked for, " +
             "even when we don't have it (they ask for 256GB and we only have 128GB → storage 256GB; the system works out " +
             "availability). Spell model, storage, grade and colour as in the tool results when they are there. Leave out what the " +
             "customer didn't say or you can't tell; leave model out rather than guess one. [] when no specific product " +
@@ -226,7 +226,7 @@ const TOOLS = [
             properties: {
               model: { type: "string" },
               storage: { type: "string" },
-              grade: { type: "string", description: "A++, A+, A, B+, B, C+, C or Ungraded." },
+              grade: { type: "string", description: "A+ 100% Battery, A, B, C, D or Ungraded (A++ / A+ → A, B+ → B, C+ → C)." },
               color: { type: "string" },
               qty: { type: "integer", description: "How many they want, only when they said a number." },
             },
@@ -258,7 +258,8 @@ function systemPrompt(settings, channel = "web") {
       ? "- A row without a listed price shows 'Contact us' — the customer can still add it to an order and our team will quote the price, or message iMobile on WhatsApp. Never quote a price that isn't listed."
       : `- A row without a listed price shows 'Contact us' — tell the customer to ${contact} for that price. Never quote a price that isn't listed.`,
     `- Listed prices: ${settings.priceNote || "as shown"}.`,
-    "- Grades are as listed (e.g. A++, A+, A, B). 'Ungraded' means the unit hasn't been graded yet. Don't explain what a grade means beyond that — suggest asking iMobile.",
+    "- Grades are as listed: 'A+ 100% Battery' (grade A+ or better with 100% battery health), A (A, A+ and A++), B (B and B+), C (C and C+), D, and 'Ungraded' (not graded yet). " +
+      "If a customer asks for A++, A+, B+ or C+, those are inside A, B or C — use that grade. Don't explain grades beyond this — suggest asking iMobile.",
     channel === "web"
       ? "- You can't place orders yourself, hold stock, give discounts or promise delivery. To order, the customer taps 'Add' on the stock you show, then 'Place order' in the order bar at the bottom of the page; " +
         "our team confirms it and arranges delivery and payment. When someone wants to buy, show the rows they want (cards) so they can add them."
@@ -295,10 +296,8 @@ function matchesWords(g, ws) {
 }
 
 const gradeLabel = (g) => g || "Ungraded";
-const gradeInputKey = (v) => {
-  const k = SC.gradeKey(v);
-  return k === "UNGRADED" || k === "NONE" || k === "-" ? "" : k;
-};
+// "A++" → A, "B+" → B, "100% battery" → A+ 100% Battery … (utils/stockChat)
+const gradeInputKey = SC.gradeInputKey;
 const priceText = (g) => (g.price != null ? `${g.currency || "AUD"} ${Number(g.price).toFixed(2)}` : "Contact us");
 
 function toolListModels(groups, input) {
@@ -359,7 +358,7 @@ function toolSearch(groups, input) {
 }
 
 // Best grade first; ungraded last.
-const GRADE_RANK = { "A++": 0, "A+": 1, A: 2, "B+": 3, B: 4, "C+": 5, C: 6 };
+const GRADE_RANK = { [SC.gradeKey(SC.GRADE_100)]: 0, A: 1, B: 2, C: 3, D: 4, E: 5 };
 const gradeRank = (g) => (g === "Ungraded" ? 99 : GRADE_RANK[SC.gradeKey(g)] !== undefined ? GRADE_RANK[SC.gradeKey(g)] : 50);
 const storageGb = (s) => {
   const m = String(s || "").match(/([\d.]+)\s*(TB|GB)/i);
@@ -478,7 +477,7 @@ function intentItems(groups, input) {
     let color = opt(it.color, 60);
     const q = Number(it.qty);
     const qty = it.qty == null || it.qty === "" || !Number.isInteger(q) || q < 1 ? null : q;
-    if (grade !== null) grade = gradeInputKey(grade) || "Ungraded";
+    if (grade !== null) grade = SC.gradeFromKey(gradeInputKey(grade)) || "Ungraded";
     if (!model) return { model: null, storage, grade, color, qty, available: null, availableQty: null };
 
     let c = groups.filter((g) => SC.modelKey(g.model) === SC.modelKey(model));
